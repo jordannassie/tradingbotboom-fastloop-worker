@@ -1,0 +1,4 @@
+py-clob-client
+websockets
+python-dotenv
+supabase
