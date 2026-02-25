@@ -38,10 +38,12 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "0")
 FUNDER = os.getenv("FUNDER")  # optional
 
-HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 current_slug = None
 current_yes_token = YES_TOKEN_ID
 current_no_token = NO_TOKEN_ID
+HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
+rotating = False
+ws_task = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -54,16 +56,27 @@ if not HAVE_PRIVATE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ASSET_TO_SIDE = {
-    YES_TOKEN_ID: "yes",
-    NO_TOKEN_ID: "no",
-}
-
 best_quotes = {
     "yes": {"bid": None, "ask": None},
     "no": {"bid": None, "ask": None},
 }
 
+ASSET_TO_SIDE = {}
+
+def refresh_asset_map():
+    ASSET_TO_SIDE.clear()
+    if current_yes_token:
+        ASSET_TO_SIDE[current_yes_token] = "yes"
+    if current_no_token:
+        ASSET_TO_SIDE[current_no_token] = "no"
+
+def reset_best_quotes():
+    best_quotes["yes"]["bid"] = None
+    best_quotes["yes"]["ask"] = None
+    best_quotes["no"]["bid"] = None
+    best_quotes["no"]["ask"] = None
+
+refresh_asset_map()
 trade_timestamps = deque()
 consecutive_trade_errors = 0
 last_trade_error = None
@@ -76,7 +89,8 @@ TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
 MAX_TRADES_PER_HOUR = max(1, int(os.getenv("MAX_TRADES_PER_HOUR", "30")))
 MAX_RUNTIME_TRADES = max(1, int(os.getenv("MAX_RUNTIME_TRADES", "200")))
 MAX_CONSECUTIVE_ERRORS = 5
-AUTO_ROTATE = os.getenv("AUTO_ROTATE", "true").lower()
+AUTO_ROTATE_ENV = os.getenv("AUTO_ROTATE", "true")
+AUTO_ROTATE_ENABLED = AUTO_ROTATE_ENV.strip().lower() in ("1", "true", "yes", "y")
 MARKET_SLUG_PREFIX = os.getenv("MARKET_SLUG_PREFIX", "btc-updown-5m")
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
 ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
@@ -89,6 +103,15 @@ logging.info(
     TRADE_SIZE,
     SIGNATURE_TYPE,
     (FUNDER[:6] + "...") if FUNDER else "None",
+)
+logging.info(
+    "Rotation config AUTO_ROTATE_ENABLED=%s AUTO_ROTATE_RAW=%s MARKET_SLUG_PREFIX=%s INTERVAL_SECONDS=%s ROTATE_POLL_SECONDS=%s ROTATE_LOOKAHEAD_SECONDS=%s",
+    AUTO_ROTATE_ENABLED,
+    AUTO_ROTATE_ENV,
+    MARKET_SLUG_PREFIX,
+    INTERVAL_SECONDS,
+    ROTATE_POLL_SECONDS,
+    ROTATE_LOOKAHEAD_SECONDS,
 )
 
 
@@ -200,68 +223,128 @@ def normalize_list_field(entry, key):
     return [value]
 
 
-def fetch_market_by_slug(slug):
+def extract_event_payload(event):
+    outcomes = normalize_list_field(event, "outcomes")
+    clob_ids = normalize_list_field(event, "clobTokenIds")
+    if outcomes and clob_ids:
+        return outcomes, clob_ids
+
+    for market in event.get("markets") or []:
+        market_outcomes = normalize_list_field(market, "outcomes")
+        market_clob = normalize_list_field(market, "clobTokenIds")
+        if market_outcomes and market_clob:
+            return market_outcomes, market_clob
+
+    return None, None
+
+
+def fetch_event_by_slug(slug):
     if not slug:
         return None
     base = "https://gamma-api.polymarket.com"
     endpoints = [
-        f"{base}/markets?slug={parse.quote(slug)}",
-        f"{base}/markets/slug/{parse.quote(slug)}",
+        f"{base}/events?slug={parse.quote(slug)}",
+        f"{base}/events/slug/{parse.quote(slug)}",
     ]
+
     for url in endpoints:
         try:
             with request.urlopen(url, timeout=5) as resp:
                 data = json.loads(resp.read())
         except Exception:
             continue
-        market = None
+
+        event = None
         if isinstance(data, list) and data:
-            market = data[0]
+            event = data[0]
         elif isinstance(data, dict):
-            market = data
-        if market:
-            outcomes = normalize_list_field(market, "outcomes")
-            clob_ids = normalize_list_field(market, "clobTokenIds")
+            event = data
+
+        if not event:
+            continue
+
+        outcomes, clob_ids = extract_event_payload(event)
+        if outcomes and clob_ids:
             return {"slug": slug, "outcomes": outcomes, "clobTokenIds": clob_ids}
+
     return None
 
 
-def compute_target_slug(now_epoch):
+def compute_target_start(now_epoch):
     interval = INTERVAL_SECONDS
     start = floor(now_epoch / interval) * interval
     if (start + interval - now_epoch) <= ROTATE_LOOKAHEAD_SECONDS:
-        target_start = start + interval
-    else:
-        target_start = start
+        return start + interval
+    return start
+
+
+def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
 
+def restart_ws_task():
+    global ws_task
+    if ws_task:
+        ws_task.cancel()
+    ws_task = asyncio.create_task(market_listener())
+    return ws_task
+
+
 async def rotate_loop():
-    if AUTO_ROTATE != "true":
+    if not AUTO_ROTATE_ENABLED:
         return
-    global current_slug, current_yes_token, current_no_token
+    global current_slug, current_yes_token, current_no_token, rotating
     current_slug = None
     while True:
         now = int(time())
-        target_slug = compute_target_slug(now)
-        if target_slug != current_slug:
-            market = fetch_market_by_slug(target_slug)
-            if market:
-                old_slug = current_slug
-                current_slug = market["slug"]
-                outcomes = [o.lower() for o in market["outcomes"]]
-                clobs = market["clobTokenIds"]
+        target_start = compute_target_start(now)
+        logging.info(
+            "ROTATE_TICK now=%s target_start=%s current_slug=%s",
+            now,
+            target_start,
+            current_slug or "none",
+        )
+        try:
+            candidates = [
+                target_start,
+                target_start - INTERVAL_SECONDS,
+                target_start + INTERVAL_SECONDS,
+            ]
+            found_market = None
+            found_slug = None
+            for candidate in candidates:
+                if candidate < 0:
+                    continue
+                slug = slug_from_start(candidate)
+                market = fetch_event_by_slug(slug)
+                found = bool(market)
+                logging.info("ROTATE_FETCH slug=%s found=%s", slug, "true" if found else "false")
+                if found:
+                    found_market = market
+                    found_slug = slug
+                    break
+
+            if found_market and found_slug != current_slug:
+                current_slug = found_slug
+                outcomes = [o.lower() for o in found_market["outcomes"]]
+                clobs = found_market["clobTokenIds"]
                 for name, token in zip(outcomes, clobs):
                     if name == "up":
                         current_yes_token = token
                     elif name == "down":
                         current_no_token = token
+                refresh_asset_map()
+                reset_best_quotes()
+                rotating = True
+                restart_ws_task()
                 logging.info(
                     "ROTATED slug=%s yes=%s no=%s",
                     current_slug,
-                    current_yes_token[:6] + "..." if current_yes_token else "none",
-                    current_no_token[:6] + "..." if current_no_token else "none",
+                    (current_yes_token[:6] + "...") if current_yes_token else "none",
+                    (current_no_token[:6] + "...") if current_no_token else "none",
                 )
+        except Exception:
+            logging.exception("ROTATE_ERROR")
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
 
@@ -277,9 +360,8 @@ def update_best_quotes(asset_id, bid, ask):
 
 
 async def market_listener():
-    subscribe_payload = {
+    base_payload = {
         "type": "market",
-        "assets_ids": [YES_TOKEN_ID, NO_TOKEN_ID],
         "custom_feature_enabled": True,
     }
 
@@ -329,7 +411,9 @@ async def market_listener():
     while True:
         try:
             async with websockets.connect(WS_MARKET, ping_interval=20, ping_timeout=20) as ws:
-                await ws.send(json.dumps(subscribe_payload))
+                assets = [token for token in (current_yes_token, current_no_token) if token]
+                payload = {**base_payload, "assets_ids": assets}
+                await ws.send(json.dumps(payload))
                 logging.info("WS connected")
                 async for raw in ws:
                     msg = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
@@ -406,7 +490,7 @@ def submit_order(client: ClobClient, token_id: str, side_label: str, price: floa
 
 
 async def heartbeat_loop(client: ClobClient | None):
-    global paused_due_to_max_trades, trade_triggers
+    global paused_due_to_max_trades, trade_triggers, rotating
 
     while True:
         is_enabled = read_is_enabled()
@@ -422,18 +506,28 @@ async def heartbeat_loop(client: ClobClient | None):
         status = "ENABLED" if is_enabled else "DISABLED"
         msg = f"ya={fmt(ya)} na={fmt(na)} total={fmt(total_ask)} edge={fmt(edge)}"
 
-        if paused_due_to_errors:
+        if rotating:
+            status = "PAUSED_ROTATING"
+            msg = msg + " rotating"
+
+        if not rotating and paused_due_to_errors:
             status = "PAUSED_ERRORS"
             msg = msg + f" last_error={last_trade_error or 'unknown'}"
 
         if trade_triggers >= MAX_RUNTIME_TRADES:
             paused_due_to_max_trades = True
 
-        if paused_due_to_max_trades:
+        if not rotating and paused_due_to_max_trades:
             status = "PAUSED_MAX_TRADES"
             msg = msg + f" trade_triggers={trade_triggers}"
 
-        if not HAVE_PRIVATE_KEY and is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
+        if (
+            not rotating
+            and not HAVE_PRIVATE_KEY
+            and is_enabled
+            and edge is not None
+            and edge >= EDGE_THRESHOLD
+        ):
             status = "PAUSED_NO_PRIVATE_KEY"
 
         slug_field = current_slug or "none"
@@ -453,33 +547,40 @@ async def heartbeat_loop(client: ClobClient | None):
             and not paused_due_to_errors
             and not paused_due_to_max_trades
             and HAVE_PRIVATE_KEY
+            and current_yes_token
+            and current_no_token
+            and not rotating
         )
 
         if trading_allowed and client:
             if has_trade_capacity(2):
                 trade_triggers += 1
                 mark_trade_attempts(2)
-                submit_order(client, YES_TOKEN_ID, "yes", ya, edge, ya, na)
-                submit_order(client, NO_TOKEN_ID, "no", na, edge, ya, na)
+                submit_order(client, current_yes_token, "yes", ya, edge, ya, na)
+                submit_order(client, current_no_token, "no", na, edge, ya, na)
             else:
                 logging.info("Rate limit reached; skipping")
 
         await asyncio.sleep(5)
+        if rotating:
+            rotating = False
 
 
 async def main():
     trading_client = build_trading_client()
-    listener = asyncio.create_task(market_listener())
     rotator = asyncio.create_task(rotate_loop())
+    restart_ws_task()
     try:
         await heartbeat_loop(trading_client)
     finally:
-        listener.cancel()
         rotator.cancel()
-        with suppress(asyncio.CancelledError):
-            await listener
+        if ws_task:
+            ws_task.cancel()
         with suppress(asyncio.CancelledError):
             await rotator
+        with suppress(asyncio.CancelledError):
+            if ws_task:
+                await ws_task
 
 
 if __name__ == "__main__":
