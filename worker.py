@@ -5,6 +5,9 @@ import os
 from collections import deque
 from contextlib import suppress
 from datetime import datetime, timezone
+from math import floor
+from time import time
+from urllib import parse, request
 
 import websockets
 from dotenv import load_dotenv
@@ -70,6 +73,11 @@ TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
 MAX_TRADES_PER_HOUR = max(1, int(os.getenv("MAX_TRADES_PER_HOUR", "30")))
 MAX_RUNTIME_TRADES = max(1, int(os.getenv("MAX_RUNTIME_TRADES", "200")))
 MAX_CONSECUTIVE_ERRORS = 5
+AUTO_ROTATE = os.getenv("AUTO_ROTATE", "true").lower()
+MARKET_SLUG_PREFIX = os.getenv("MARKET_SLUG_PREFIX", "btc-updown-5m")
+INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
+ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
+ROTATE_LOOKAHEAD_SECONDS = int(os.getenv("ROTATE_LOOKAHEAD_SECONDS", "20"))
 
 logging.info(
     "Worker start BOT_ID=%s EDGE=%s SIZE=%s SIG=%s FUNDER=%s (Supabase connected)",
@@ -169,6 +177,79 @@ def record_trade(token_id, side_label, status, price, edge, ya, na, response=Non
         supabase.table("bot_trades").insert(payload).execute()
     except Exception:
         logging.exception("Failed inserting bot_trades row")
+
+
+def normalize_list_field(entry, key):
+    value = entry.get(key)
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    if value is None:
+        return []
+    return [value]
+
+
+def fetch_market_by_slug(slug):
+    if not slug:
+        return None
+    base = "https://gamma-api.polymarket.com"
+    endpoints = [
+        f"{base}/markets?slug={parse.quote(slug)}",
+        f"{base}/markets/slug/{parse.quote(slug)}",
+    ]
+    for url in endpoints:
+        try:
+            with request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read())
+        except Exception:
+            continue
+        market = None
+        if isinstance(data, list) and data:
+            market = data[0]
+        elif isinstance(data, dict):
+            market = data
+        if market:
+            outcomes = normalize_list_field(market, "outcomes")
+            clob_ids = normalize_list_field(market, "clobTokenIds")
+            return {"slug": slug, "outcomes": outcomes, "clobTokenIds": clob_ids}
+    return None
+
+
+def compute_target_slug(now_epoch):
+    interval = INTERVAL_SECONDS
+    start = floor(now_epoch / interval) * interval
+    if (start + interval - now_epoch) <= ROTATE_LOOKAHEAD_SECONDS:
+        target_start = start + interval
+    else:
+        target_start = start
+    return f"{MARKET_SLUG_PREFIX}-{target_start}"
+
+
+async def rotate_loop():
+    if AUTO_ROTATE != "true":
+        return
+    current_slug = None
+    while True:
+        now = int(time())
+        target_slug = compute_target_slug(now)
+        if target_slug != current_slug:
+            market = fetch_market_by_slug(target_slug)
+            if market:
+                logging.info(
+                    "ROTATE_CHECK slug=%s outcomes=%s clobTokenIds=%s",
+                    market["slug"],
+                    market["outcomes"],
+                    market["clobTokenIds"],
+                )
+            current_slug = target_slug
+        await asyncio.sleep(ROTATE_POLL_SECONDS)
+
 
 
 def update_best_quotes(asset_id, bid, ask):
@@ -373,12 +454,16 @@ async def heartbeat_loop(client: ClobClient | None):
 async def main():
     trading_client = build_trading_client()
     listener = asyncio.create_task(market_listener())
+    rotator = asyncio.create_task(rotate_loop())
     try:
         await heartbeat_loop(trading_client)
     finally:
         listener.cancel()
+        rotator.cancel()
         with suppress(asyncio.CancelledError):
             await listener
+        with suppress(asyncio.CancelledError):
+            await rotator
 
 
 if __name__ == "__main__":
