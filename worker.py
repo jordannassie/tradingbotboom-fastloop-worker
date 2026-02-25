@@ -196,6 +196,22 @@ async def market_listener():
         "custom_feature_enabled": True,
     }
 
+    def process_event(evt):
+        if not isinstance(evt, dict):
+            return
+        event_type = evt.get("event_type") or evt.get("eventType") or evt.get("type")
+        if event_type != "best_bid_ask":
+            return
+        data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
+        asset_id = (
+            data.get("asset_id")
+            or data.get("assetId")
+            or data.get("token_id")
+        )
+        bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
+        ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
+        update_best_quotes(asset_id, bid, ask)
+
     while True:
         try:
             async with websockets.connect(WS_MARKET, ping_interval=20, ping_timeout=20) as ws:
@@ -210,15 +226,14 @@ async def market_listener():
                     except json.JSONDecodeError:
                         continue
 
-                    if payload.get("event_type") != "best_bid_ask":
-                        continue
-
-                    data = payload.get("data") or payload
-                    asset_id = data.get("asset_id") or data.get("assetId") or data.get("token_id")
-                    bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
-                    ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
-                    if asset_id:
-                        update_best_quotes(asset_id, bid, ask)
+                    try:
+                        if isinstance(payload, list):
+                            for evt in payload:
+                                process_event(evt)
+                        else:
+                            process_event(payload)
+                    except Exception:
+                        logging.exception("Error processing WS payload")
         except asyncio.CancelledError:
             break
         except Exception:
