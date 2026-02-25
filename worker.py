@@ -39,6 +39,9 @@ SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "0")
 FUNDER = os.getenv("FUNDER")  # optional
 
 HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
+current_slug = None
+current_yes_token = YES_TOKEN_ID
+current_no_token = NO_TOKEN_ID
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -151,6 +154,7 @@ def record_opportunity(total_ask, edge, ya, yb, na, nb):
         "status": "OPPORTUNITY",
         "meta": {**meta_template(edge, ya, na), "yes_bid": yb, "no_bid": nb},
     }
+    payload["meta"]["slug"] = current_slug
     try:
         supabase.table("bot_trades").insert(payload).execute()
     except Exception:
@@ -163,6 +167,7 @@ def record_trade(token_id, side_label, status, price, edge, ya, na, response=Non
         meta["response"] = response
     if error is not None:
         meta["error"] = error
+    meta["slug"] = current_slug
 
     payload = {
         "bot_id": BOT_ID,
@@ -234,6 +239,7 @@ def compute_target_slug(now_epoch):
 async def rotate_loop():
     if AUTO_ROTATE != "true":
         return
+    global current_slug, current_yes_token, current_no_token
     current_slug = None
     while True:
         now = int(time())
@@ -241,13 +247,21 @@ async def rotate_loop():
         if target_slug != current_slug:
             market = fetch_market_by_slug(target_slug)
             if market:
+                old_slug = current_slug
+                current_slug = market["slug"]
+                outcomes = [o.lower() for o in market["outcomes"]]
+                clobs = market["clobTokenIds"]
+                for name, token in zip(outcomes, clobs):
+                    if name == "up":
+                        current_yes_token = token
+                    elif name == "down":
+                        current_no_token = token
                 logging.info(
-                    "ROTATE_CHECK slug=%s outcomes=%s clobTokenIds=%s",
-                    market["slug"],
-                    market["outcomes"],
-                    market["clobTokenIds"],
+                    "ROTATED slug=%s yes=%s no=%s",
+                    current_slug,
+                    current_yes_token[:6] + "..." if current_yes_token else "none",
+                    current_no_token[:6] + "..." if current_no_token else "none",
                 )
-            current_slug = target_slug
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
 
@@ -422,8 +436,10 @@ async def heartbeat_loop(client: ClobClient | None):
         if not HAVE_PRIVATE_KEY and is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
             status = "PAUSED_NO_PRIVATE_KEY"
 
-        logging.info("%s %s", status, msg)
-        record_heartbeat(status, msg)
+        slug_field = current_slug or "none"
+        msg_with_slug = f"{msg} slug={slug_field}"
+        logging.info("%s %s", status, msg_with_slug)
+        record_heartbeat(status, msg_with_slug)
 
         if is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
             record_opportunity(total_ask, edge, ya, yb, na, nb)
