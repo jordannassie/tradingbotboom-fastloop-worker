@@ -193,17 +193,41 @@ async def market_listener():
             if not isinstance(evt, dict):
                 return
             event_type = evt.get("event_type") or evt.get("eventType") or evt.get("type")
-            if event_type != "best_bid_ask":
+            if event_type == "best_bid_ask":
+                data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
+                asset_id = (
+                    data.get("asset_id")
+                    or data.get("assetId")
+                    or data.get("token_id")
+                )
+                bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
+                ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
+                update_best_quotes(asset_id, bid, ask)
+            elif event_type == "book":
+                asset_id = evt.get("asset_id") or evt.get("assetId")
+                bids = evt.get("bids") or []
+                asks = evt.get("asks") or []
+                best_bid = None
+                best_ask = None
+                for bid_entry in bids:
+                    price = float_or_none(bid_entry.get("price"))
+                    if price is not None and (best_bid is None or price > best_bid):
+                        best_bid = price
+                for ask_entry in asks:
+                    price = float_or_none(ask_entry.get("price"))
+                    if price is not None and (best_ask is None or price < best_ask):
+                        best_ask = price
+                update_best_quotes(asset_id, best_bid, best_ask)
+            elif event_type == "price_change":
+                for change in evt.get("price_changes") or []:
+                    asset_id = change.get("asset_id") or change.get("assetId")
+                    if not asset_id:
+                        continue
+                    bid = float_or_none(change.get("best_bid") or change.get("bestBid"))
+                    ask = float_or_none(change.get("best_ask") or change.get("bestAsk"))
+                    update_best_quotes(asset_id, bid, ask)
+            else:
                 return
-            data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
-            asset_id = (
-                data.get("asset_id")
-                or data.get("assetId")
-                or data.get("token_id")
-            )
-            bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
-            ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
-            update_best_quotes(asset_id, bid, ask)
         except Exception:
             logging.exception("Error in process_event")
 
