@@ -35,29 +35,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "0")
 FUNDER = os.getenv("FUNDER")  # optional
 
-def parse_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-def parse_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-EDGE_THRESHOLD = parse_float("EDGE_THRESHOLD", 0.004)
-TRADE_SIZE = parse_float("TRADE_SIZE", 5.0)
-MAX_TRADES_PER_HOUR = max(1, parse_int("MAX_TRADES_PER_HOUR", 30))
-MAX_RUNTIME_TRADES = max(1, parse_int("MAX_RUNTIME_TRADES", 200))
-MAX_CONSECUTIVE_ERRORS = 5
+HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -65,8 +43,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 if not YES_TOKEN_ID or not NO_TOKEN_ID:
     raise SystemExit("Missing YES_TOKEN_ID or NO_TOKEN_ID")
 
-if not PRIVATE_KEY:
-    raise SystemExit("Missing PRIVATE_KEY")
+if not HAVE_PRIVATE_KEY:
+    logging.warning("Missing PRIVATE_KEY; running in observe-only mode")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -87,15 +65,21 @@ paused_due_to_errors = False
 paused_due_to_max_trades = False
 trade_triggers = 0  # counts 2-leg attempts (YES+NO)
 
-def mask(value: str | None) -> str:
-    if not value:
-        return "None"
-    return value[:6] + "..."
+EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
+MAX_TRADES_PER_HOUR = max(1, int(os.getenv("MAX_TRADES_PER_HOUR", "30")))
+MAX_RUNTIME_TRADES = max(1, int(os.getenv("MAX_RUNTIME_TRADES", "200")))
+MAX_CONSECUTIVE_ERRORS = 5
 
 logging.info(
     "Worker start BOT_ID=%s EDGE=%s SIZE=%s SIG=%s FUNDER=%s (Supabase connected)",
-    BOT_ID, EDGE_THRESHOLD, TRADE_SIZE, SIGNATURE_TYPE, mask(FUNDER)
+    BOT_ID,
+    EDGE_THRESHOLD,
+    TRADE_SIZE,
+    SIGNATURE_TYPE,
+    (FUNDER[:6] + "...") if FUNDER else "None",
 )
+
 
 def float_or_none(v):
     if v is None:
@@ -104,6 +88,7 @@ def float_or_none(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
 
 def read_is_enabled() -> bool:
     try:
@@ -121,8 +106,10 @@ def read_is_enabled() -> bool:
         logging.exception("Failed reading bot_settings")
     return False
 
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def record_heartbeat(status_text: str, message: str):
     payload = {
@@ -136,6 +123,7 @@ def record_heartbeat(status_text: str, message: str):
     except Exception:
         logging.exception("Failed inserting bot_heartbeat")
 
+
 def meta_template(edge, ya, na):
     return {
         "timestamp": utc_now_iso(),
@@ -143,6 +131,7 @@ def meta_template(edge, ya, na):
         "ya": ya,
         "na": na,
     }
+
 
 def record_opportunity(total_ask, edge, ya, yb, na, nb):
     payload = {
@@ -158,6 +147,7 @@ def record_opportunity(total_ask, edge, ya, yb, na, nb):
         supabase.table("bot_trades").insert(payload).execute()
     except Exception:
         logging.exception("Failed inserting OPPORTUNITY")
+
 
 def record_trade(token_id, side_label, status, price, edge, ya, na, response=None, error=None):
     meta = {**meta_template(edge, ya, na), "token_id": token_id, "side_label": side_label}
@@ -180,6 +170,7 @@ def record_trade(token_id, side_label, status, price, edge, ya, na, response=Non
     except Exception:
         logging.exception("Failed inserting bot_trades row")
 
+
 def update_best_quotes(asset_id, bid, ask):
     side = ASSET_TO_SIDE.get(asset_id)
     if not side:
@@ -188,6 +179,7 @@ def update_best_quotes(asset_id, bid, ask):
         best_quotes[side]["bid"] = bid
     if ask is not None:
         best_quotes[side]["ask"] = ask
+
 
 async def market_listener():
     subscribe_payload = {
@@ -240,29 +232,37 @@ async def market_listener():
             logging.exception("WS error, reconnecting")
             await asyncio.sleep(2)
 
+
 def prune_trade_history():
     cutoff = datetime.now(timezone.utc).timestamp() - 3600
     while trade_timestamps and trade_timestamps[0] < cutoff:
         trade_timestamps.popleft()
 
+
 def has_trade_capacity(required=2) -> bool:
     prune_trade_history()
     return (len(trade_timestamps) + required) <= MAX_TRADES_PER_HOUR
+
 
 def mark_trade_attempts(n=1):
     ts = datetime.now(timezone.utc).timestamp()
     for _ in range(n):
         trade_timestamps.append(ts)
 
-def build_trading_client() -> ClobClient:
+
+def build_trading_client() -> ClobClient | None:
+    if not HAVE_PRIVATE_KEY:
+        return None
     sig = int(SIGNATURE_TYPE)
     funder = FUNDER if FUNDER else None
     client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=sig, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
+
 def fmt(v):
     return f"{v:.6f}" if v is not None else "n/a"
+
 
 def submit_order(client: ClobClient, token_id: str, side_label: str, price: float, edge: float, ya: float, na: float):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors
@@ -270,7 +270,6 @@ def submit_order(client: ClobClient, token_id: str, side_label: str, price: floa
     try:
         order = OrderArgs(token_id=token_id, price=price, size=TRADE_SIZE, side=BUY)
         signed = client.create_order(order)
-        # IMPORTANT: match official usage: positional OrderType argument
         resp = client.post_order(signed, OrderType.FAK)
         record_trade(token_id, side_label, "SUBMITTED", price, edge, ya, na, response=resp)
         consecutive_trade_errors = 0
@@ -283,7 +282,8 @@ def submit_order(client: ClobClient, token_id: str, side_label: str, price: floa
             paused_due_to_errors = True
             logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
 
-async def heartbeat_loop(client: ClobClient):
+
+async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers
 
     while True:
@@ -311,10 +311,12 @@ async def heartbeat_loop(client: ClobClient):
             status = "PAUSED_MAX_TRADES"
             msg = msg + f" trade_triggers={trade_triggers}"
 
+        if not HAVE_PRIVATE_KEY and is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
+            status = "PAUSED_NO_PRIVATE_KEY"
+
         logging.info("%s %s", status, msg)
         record_heartbeat(status, msg)
 
-        # opportunity logging
         if is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
             record_opportunity(total_ask, edge, ya, yb, na, nb)
 
@@ -326,11 +328,11 @@ async def heartbeat_loop(client: ClobClient):
             and edge >= EDGE_THRESHOLD
             and not paused_due_to_errors
             and not paused_due_to_max_trades
+            and HAVE_PRIVATE_KEY
         )
 
-        if trading_allowed:
+        if trading_allowed and client:
             if has_trade_capacity(2):
-                # count a 2-leg attempt
                 trade_triggers += 1
                 mark_trade_attempts(2)
                 submit_order(client, YES_TOKEN_ID, "yes", ya, edge, ya, na)
@@ -339,6 +341,7 @@ async def heartbeat_loop(client: ClobClient):
                 logging.info("Rate limit reached; skipping")
 
         await asyncio.sleep(5)
+
 
 async def main():
     trading_client = build_trading_client()
@@ -349,6 +352,7 @@ async def main():
         listener.cancel()
         with suppress(asyncio.CancelledError):
             await listener
+
 
 if __name__ == "__main__":
     asyncio.run(main())
