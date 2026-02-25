@@ -189,20 +189,23 @@ async def market_listener():
     }
 
     def process_event(evt):
-        if not isinstance(evt, dict):
-            return
-        event_type = evt.get("event_type") or evt.get("eventType") or evt.get("type")
-        if event_type != "best_bid_ask":
-            return
-        data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
-        asset_id = (
-            data.get("asset_id")
-            or data.get("assetId")
-            or data.get("token_id")
-        )
-        bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
-        ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
-        update_best_quotes(asset_id, bid, ask)
+        try:
+            if not isinstance(evt, dict):
+                return
+            event_type = evt.get("event_type") or evt.get("eventType") or evt.get("type")
+            if event_type != "best_bid_ask":
+                return
+            data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
+            asset_id = (
+                data.get("asset_id")
+                or data.get("assetId")
+                or data.get("token_id")
+            )
+            bid = float_or_none(data.get("best_bid") or data.get("bestBid"))
+            ask = float_or_none(data.get("best_ask") or data.get("bestAsk"))
+            update_best_quotes(asset_id, bid, ask)
+        except Exception:
+            logging.exception("Error in process_event")
 
     while True:
         try:
@@ -222,7 +225,7 @@ async def market_listener():
                         if isinstance(payload, list):
                             for evt in payload:
                                 process_event(evt)
-                        else:
+                        elif isinstance(payload, dict):
                             process_event(payload)
                     except Exception:
                         logging.exception("Error processing WS payload")
