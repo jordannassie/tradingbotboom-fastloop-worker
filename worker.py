@@ -238,7 +238,7 @@ def extract_event_payload(event):
     return None, None
 
 
-def fetch_event_by_slug(slug):
+def fetch_event_by_slug_sync(slug):
     if not slug:
         return None
     base = "https://gamma-api.polymarket.com"
@@ -249,7 +249,8 @@ def fetch_event_by_slug(slug):
 
     for url in endpoints:
         try:
-            with request.urlopen(url, timeout=5) as resp:
+            req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+            with request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
         except Exception:
             continue
@@ -268,6 +269,10 @@ def fetch_event_by_slug(slug):
             return {"slug": slug, "outcomes": outcomes, "clobTokenIds": clob_ids}
 
     return None
+
+
+async def fetch_event_by_slug_async(slug):
+    return await asyncio.to_thread(fetch_event_by_slug_sync, slug)
 
 
 def compute_target_start(now_epoch):
@@ -304,6 +309,7 @@ async def rotate_loop():
             target_start,
             current_slug or "none",
         )
+        await asyncio.sleep(0)
         try:
             candidates = [
                 target_start,
@@ -316,9 +322,23 @@ async def rotate_loop():
                 if candidate < 0:
                     continue
                 slug = slug_from_start(candidate)
-                market = fetch_event_by_slug(slug)
-                found = bool(market)
-                logging.info("ROTATE_FETCH slug=%s found=%s", slug, "true" if found else "false")
+                logging.info("ROTATE_FETCH_START slug=%s", slug)
+                start_fetch = time()
+                market = None
+                found = False
+                try:
+                    market = await fetch_event_by_slug_async(slug)
+                    found = bool(market)
+                except Exception:
+                    logging.exception("ROTATE_ERROR")
+                    found = False
+                duration_ms = int((time() - start_fetch) * 1000)
+                logging.info(
+                    "ROTATE_FETCH_DONE slug=%s found=%s duration_ms=%s",
+                    slug,
+                    "true" if found else "false",
+                    duration_ms,
+                )
                 if found:
                     found_market = market
                     found_slug = slug
@@ -335,6 +355,11 @@ async def rotate_loop():
                         current_no_token = token
                 refresh_asset_map()
                 reset_best_quotes()
+                logging.info(
+                    "ASSET_MAP refreshed yes=%s no=%s",
+                    current_yes_token or "none",
+                    current_no_token or "none",
+                )
                 rotating = True
                 restart_ws_task()
                 logging.info(
