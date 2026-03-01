@@ -37,6 +37,7 @@ NO_TOKEN_ID = os.getenv("NO_TOKEN_ID")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "0")
 FUNDER = os.getenv("FUNDER")  # optional
+KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
 
 current_slug = None
 current_yes_token = YES_TOKEN_ID
@@ -83,6 +84,7 @@ last_trade_error = None
 paused_due_to_errors = False
 paused_due_to_max_trades = False
 trade_triggers = 0  # counts 2-leg attempts (YES+NO)
+last_paper_skip_ts = 0
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -125,20 +127,40 @@ def float_or_none(v):
 
 
 def read_is_enabled() -> bool:
+    settings = read_bot_settings()
+    return settings["is_enabled"]
+
+
+def read_bot_settings() -> dict[str, object]:
+    defaults = {
+        "is_enabled": False,
+        "mode": "PAPER",
+        "edge_threshold": EDGE_THRESHOLD,
+        "trade_size_usd": TRADE_SIZE,
+        "max_trades_per_hour": MAX_TRADES_PER_HOUR,
+    }
     try:
         resp = (
             supabase.table("bot_settings")
-            .select("is_enabled")
+            .select("is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour")
             .eq("bot_id", BOT_ID)
             .limit(1)
             .execute()
         )
         data = resp.data or []
-        if data:
-            return bool(data[0].get("is_enabled"))
+        if not data:
+            return defaults
+        row = data[0]
+        return {
+            "is_enabled": bool(row.get("is_enabled")),
+            "mode": (row.get("mode") or "PAPER").upper(),
+            "edge_threshold": float_or_none(row.get("edge_threshold")) or EDGE_THRESHOLD,
+            "trade_size_usd": float_or_none(row.get("trade_size_usd")) or TRADE_SIZE,
+            "max_trades_per_hour": int(row.get("max_trades_per_hour") or MAX_TRADES_PER_HOUR),
+        }
     except Exception:
         logging.exception("Failed reading bot_settings")
-    return False
+        return defaults
 
 
 def utc_now_iso() -> str:
@@ -184,7 +206,18 @@ def record_opportunity(total_ask, edge, ya, yb, na, nb):
         logging.exception("Failed inserting OPPORTUNITY")
 
 
-def record_trade(token_id, side_label, status, price, edge, ya, na, response=None, error=None):
+def record_trade(
+    token_id,
+    side_label,
+    status,
+    price,
+    edge,
+    ya,
+    na,
+    trade_size,
+    response=None,
+    error=None,
+):
     meta = {**meta_template(edge, ya, na), "token_id": token_id, "side_label": side_label}
     if response is not None:
         meta["response"] = response
@@ -197,7 +230,7 @@ def record_trade(token_id, side_label, status, price, edge, ya, na, response=Non
         "market": "FASTLOOP",
         "side": side_label,
         "price": price,
-        "size": TRADE_SIZE,
+        "size": trade_size,
         "status": status,
         "meta": meta,
     }
@@ -470,9 +503,9 @@ def prune_trade_history():
         trade_timestamps.popleft()
 
 
-def has_trade_capacity(required=2) -> bool:
+def has_trade_capacity(required=2, max_per_hour=MAX_TRADES_PER_HOUR) -> bool:
     prune_trade_history()
-    return (len(trade_timestamps) + required) <= MAX_TRADES_PER_HOUR
+    return (len(trade_timestamps) + required) <= max_per_hour
 
 
 def mark_trade_attempts(n=1):
@@ -495,30 +528,65 @@ def fmt(v):
     return f"{v:.6f}" if v is not None else "n/a"
 
 
-def submit_order(client: ClobClient, token_id: str, side_label: str, price: float, edge: float, ya: float, na: float):
+def submit_order(
+    client: ClobClient,
+    token_id: str,
+    side_label: str,
+    price: float,
+    edge: float,
+    ya: float,
+    na: float,
+    trade_size: float,
+):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors
 
     try:
-        order = OrderArgs(token_id=token_id, price=price, size=TRADE_SIZE, side=BUY)
+        order = OrderArgs(token_id=token_id, price=price, size=trade_size, side=BUY)
         signed = client.create_order(order)
         resp = client.post_order(signed, OrderType.FAK)
-        record_trade(token_id, side_label, "SUBMITTED", price, edge, ya, na, response=resp)
+        record_trade(
+            token_id,
+            side_label,
+            "SUBMITTED",
+            price,
+            edge,
+            ya,
+            na,
+            trade_size,
+            response=resp,
+        )
         consecutive_trade_errors = 0
         last_trade_error = None
     except Exception as exc:
         consecutive_trade_errors += 1
         last_trade_error = str(exc)[:512]
-        record_trade(token_id, side_label, "ERROR", price, edge, ya, na, error=str(exc))
+        record_trade(
+            token_id,
+            side_label,
+            "ERROR",
+            price,
+            edge,
+            ya,
+            na,
+            trade_size,
+            error=str(exc),
+        )
         if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
             paused_due_to_errors = True
             logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
 
 
 async def heartbeat_loop(client: ClobClient | None):
-    global paused_due_to_max_trades, trade_triggers, rotating
+    global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
 
     while True:
-        is_enabled = read_is_enabled()
+        now_ts = int(time())
+        settings = read_bot_settings()
+        is_enabled = settings["is_enabled"]
+        mode = settings["mode"]
+        edge_threshold = settings["edge_threshold"]
+        trade_size_usd = settings["trade_size_usd"]
+        max_trades_per_hour = settings["max_trades_per_hour"]
 
         ya = best_quotes["yes"]["ask"]
         na = best_quotes["no"]["ask"]
@@ -551,7 +619,7 @@ async def heartbeat_loop(client: ClobClient | None):
             and not HAVE_PRIVATE_KEY
             and is_enabled
             and edge is not None
-            and edge >= EDGE_THRESHOLD
+            and edge >= edge_threshold
         ):
             status = "PAUSED_NO_PRIVATE_KEY"
 
@@ -560,29 +628,93 @@ async def heartbeat_loop(client: ClobClient | None):
         logging.info("%s %s", status, msg_with_slug)
         record_heartbeat(status, msg_with_slug)
 
-        if is_enabled and edge is not None and edge >= EDGE_THRESHOLD:
+        if is_enabled and edge is not None and edge >= edge_threshold:
             record_opportunity(total_ask, edge, ya, yb, na, nb)
 
-        trading_allowed = (
+        paper_mode_active = is_enabled and (mode == "PAPER" or KILL_SWITCH)
+        if (
+            paper_mode_active
+            and edge is not None
+            and edge < edge_threshold
+            and now_ts - last_paper_skip_ts >= INTERVAL_SECONDS
+        ):
+            paper_skip_payload = {
+                "bot_id": BOT_ID,
+                "market": "FASTLOOP",
+                "market_slug": current_slug,
+                "side": "SKIP",
+                "price": total_ask,
+                "size": 0,
+                "status": "PAPER_DECISION",
+                "meta": {
+                    **meta_template(edge, ya, na),
+                    "threshold": edge_threshold,
+                    "mode": mode,
+                },
+            }
+            try:
+                supabase.table("bot_trades").insert(paper_skip_payload).execute()
+            except Exception:
+                logging.exception("Failed inserting PAPER_DECISION skip")
+            last_paper_skip_ts = now_ts
+
+        trading_condition = (
             is_enabled
             and edge is not None
             and ya is not None
             and na is not None
-            and edge >= EDGE_THRESHOLD
+            and edge >= edge_threshold
             and not paused_due_to_errors
             and not paused_due_to_max_trades
-            and HAVE_PRIVATE_KEY
             and current_yes_token
             and current_no_token
             and not rotating
         )
 
-        if trading_allowed and client:
-            if has_trade_capacity(2):
-                trade_triggers += 1
-                mark_trade_attempts(2)
-                submit_order(client, current_yes_token, "yes", ya, edge, ya, na)
-                submit_order(client, current_no_token, "no", na, edge, ya, na)
+        if trading_condition:
+            if has_trade_capacity(2, max_trades_per_hour):
+                if mode == "PAPER" or KILL_SWITCH:
+                    paper_payload = {
+                        "bot_id": BOT_ID,
+                        "market": "FASTLOOP",
+                        "side": "BUY_BOTH",
+                        "price": total_ask,
+                        "size": trade_size_usd,
+                        "status": "PAPER_DECISION",
+                        "meta": {
+                            **meta_template(edge, ya, na),
+                            "slug": current_slug,
+                            "action": "BUY_BOTH",
+                            "mode": mode,
+                        },
+                    }
+                    try:
+                        supabase.table("bot_trades").insert(paper_payload).execute()
+                    except Exception:
+                        logging.exception("Failed inserting PAPER_DECISION")
+                elif client:
+                    trade_triggers += 1
+                    mark_trade_attempts(2)
+                    submit_order(
+                        client,
+                        current_yes_token,
+                        "yes",
+                        ya,
+                        edge,
+                        ya,
+                        na,
+                        trade_size_usd,
+                    )
+                    submit_order(
+                        client,
+                        current_no_token,
+                        "no",
+                        na,
+                        edge,
+                        ya,
+                        na,
+                        trade_size_usd,
+                    )
             else:
                 logging.info("Rate limit reached; skipping")
 
