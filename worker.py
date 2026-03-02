@@ -19,6 +19,7 @@ from supabase import create_client
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 load_dotenv()
 
@@ -318,6 +319,22 @@ def compute_target_start(now_epoch):
 
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
+
+
+def _fetch_btc_spot_price_sync() -> float | None:
+    try:
+        req = request.Request(COINBASE_SPOT_URL, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        amount = data.get("data", {}).get("amount")
+        return float(amount) if amount is not None else None
+    except Exception:
+        logging.exception("Failed fetching BTC spot price")
+        return None
+
+
+async def fetch_btc_spot_price() -> float | None:
+    return await asyncio.to_thread(_fetch_btc_spot_price_sync)
 
 
 def slug_start_timestamp(slug: str | None) -> int | None:
@@ -724,6 +741,14 @@ async def heartbeat_loop(client: ClobClient | None):
                             "end_ts": start_ts + INTERVAL_SECONDS,
                             "status": "OPEN",
                         }
+                        start_price_at_open = await fetch_btc_spot_price()
+                        if start_price_at_open is not None:
+                            position_payload["start_price"] = start_price_at_open
+                        else:
+                            logging.warning(
+                                "Unable to fetch BTC spot price for paper_positions start slug=%s",
+                                current_slug,
+                            )
                         try:
                             supabase.table("paper_positions").insert(position_payload).execute()
                             logging.info(
@@ -764,14 +789,162 @@ async def heartbeat_loop(client: ClobClient | None):
             rotating = False
 
 
+async def paper_settlement_loop():
+    while True:
+        now_ts = int(time())
+        try:
+            resp = (
+                supabase.table("paper_positions")
+                .select(
+                    "id, market_slug, side, shares, size_usd, start_price",
+                )
+                .eq("bot_id", BOT_ID)
+                .eq("status", "OPEN")
+                .lte("end_ts", now_ts)
+                .execute()
+            )
+            rows = resp.data or []
+        except Exception:
+            logging.exception("Failed querying OPEN paper_positions")
+            rows = []
+
+        for row in rows:
+            row_id = row.get("id")
+            if not row_id:
+                continue
+            market_slug = row.get("market_slug")
+            row_side = (row.get("side") or "").lower()
+            shares = float_or_none(row.get("shares")) or 0.0
+            size_usd = float_or_none(row.get("size_usd")) or 0.0
+            start_price = float_or_none(row.get("start_price"))
+            if start_price is None:
+                start_price = await fetch_btc_spot_price()
+                if start_price is not None:
+                    try:
+                        supabase.table("paper_positions").update(
+                            {"start_price": start_price}
+                        ).eq("id", row_id).execute()
+                    except Exception:
+                        logging.exception("Failed updating paper_positions start_price")
+                else:
+                    logging.warning(
+                        "Skipping settlement without start_price id=%s slug=%s",
+                        row_id,
+                        market_slug,
+                    )
+                    continue
+
+            end_price = await fetch_btc_spot_price()
+            if end_price is None:
+                logging.warning(
+                    "Skipping settlement without end_price id=%s slug=%s",
+                    row_id,
+                    market_slug,
+                )
+                continue
+
+            resolved_side = "yes" if end_price >= start_price else "no"
+            payout_usd = shares if row_side == resolved_side else 0.0
+            pnl_usd = payout_usd - size_usd
+            closed_at = utc_now_iso()
+
+            position_updates = {
+                "status": "CLOSED",
+                "resolved_side": resolved_side,
+                "end_price": end_price,
+                "pnl_usd": pnl_usd,
+                "closed_at": closed_at,
+            }
+            try:
+                supabase.table("paper_positions").update(position_updates).eq("id", row_id).execute()
+            except Exception:
+                logging.exception("Failed updating paper_positions row id=%s", row_id)
+                continue
+
+            settings_row = None
+            try:
+                settings_resp = (
+                    supabase.table("bot_settings")
+                    .select("paper_balance_usd, paper_pnl_usd")
+                    .eq("bot_id", BOT_ID)
+                    .limit(1)
+                    .execute()
+                )
+                settings_row = (settings_resp.data or [None])[0]
+            except Exception:
+                logging.exception("Failed reading bot_settings for paper settlement")
+
+            balance = (
+                float_or_none(settings_row.get("paper_balance_usd"))
+                if settings_row
+                else 0.0
+            ) or 0.0
+            pnl_total = (
+                float_or_none(settings_row.get("paper_pnl_usd"))
+                if settings_row
+                else 0.0
+            ) or 0.0
+            new_balance = balance + pnl_usd
+            new_pnl_total = pnl_total + pnl_usd
+
+            settings_payload = {
+                "paper_balance_usd": new_balance,
+                "paper_pnl_usd": new_pnl_total,
+            }
+            try:
+                if settings_row:
+                    supabase.table("bot_settings").update(settings_payload).eq(
+                        "bot_id", BOT_ID
+                    ).execute()
+                else:
+                    supabase.table("bot_settings").insert(
+                        {"bot_id": BOT_ID, **settings_payload}
+                    ).execute()
+            except Exception:
+                logging.exception("Failed updating bot_settings for paper settlement")
+
+            trade_payload = {
+                "bot_id": BOT_ID,
+                "market": "FASTLOOP",
+                "market_slug": market_slug,
+                "side": row.get("side"),
+                "price": end_price,
+                "size": size_usd,
+                "status": "PAPER_CLOSED",
+                "meta": {
+                    "timestamp": closed_at,
+                    "pnl_usd": pnl_usd,
+                    "start_price": start_price,
+                    "end_price": end_price,
+                    "resolved_side": resolved_side,
+                    "shares": shares,
+                    "market_slug": market_slug,
+                },
+            }
+            try:
+                supabase.table("bot_trades").insert(trade_payload).execute()
+                logging.info(
+                    "Closed paper_position id=%s slug=%s pnl_usd=%s",
+                    row_id,
+                    market_slug,
+                    pnl_usd,
+                )
+            except Exception:
+                logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
+
+        await asyncio.sleep(15)
+
+
 async def main():
     trading_client = build_trading_client()
     rotator = asyncio.create_task(rotate_loop())
+    settlement = asyncio.create_task(paper_settlement_loop())
     restart_ws_task()
     try:
         await heartbeat_loop(trading_client)
     finally:
         rotator.cancel()
+        settlement.cancel()
         if ws_task:
             ws_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -779,6 +952,8 @@ async def main():
         with suppress(asyncio.CancelledError):
             if ws_task:
                 await ws_task
+        with suppress(asyncio.CancelledError):
+            await settlement
 
 
 if __name__ == "__main__":
