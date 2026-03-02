@@ -320,6 +320,15 @@ def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
 
+def slug_start_timestamp(slug: str | None) -> int | None:
+    if not slug:
+        return None
+    try:
+        return int(slug.rsplit("-", 1)[-1])
+    except ValueError:
+        return None
+
+
 def restart_ws_task():
     global ws_task
     if ws_task:
@@ -692,6 +701,38 @@ async def heartbeat_loop(client: ClobClient | None):
                         supabase.table("bot_trades").insert(paper_payload).execute()
                     except Exception:
                         logging.exception("Failed inserting PAPER_DECISION")
+                    paper_side = "yes" if ya <= na else "no"
+                    entry_price = ya if ya <= na else na
+                    start_ts = slug_start_timestamp(current_slug)
+                    if entry_price is None or entry_price <= 0 or start_ts is None:
+                        logging.warning(
+                            "Skipping paper_positions insert slug=%s entry_price=%s start_ts=%s",
+                            current_slug,
+                            entry_price,
+                            start_ts,
+                        )
+                    else:
+                        shares = trade_size_usd / entry_price
+                        position_payload = {
+                            "bot_id": BOT_ID,
+                            "market_slug": current_slug,
+                            "side": paper_side,
+                            "entry_price": entry_price,
+                            "size_usd": trade_size_usd,
+                            "shares": shares,
+                            "start_ts": start_ts,
+                            "end_ts": start_ts + INTERVAL_SECONDS,
+                            "status": "OPEN",
+                        }
+                        try:
+                            supabase.table("paper_positions").insert(position_payload).execute()
+                            logging.info(
+                                "Inserted OPEN paper_positions row slug=%s side=%s",
+                                current_slug,
+                                paper_side,
+                            )
+                        except Exception:
+                            logging.exception("Failed inserting paper_positions row")
                 elif client:
                     trade_triggers += 1
                     mark_trade_attempts(2)
