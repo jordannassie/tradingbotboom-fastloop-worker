@@ -23,6 +23,7 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
 SNIPER_SECONDS_THRESHOLD = 30
+DEFAULT_PAPER_START_BALANCE = 1000.0
 
 load_dotenv()
 
@@ -49,6 +50,7 @@ current_no_token = NO_TOKEN_ID
 HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 rotating = False
 ws_task = None
+HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -470,6 +472,93 @@ async def create_paper_strategy_position(
             "Failed inserting paper_positions row for strategy_id=%s",
             strategy_id,
         )
+
+
+def fetch_bot_settings_row() -> dict[str, object] | None:
+    global HAS_PAPER_START_BALANCE_COLUMN
+    columns = ["paper_balance_usd", "paper_pnl_usd"]
+    include_start = HAS_PAPER_START_BALANCE_COLUMN is not False
+    if include_start:
+        columns.append("paper_start_balance_usd")
+
+    col_str = ",".join(columns)
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select(col_str)
+            .eq("bot_id", BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        if include_start:
+            HAS_PAPER_START_BALANCE_COLUMN = True
+        return (resp.data or [None])[0]
+    except Exception:
+        if include_start:
+            HAS_PAPER_START_BALANCE_COLUMN = False
+            try:
+                resp = (
+                    supabase.table("bot_settings")
+                    .select("paper_balance_usd, paper_pnl_usd")
+                    .eq("bot_id", BOT_ID)
+                    .limit(1)
+                    .execute()
+                )
+                return (resp.data or [None])[0]
+            except Exception:
+                logging.exception("Failed reading bot_settings without start balance")
+                return None
+        logging.exception("Failed reading bot_settings")
+        return None
+
+
+def sum_closed_paper_pnl() -> float | None:
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("pnl_usd")
+            .eq("bot_id", BOT_ID)
+            .eq("status", "CLOSED")
+            .execute()
+        )
+        data = resp.data or []
+        return sum(float_or_none(row.get("pnl_usd")) or 0.0 for row in data)
+    except Exception:
+        logging.exception("Failed summing closed paper_positions pnl")
+        return None
+
+
+def update_paper_settings_from_positions() -> None:
+    pnl_total = sum_closed_paper_pnl()
+    if pnl_total is None:
+        return
+
+    settings_row = fetch_bot_settings_row()
+    start_balance = None
+    if settings_row:
+        if HAS_PAPER_START_BALANCE_COLUMN and "paper_start_balance_usd" in settings_row:
+            start_balance = float_or_none(settings_row.get("paper_start_balance_usd"))
+        if start_balance is None:
+            start_balance = float_or_none(settings_row.get("paper_balance_usd"))
+
+    if start_balance is None:
+        start_balance = DEFAULT_PAPER_START_BALANCE
+
+    new_balance = start_balance + pnl_total
+    payload = {
+        "paper_balance_usd": new_balance,
+        "paper_pnl_usd": pnl_total,
+    }
+    if HAS_PAPER_START_BALANCE_COLUMN:
+        payload["paper_start_balance_usd"] = start_balance
+
+    try:
+        if settings_row:
+            supabase.table("bot_settings").update(payload).eq("bot_id", BOT_ID).execute()
+        else:
+            supabase.table("bot_settings").insert({"bot_id": BOT_ID, **payload}).execute()
+    except Exception:
+        logging.exception("Failed updating bot_settings after paper settlement")
 
 
 def slug_start_timestamp(slug: str | None) -> int | None:
@@ -961,48 +1050,6 @@ async def paper_settlement_loop():
                 logging.exception("Failed updating paper_positions row id=%s", row_id)
                 continue
 
-            settings_row = None
-            try:
-                settings_resp = (
-                    supabase.table("bot_settings")
-                    .select("paper_balance_usd, paper_pnl_usd")
-                    .eq("bot_id", BOT_ID)
-                    .limit(1)
-                    .execute()
-                )
-                settings_row = (settings_resp.data or [None])[0]
-            except Exception:
-                logging.exception("Failed reading bot_settings for paper settlement")
-
-            balance = (
-                float_or_none(settings_row.get("paper_balance_usd"))
-                if settings_row
-                else 0.0
-            ) or 0.0
-            pnl_total = (
-                float_or_none(settings_row.get("paper_pnl_usd"))
-                if settings_row
-                else 0.0
-            ) or 0.0
-            new_balance = balance + pnl_usd
-            new_pnl_total = pnl_total + pnl_usd
-
-            settings_payload = {
-                "paper_balance_usd": new_balance,
-                "paper_pnl_usd": new_pnl_total,
-            }
-            try:
-                if settings_row:
-                    supabase.table("bot_settings").update(settings_payload).eq(
-                        "bot_id", BOT_ID
-                    ).execute()
-                else:
-                    supabase.table("bot_settings").insert(
-                        {"bot_id": BOT_ID, **settings_payload}
-                    ).execute()
-            except Exception:
-                logging.exception("Failed updating bot_settings for paper settlement")
-
             trade_payload = {
                 "bot_id": BOT_ID,
                 "market": "FASTLOOP",
@@ -1033,6 +1080,9 @@ async def paper_settlement_loop():
                 )
             except Exception:
                 logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
+
+        if rows:
+            update_paper_settings_from_positions()
 
         await asyncio.sleep(15)
 
