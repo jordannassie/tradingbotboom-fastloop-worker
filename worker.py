@@ -20,6 +20,9 @@ HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+STRATEGY_FASTLOOP = "FASTLOOP"
+STRATEGY_SNIPER = "SNIPER"
+SNIPER_SECONDS_THRESHOLD = 30
 
 load_dotenv()
 
@@ -335,6 +338,138 @@ def _fetch_btc_spot_price_sync() -> float | None:
 
 async def fetch_btc_spot_price() -> float | None:
     return await asyncio.to_thread(_fetch_btc_spot_price_sync)
+
+
+async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str) -> bool:
+    if not market_slug:
+        return False
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("id")
+            .eq("bot_id", BOT_ID)
+            .eq("market_slug", market_slug)
+            .eq("strategy_id", strategy_id)
+            .eq("status", "OPEN")
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        logging.exception(
+            "Failed checking open paper_positions for strategy=%s slug=%s",
+            strategy_id,
+            market_slug,
+        )
+        return True
+
+
+def seconds_to_window_end(now_ts: int) -> int | None:
+    start_ts = slug_start_timestamp(current_slug)
+    if start_ts is None:
+        return None
+    end_ts = start_ts + INTERVAL_SECONDS
+    return max(0, end_ts - now_ts)
+
+
+async def create_paper_strategy_position(
+    strategy_id: str,
+    action_label: str,
+    edge: float | None,
+    ya: float | None,
+    na: float | None,
+    total_ask: float | None,
+    trade_size_usd: float,
+    mode: str,
+) -> None:
+    if not current_slug:
+        logging.warning("Missing slug for strategy %s paper decision", strategy_id)
+        return
+
+    if await has_open_paper_position_for_strategy(current_slug, strategy_id):
+        logging.info(
+            "Skipping new paper_position since one is already open slug=%s strategy_id=%s",
+            current_slug,
+            strategy_id,
+        )
+        return
+
+    if ya is None or na is None:
+        return
+
+    paper_side = "yes" if ya <= na else "no"
+    entry_price = ya if paper_side == "yes" else na
+    start_ts = slug_start_timestamp(current_slug)
+    if entry_price is None or entry_price <= 0 or start_ts is None:
+        logging.warning(
+            "Skipping paper_positions insert slug=%s entry_price=%s start_ts=%s",
+            current_slug,
+            entry_price,
+            start_ts,
+        )
+        return
+
+    meta = {
+        **meta_template(edge, ya, na),
+        "slug": current_slug,
+        "action": action_label,
+        "mode": mode,
+        "strategy_id": strategy_id,
+    }
+
+    paper_payload = {
+        "bot_id": BOT_ID,
+        "market": "FASTLOOP",
+        "side": "BUY_BOTH",
+        "price": total_ask,
+        "size": trade_size_usd,
+        "status": "PAPER_DECISION",
+        "strategy_id": strategy_id,
+        "meta": meta,
+    }
+
+    try:
+        supabase.table("bot_trades").insert(paper_payload).execute()
+    except Exception:
+        logging.exception("Failed inserting PAPER_DECISION for strategy %s", strategy_id)
+
+    shares = trade_size_usd / entry_price
+    position_payload = {
+        "bot_id": BOT_ID,
+        "market_slug": current_slug,
+        "side": paper_side,
+        "entry_price": entry_price,
+        "size_usd": trade_size_usd,
+        "shares": shares,
+        "start_ts": start_ts,
+        "end_ts": start_ts + INTERVAL_SECONDS,
+        "status": "OPEN",
+        "strategy_id": strategy_id,
+    }
+
+    start_price_at_open = await fetch_btc_spot_price()
+    if start_price_at_open is not None:
+        position_payload["start_price"] = start_price_at_open
+    else:
+        logging.warning(
+            "Unable to fetch BTC spot price for paper_positions start slug=%s strategy_id=%s",
+            current_slug,
+            strategy_id,
+        )
+
+    try:
+        supabase.table("paper_positions").insert(position_payload).execute()
+        logging.info(
+            "Inserted OPEN paper_positions row slug=%s side=%s strategy_id=%s",
+            current_slug,
+            paper_side,
+            strategy_id,
+        )
+    except Exception:
+        logging.exception(
+            "Failed inserting paper_positions row for strategy_id=%s",
+            strategy_id,
+        )
 
 
 def slug_start_timestamp(slug: str | None) -> int | None:
@@ -700,64 +835,28 @@ async def heartbeat_loop(client: ClobClient | None):
         if trading_condition:
             if has_trade_capacity(2, max_trades_per_hour):
                 if mode == "PAPER" or KILL_SWITCH:
-                    paper_payload = {
-                        "bot_id": BOT_ID,
-                        "market": "FASTLOOP",
-                        "side": "BUY_BOTH",
-                        "price": total_ask,
-                        "size": trade_size_usd,
-                        "status": "PAPER_DECISION",
-                        "meta": {
-                            **meta_template(edge, ya, na),
-                            "slug": current_slug,
-                            "action": "BUY_BOTH",
-                            "mode": mode,
-                        },
-                    }
-                    try:
-                        supabase.table("bot_trades").insert(paper_payload).execute()
-                    except Exception:
-                        logging.exception("Failed inserting PAPER_DECISION")
-                    paper_side = "yes" if ya <= na else "no"
-                    entry_price = ya if ya <= na else na
-                    start_ts = slug_start_timestamp(current_slug)
-                    if entry_price is None or entry_price <= 0 or start_ts is None:
-                        logging.warning(
-                            "Skipping paper_positions insert slug=%s entry_price=%s start_ts=%s",
-                            current_slug,
-                            entry_price,
-                            start_ts,
+                    seconds_remaining = seconds_to_window_end(now_ts)
+                    await create_paper_strategy_position(
+                        STRATEGY_FASTLOOP,
+                        "BUY_BOTH",
+                        edge,
+                        ya,
+                        na,
+                        total_ask,
+                        trade_size_usd,
+                        mode,
+                    )
+                    if seconds_remaining is not None and seconds_remaining <= SNIPER_SECONDS_THRESHOLD:
+                        await create_paper_strategy_position(
+                            STRATEGY_SNIPER,
+                            "SNIPER",
+                            edge,
+                            ya,
+                            na,
+                            total_ask,
+                            trade_size_usd,
+                            mode,
                         )
-                    else:
-                        shares = trade_size_usd / entry_price
-                        position_payload = {
-                            "bot_id": BOT_ID,
-                            "market_slug": current_slug,
-                            "side": paper_side,
-                            "entry_price": entry_price,
-                            "size_usd": trade_size_usd,
-                            "shares": shares,
-                            "start_ts": start_ts,
-                            "end_ts": start_ts + INTERVAL_SECONDS,
-                            "status": "OPEN",
-                        }
-                        start_price_at_open = await fetch_btc_spot_price()
-                        if start_price_at_open is not None:
-                            position_payload["start_price"] = start_price_at_open
-                        else:
-                            logging.warning(
-                                "Unable to fetch BTC spot price for paper_positions start slug=%s",
-                                current_slug,
-                            )
-                        try:
-                            supabase.table("paper_positions").insert(position_payload).execute()
-                            logging.info(
-                                "Inserted OPEN paper_positions row slug=%s side=%s",
-                                current_slug,
-                                paper_side,
-                            )
-                        except Exception:
-                            logging.exception("Failed inserting paper_positions row")
                 elif client:
                     trade_triggers += 1
                     mark_trade_attempts(2)
@@ -796,7 +895,7 @@ async def paper_settlement_loop():
             resp = (
                 supabase.table("paper_positions")
                 .select(
-                    "id, market_slug, side, shares, size_usd, start_price",
+                    "id, market_slug, side, shares, size_usd, start_price, strategy_id",
                 )
                 .eq("bot_id", BOT_ID)
                 .eq("status", "OPEN")
@@ -814,6 +913,7 @@ async def paper_settlement_loop():
                 continue
             market_slug = row.get("market_slug")
             row_side = (row.get("side") or "").lower()
+            strategy_id = row.get("strategy_id")
             shares = float_or_none(row.get("shares")) or 0.0
             size_usd = float_or_none(row.get("size_usd")) or 0.0
             start_price = float_or_none(row.get("start_price"))
@@ -907,6 +1007,7 @@ async def paper_settlement_loop():
                 "bot_id": BOT_ID,
                 "market": "FASTLOOP",
                 "market_slug": market_slug,
+                "strategy_id": strategy_id,
                 "side": row.get("side"),
                 "price": end_price,
                 "size": size_usd,
@@ -919,6 +1020,7 @@ async def paper_settlement_loop():
                     "resolved_side": resolved_side,
                     "shares": shares,
                     "market_slug": market_slug,
+                    "strategy_id": strategy_id,
                 },
             }
             try:
