@@ -50,6 +50,7 @@ current_no_token = NO_TOKEN_ID
 HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 rotating = False
 ws_task = None
+live_balance_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -340,6 +341,39 @@ def _fetch_btc_spot_price_sync() -> float | None:
 
 async def fetch_btc_spot_price() -> float | None:
     return await asyncio.to_thread(_fetch_btc_spot_price_sync)
+
+
+def get_live_balance_usd(client: ClobClient | None) -> float | None:
+    if not client:
+        return None
+    try:
+        resp = client.get_balance(asset_type="COLLATERAL")
+        if not resp:
+            return None
+        for key in ("balance", "collateral_balance", "amount", "collateralBalance"):
+            value = resp.get(key)
+            if value is not None:
+                return float(value)
+        return None
+    except Exception:
+        logging.exception("Failed fetching live collateral balance")
+        return None
+
+
+async def live_balance_loop(client: ClobClient | None):
+    while True:
+        balance = get_live_balance_usd(client)
+        if balance is not None:
+            try:
+                supabase.table("bot_settings").update(
+                    {
+                        "live_balance_usd": balance,
+                        "live_updated_at": utc_now_iso(),
+                    }
+                ).eq("bot_id", BOT_ID).execute()
+            except Exception:
+                logging.exception("Failed updating live balance bot_settings")
+        await asyncio.sleep(60)
 
 
 async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str) -> bool:
@@ -1091,12 +1125,16 @@ async def main():
     trading_client = build_trading_client()
     rotator = asyncio.create_task(rotate_loop())
     settlement = asyncio.create_task(paper_settlement_loop())
+    global live_balance_task
+    live_balance_task = asyncio.create_task(live_balance_loop(trading_client))
     restart_ws_task()
     try:
         await heartbeat_loop(trading_client)
     finally:
         rotator.cancel()
         settlement.cancel()
+        if live_balance_task:
+            live_balance_task.cancel()
         if ws_task:
             ws_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -1106,6 +1144,9 @@ async def main():
                 await ws_task
         with suppress(asyncio.CancelledError):
             await settlement
+        with suppress(asyncio.CancelledError):
+            if live_balance_task:
+                await live_balance_task
 
 
 if __name__ == "__main__":
