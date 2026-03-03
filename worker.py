@@ -34,6 +34,11 @@ STRATEGY_COPY_BOT_ID = "paper_copy"
 STRATEGY_SCALPER_BOT_ID = "paper_scalper"
 LIVE_MASTER_BOT_ID = "live"
 
+COPY_TARGET_WALLET = os.getenv(
+    "COPY_TARGET_WALLET", "0xd0d6053c3c37e727402d84c14069780d360993aa"
+)
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
 load_dotenv()
 
 logging.basicConfig(
@@ -61,6 +66,7 @@ rotating = False
 ws_task = None
 live_balance_task = None
 scan_task = None
+copy_watch_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -80,6 +86,8 @@ best_quotes = {
 }
 
 ASSET_TO_SIDE = {}
+copy_last_seen_trade_ids = deque()
+copy_seen_trade_id_set = set()
 
 def refresh_asset_map():
     ASSET_TO_SIDE.clear()
@@ -580,6 +588,42 @@ async def fetch_event_by_slug_async(slug):
     return await asyncio.to_thread(fetch_event_by_slug_sync, slug)
 
 
+def track_copy_trade_id(trade_id: str) -> bool:
+    if trade_id in copy_seen_trade_id_set:
+        return False
+    copy_last_seen_trade_ids.append(trade_id)
+    copy_seen_trade_id_set.add(trade_id)
+    if len(copy_last_seen_trade_ids) > 500:
+        old = copy_last_seen_trade_ids.popleft()
+        copy_seen_trade_id_set.discard(old)
+    return True
+
+
+def fetch_copy_feed() -> list[dict]:
+    if not COPY_TARGET_WALLET:
+        return []
+    url = f"{GAMMA_API_BASE}/trades?accountId={parse.quote(COPY_TARGET_WALLET)}&limit=50"
+    try:
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        logging.warning("COPY_FEED_UNAVAILABLE url=%s error=%s", url, exc)
+        return []
+
+    trades = data
+    if isinstance(data, dict):
+        if "trades" in data and isinstance(data["trades"], list):
+            trades = data["trades"]
+        elif "data" in data and isinstance(data["data"], list):
+            trades = data["data"]
+        else:
+            trades = []
+    if not isinstance(trades, list):
+        return []
+    return trades
+
+
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
@@ -670,6 +714,36 @@ async def scan_loop():
         except Exception:
             logging.exception("Failed inserting SCAN bot_trades row")
         await asyncio.sleep(60)
+
+
+async def copy_watch_loop():
+    while True:
+        settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
+        if settings["is_enabled"]:
+            trades = fetch_copy_feed()
+            for trade in trades:
+                trade_id = trade.get("id") or trade.get("tradeId") or trade.get("hash")
+                if not trade_id:
+                    continue
+                if not track_copy_trade_id(trade_id):
+                    continue
+                market_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("market") or "none"
+                trade_side = (trade.get("outcome") or trade.get("side") or trade.get("symbol") or "").upper()
+                if trade_side not in {"YES", "NO"}:
+                    trade_side = trade.get("type", "UNKNOWN").upper()
+                action = (trade.get("action") or trade.get("type") or trade.get("direction") or "UNKNOWN").upper()
+                size = float_or_none(trade.get("size") or trade.get("amount") or trade.get("sizeUsd") or 0.0)
+                price = float_or_none(trade.get("price") or trade.get("executionPrice"))
+                logging.info(
+                    "COPY_FEED trade_id=%s side=%s action=%s size=%s price=%s market_slug=%s",
+                    trade_id,
+                    trade_side,
+                    action,
+                    size,
+                    price,
+                    market_slug,
+                )
+        await asyncio.sleep(10)
 
 
 async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str, bot_id: str) -> bool:
@@ -1441,6 +1515,8 @@ async def main():
     global live_balance_task, scan_task
     live_balance_task = asyncio.create_task(live_balance_loop(trading_client))
     scan_task = asyncio.create_task(scan_loop())
+    global copy_watch_task
+    copy_watch_task = asyncio.create_task(copy_watch_loop())
     restart_ws_task()
     try:
         await heartbeat_loop(trading_client)
@@ -1451,6 +1527,8 @@ async def main():
             live_balance_task.cancel()
         if scan_task:
             scan_task.cancel()
+        if copy_watch_task:
+            copy_watch_task.cancel()
         if ws_task:
             ws_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -1463,6 +1541,9 @@ async def main():
         with suppress(asyncio.CancelledError):
             if live_balance_task:
                 await live_balance_task
+        with suppress(asyncio.CancelledError):
+            if copy_watch_task:
+                await copy_watch_task
         with suppress(asyncio.CancelledError):
             if scan_task:
                 await scan_task
