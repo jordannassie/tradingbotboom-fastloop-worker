@@ -24,6 +24,11 @@ STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
 SNIPER_SECONDS_THRESHOLD = 30
 DEFAULT_PAPER_START_BALANCE = 1000.0
+SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
+
+STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
+STRATEGY_SNIPER_BOT_ID = "paper_sniper"
+LIVE_MASTER_BOT_ID = "live"
 
 load_dotenv()
 
@@ -85,7 +90,12 @@ def reset_best_quotes():
     best_quotes["no"]["ask"] = None
 
 refresh_asset_map()
-trade_timestamps = deque()
+strategy_trade_timestamps = {
+    STRATEGY_SNIPER: deque(),
+    STRATEGY_FASTLOOP: deque(),
+}
+strategy_missing_rows: set[str] = set()
+live_master_warned = False
 consecutive_trade_errors = 0
 last_trade_error = None
 paused_due_to_errors = False
@@ -133,41 +143,269 @@ def float_or_none(v):
         return None
 
 
-def read_is_enabled() -> bool:
-    settings = read_bot_settings()
-    return settings["is_enabled"]
-
-
-def read_bot_settings() -> dict[str, object]:
+def read_strategy_settings(bot_id: str) -> dict[str, object]:
     defaults = {
+        "bot_id": bot_id,
         "is_enabled": False,
         "mode": "PAPER",
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size_usd": TRADE_SIZE,
         "max_trades_per_hour": MAX_TRADES_PER_HOUR,
+        "paper_balance_usd": 0.0,
+        "arm_live": False,
     }
+    columns = "is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour, paper_balance_usd, arm_live"
     try:
         resp = (
             supabase.table("bot_settings")
-            .select("is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour")
-            .eq("bot_id", BOT_ID)
+            .select(columns)
+            .eq("bot_id", bot_id)
             .limit(1)
             .execute()
         )
         data = resp.data or []
         if not data:
+            if bot_id not in strategy_missing_rows:
+                logging.warning("Missing bot_settings row for %s; treating as disabled", bot_id)
+                strategy_missing_rows.add(bot_id)
             return defaults
         row = data[0]
-        return {
+        settings = {
+            "bot_id": bot_id,
             "is_enabled": bool(row.get("is_enabled")),
             "mode": (row.get("mode") or "PAPER").upper(),
             "edge_threshold": float_or_none(row.get("edge_threshold")) or EDGE_THRESHOLD,
             "trade_size_usd": float_or_none(row.get("trade_size_usd")) or TRADE_SIZE,
             "max_trades_per_hour": int(row.get("max_trades_per_hour") or MAX_TRADES_PER_HOUR),
+            "paper_balance_usd": float_or_none(row.get("paper_balance_usd")) or 0.0,
+            "arm_live": bool(row.get("arm_live")),
         }
+        logging.info(
+            "Loaded strategy settings bot_id=%s is_enabled=%s edge_threshold=%s arm_live=%s",
+            bot_id,
+            settings["is_enabled"],
+            settings["edge_threshold"],
+            settings["arm_live"],
+        )
+        return settings
     except Exception:
-        logging.exception("Failed reading bot_settings")
+        logging.exception("Failed reading bot_settings for %s", bot_id)
         return defaults
+
+
+def read_live_master_enabled() -> bool:
+    global live_master_warned
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("is_enabled, live_enabled")
+            .eq("bot_id", LIVE_MASTER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        data = resp.data or []
+        if not data:
+            if not live_master_warned:
+                logging.warning("Missing live master bot_settings row; treating LIVE_ON as disabled")
+                live_master_warned = True
+            return False
+        row = data[0]
+        live_enabled = row.get("live_enabled")
+        enabled = bool(live_enabled) if live_enabled is not None else bool(row.get("is_enabled"))
+        logging.info("Live master fetched: live_master_enabled=%s", enabled)
+        return enabled
+    except Exception:
+        logging.exception("Failed reading live master settings")
+        return False
+
+
+def prune_strategy_trade_history(strategy_id: str):
+    cutoff = datetime.now(timezone.utc).timestamp() - 3600
+    dq = strategy_trade_timestamps[strategy_id]
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+
+def has_strategy_trade_capacity(strategy_id: str, required=2, max_per_hour=MAX_TRADES_PER_HOUR) -> bool:
+    prune_strategy_trade_history(strategy_id)
+    dq = strategy_trade_timestamps[strategy_id]
+    return (len(dq) + required) <= max_per_hour
+
+
+def mark_strategy_trade_attempts(strategy_id: str, n=1):
+    ts = datetime.now(timezone.utc).timestamp()
+    dq = strategy_trade_timestamps[strategy_id]
+    for _ in range(n):
+        dq.append(ts)
+
+
+def compute_strategy_size(settings: dict[str, object], strategy_id: str) -> float:
+    base_size = max(settings["trade_size_usd"], 0.0)
+    if strategy_id == STRATEGY_SNIPER:
+        paper_balance = settings.get("paper_balance_usd") or 0.0
+        if base_size <= 1 and paper_balance > 0:
+            base_size = paper_balance * base_size
+        size = min(base_size, SNIPER_SIZE_CAP_USD)
+    else:
+        size = base_size
+    return size
+
+
+def compute_shares_from_size(size_usd: float, price: float) -> float:
+    if not price or price <= 0:
+        return 0.0
+    raw = size_usd / price
+    if raw <= 0:
+        return 0.0
+    return floor(raw * 1e8) / 1e8
+
+
+def should_trade_strategy(settings: dict[str, object], strategy_id: str, edge: float | None) -> bool:
+    if not settings["is_enabled"]:
+        return False
+    if settings["mode"] != "PAPER":
+        return False
+    if edge is None or edge < settings["edge_threshold"]:
+        return False
+    if not has_strategy_trade_capacity(
+        strategy_id, 2, settings["max_trades_per_hour"]
+    ):
+        logging.info(
+            "Rate limit reached for %s max_trades_per_hour=%s",
+            strategy_id,
+            settings["max_trades_per_hour"],
+        )
+        return False
+    return True
+
+
+def execute_live_strategy(
+    client: ClobClient | None,
+    strategy_id: str,
+    edge: float,
+    ya: float,
+    na: float,
+    size_usd: float,
+) -> bool:
+    global trade_triggers
+    if not client or not current_yes_token or not current_no_token:
+        return False
+    logging.info(
+        "LIVE_EXEC strategy=%s slug=%s size_usd=%s",
+        strategy_id,
+        current_slug,
+        size_usd,
+    )
+    trade_triggers += 1
+    try:
+        submit_order(
+            client,
+            current_yes_token,
+            "yes",
+            ya,
+            edge,
+            ya,
+            na,
+            size_usd,
+            strategy_id=strategy_id,
+        )
+        submit_order(
+            client,
+            current_no_token,
+            "no",
+            na,
+            edge,
+            ya,
+            na,
+            size_usd,
+            strategy_id=strategy_id,
+        )
+        return True
+    except Exception:
+        logging.exception("Live execution failed for strategy %s", strategy_id)
+        return False
+
+
+async def execute_strategy(
+    strategy_id: str,
+    action_label: str,
+    settings: dict[str, object],
+    edge: float,
+    total_ask: float | None,
+    ya: float,
+    na: float,
+    client: ClobClient | None,
+    live_master_enabled: bool,
+) -> bool:
+    if not current_slug:
+        logging.warning("Missing slug; skipping strategy %s", strategy_id)
+        return False
+    paper_side = "yes" if ya <= na else "no"
+    entry_price = ya if paper_side == "yes" else na
+    if entry_price is None or entry_price <= 0:
+        logging.warning("Invalid entry price for %s slug=%s", strategy_id, current_slug)
+        return False
+
+    size_usd = compute_strategy_size(settings, strategy_id)
+    shares = compute_shares_from_size(size_usd, entry_price)
+    if size_usd <= 0:
+        logging.warning(
+            "Skipping %s: size_usd=%s price=%s shares=%s reason=size<=0",
+            strategy_id,
+            size_usd,
+            entry_price,
+            shares,
+        )
+        return False
+    if shares <= 0:
+        logging.warning(
+            "Skipping %s: size_usd=%s price=%s shares=%s reason=shares<=0",
+            strategy_id,
+            size_usd,
+            entry_price,
+            shares,
+        )
+        return False
+
+    route_live = live_master_enabled and settings["arm_live"]
+    executed_live = False
+    if route_live:
+        logging.info(
+            "Live gating requested for strategy=%s arm_live=%s live_master_enabled=%s",
+            strategy_id,
+            settings["arm_live"],
+            live_master_enabled,
+        )
+        executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, size_usd)
+        if not executed_live:
+            logging.info(
+                "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
+                strategy_id,
+                live_master_enabled,
+                "available" if client else "missing",
+            )
+
+    if not executed_live:
+        logging.info(
+            "PAPER_EXEC strategy=%s slug=%s size_usd=%s",
+            strategy_id,
+            current_slug,
+            size_usd,
+        )
+        await create_paper_strategy_position(
+            strategy_id,
+            action_label,
+            edge,
+            ya,
+            na,
+            total_ask,
+            size_usd,
+            shares,
+            settings["mode"],
+        )
+
+    mark_strategy_trade_attempts(strategy_id, 2)
+    return True
 
 
 def utc_now_iso() -> str:
@@ -224,6 +462,7 @@ def record_trade(
     trade_size,
     response=None,
     error=None,
+    strategy_id: str | None = None,
 ):
     meta = {**meta_template(edge, ya, na), "token_id": token_id, "side_label": side_label}
     if response is not None:
@@ -231,6 +470,8 @@ def record_trade(
     if error is not None:
         meta["error"] = error
     meta["slug"] = current_slug
+    if strategy_id:
+        meta["strategy_id"] = strategy_id
 
     payload = {
         "bot_id": BOT_ID,
@@ -400,14 +641,6 @@ async def has_open_paper_position_for_strategy(market_slug: str | None, strategy
         return True
 
 
-def seconds_to_window_end(now_ts: int) -> int | None:
-    start_ts = slug_start_timestamp(current_slug)
-    if start_ts is None:
-        return None
-    end_ts = start_ts + INTERVAL_SECONDS
-    return max(0, end_ts - now_ts)
-
-
 async def create_paper_strategy_position(
     strategy_id: str,
     action_label: str,
@@ -415,7 +648,8 @@ async def create_paper_strategy_position(
     ya: float | None,
     na: float | None,
     total_ask: float | None,
-    trade_size_usd: float,
+    size_usd: float,
+    shares: float,
     mode: str,
 ) -> None:
     if not current_slug:
@@ -458,7 +692,7 @@ async def create_paper_strategy_position(
         "market": "FASTLOOP",
         "side": "BUY_BOTH",
         "price": total_ask,
-        "size": trade_size_usd,
+        "size": size_usd,
         "status": "PAPER_DECISION",
         "strategy_id": strategy_id,
         "meta": meta,
@@ -469,13 +703,12 @@ async def create_paper_strategy_position(
     except Exception:
         logging.exception("Failed inserting PAPER_DECISION for strategy %s", strategy_id)
 
-    shares = trade_size_usd / entry_price
     position_payload = {
         "bot_id": BOT_ID,
         "market_slug": current_slug,
         "side": paper_side,
         "entry_price": entry_price,
-        "size_usd": trade_size_usd,
+        "size_usd": size_usd,
         "shares": shares,
         "start_ts": start_ts,
         "end_ts": start_ts + INTERVAL_SECONDS,
@@ -781,23 +1014,6 @@ async def market_listener():
             await asyncio.sleep(2)
 
 
-def prune_trade_history():
-    cutoff = datetime.now(timezone.utc).timestamp() - 3600
-    while trade_timestamps and trade_timestamps[0] < cutoff:
-        trade_timestamps.popleft()
-
-
-def has_trade_capacity(required=2, max_per_hour=MAX_TRADES_PER_HOUR) -> bool:
-    prune_trade_history()
-    return (len(trade_timestamps) + required) <= max_per_hour
-
-
-def mark_trade_attempts(n=1):
-    ts = datetime.now(timezone.utc).timestamp()
-    for _ in range(n):
-        trade_timestamps.append(ts)
-
-
 def build_trading_client() -> ClobClient | None:
     if not HAVE_PRIVATE_KEY:
         return None
@@ -821,6 +1037,7 @@ def submit_order(
     ya: float,
     na: float,
     trade_size: float,
+    strategy_id: str | None = None,
 ):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors
 
@@ -837,6 +1054,7 @@ def submit_order(
             ya,
             na,
             trade_size,
+            strategy_id=strategy_id,
             response=resp,
         )
         consecutive_trade_errors = 0
@@ -854,6 +1072,7 @@ def submit_order(
             na,
             trade_size,
             error=str(exc),
+            strategy_id=strategy_id,
         )
         if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
             paused_due_to_errors = True
@@ -865,12 +1084,12 @@ async def heartbeat_loop(client: ClobClient | None):
 
     while True:
         now_ts = int(time())
-        settings = read_bot_settings()
-        is_enabled = settings["is_enabled"]
-        mode = settings["mode"]
-        edge_threshold = settings["edge_threshold"]
-        trade_size_usd = settings["trade_size_usd"]
-        max_trades_per_hour = settings["max_trades_per_hour"]
+        sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
+        fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
+        live_master_enabled = read_live_master_enabled()
+        is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"]
+        mode = fastloop_settings["mode"]
+        edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
 
         ya = best_quotes["yes"]["ask"]
         na = best_quotes["no"]["ask"]
@@ -880,8 +1099,11 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
 
-        status = "ENABLED" if is_enabled else "DISABLED"
-        msg = f"ya={fmt(ya)} na={fmt(na)} total={fmt(total_ask)} edge={fmt(edge)}"
+        status = "ENABLED" if is_enabled_combined else "DISABLED"
+        msg = (
+            f"ya={fmt(ya)} na={fmt(na)} total={fmt(total_ask)} edge={fmt(edge)} "
+            f"sniper_enabled={sniper_settings['is_enabled']} fastloop_enabled={fastloop_settings['is_enabled']}"
+        )
 
         if rotating:
             status = "PAUSED_ROTATING"
@@ -901,7 +1123,7 @@ async def heartbeat_loop(client: ClobClient | None):
         if (
             not rotating
             and not HAVE_PRIVATE_KEY
-            and is_enabled
+            and is_enabled_combined
             and edge is not None
             and edge >= edge_threshold
         ):
@@ -912,10 +1134,21 @@ async def heartbeat_loop(client: ClobClient | None):
         logging.info("%s %s", status, msg_with_slug)
         record_heartbeat(status, msg_with_slug)
 
-        if is_enabled and edge is not None and edge >= edge_threshold:
+        if (
+            is_enabled_combined
+            and edge is not None
+            and edge >= edge_threshold
+        ):
             record_opportunity(total_ask, edge, ya, yb, na, nb)
 
-        paper_mode_active = is_enabled and (mode == "PAPER" or KILL_SWITCH)
+        paper_mode_active = (
+            is_enabled_combined
+            and (
+                (sniper_settings["mode"] == "PAPER")
+                or (fastloop_settings["mode"] == "PAPER")
+                or KILL_SWITCH
+            )
+        )
         if (
             paper_mode_active
             and edge is not None
@@ -943,7 +1176,7 @@ async def heartbeat_loop(client: ClobClient | None):
             last_paper_skip_ts = now_ts
 
         trading_condition = (
-            is_enabled
+            is_enabled_combined
             and edge is not None
             and ya is not None
             and na is not None
@@ -956,56 +1189,34 @@ async def heartbeat_loop(client: ClobClient | None):
         )
 
         if trading_condition:
-            if has_trade_capacity(2, max_trades_per_hour):
-                if mode == "PAPER" or KILL_SWITCH:
-                    seconds_remaining = seconds_to_window_end(now_ts)
-                    await create_paper_strategy_position(
+            sniper_traded = False
+            if should_trade_strategy(sniper_settings, STRATEGY_SNIPER, edge):
+                sniper_traded = await execute_strategy(
+                    STRATEGY_SNIPER,
+                    "SNIPER",
+                    sniper_settings,
+                    edge,
+                    total_ask,
+                    ya,
+                    na,
+                    client,
+                    live_master_enabled,
+                )
+            if sniper_traded:
+                logging.info("SNIPER blocked FASTLOOP slug=%s", current_slug or "none")
+            else:
+                if should_trade_strategy(fastloop_settings, STRATEGY_FASTLOOP, edge):
+                    await execute_strategy(
                         STRATEGY_FASTLOOP,
                         "BUY_BOTH",
+                        fastloop_settings,
                         edge,
-                        ya,
-                        na,
                         total_ask,
-                        trade_size_usd,
-                        mode,
-                    )
-                    if seconds_remaining is not None and seconds_remaining <= SNIPER_SECONDS_THRESHOLD:
-                        await create_paper_strategy_position(
-                            STRATEGY_SNIPER,
-                            "SNIPER",
-                            edge,
-                            ya,
-                            na,
-                            total_ask,
-                            trade_size_usd,
-                            mode,
-                        )
-                elif client:
-                    trade_triggers += 1
-                    mark_trade_attempts(2)
-                    submit_order(
+                        ya,
+                        na,
                         client,
-                        current_yes_token,
-                        "yes",
-                        ya,
-                        edge,
-                        ya,
-                        na,
-                        trade_size_usd,
+                        live_master_enabled,
                     )
-                    submit_order(
-                        client,
-                        current_no_token,
-                        "no",
-                        na,
-                        edge,
-                        ya,
-                        na,
-                        trade_size_usd,
-                    )
-            else:
-                logging.info("Rate limit reached; skipping")
-
         await asyncio.sleep(5)
         if rotating:
             rotating = False
