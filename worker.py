@@ -56,6 +56,7 @@ HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 rotating = False
 ws_task = None
 live_balance_task = None
+scan_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -122,6 +123,7 @@ if not MARKET_SLUG_PREFIXES:
 logging.info("MARKET_SLUG_PREFIXES parsed: %s", MARKET_SLUG_PREFIXES)
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
 current_interval_seconds = INTERVAL_SECONDS
+current_prefix = MARKET_SLUG_PREFIXES[0] if MARKET_SLUG_PREFIXES else MARKET_SLUG_PREFIX
 ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
 ROTATE_LOOKAHEAD_SECONDS = int(os.getenv("ROTATE_LOOKAHEAD_SECONDS", "20"))
 
@@ -627,6 +629,45 @@ async def live_balance_loop(client: ClobClient | None):
         await asyncio.sleep(60)
 
 
+async def scan_loop():
+    while True:
+        prefix = current_prefix or (MARKET_SLUG_PREFIXES[0] if MARKET_SLUG_PREFIXES else MARKET_SLUG_PREFIX)
+        slug = current_slug or "none"
+        ya = best_quotes["yes"]["ask"]
+        na = best_quotes["no"]["ask"]
+        total = (ya + na) if (ya is not None and na is not None) else None
+        edge = (1.0 - total) if (total is not None) else None
+        reason = ""
+        if ya is None or na is None:
+            reason = "prices_n/a"
+        payload = {
+            "bot_id": BOT_ID,
+            "market": "FASTLOOP",
+            "market_slug": slug,
+            "side": "SYSTEM",
+            "price": total,
+            "size": 0,
+            "type": "SCAN",
+            "status": "SCAN",
+            "strategy_id": "SYSTEM",
+            "meta": {
+                "active_prefix": prefix,
+                "slug": slug,
+                "ya": ya,
+                "na": na,
+                "total": total,
+                "edge": edge,
+                "reason": reason,
+                "timestamp": utc_now_iso(),
+            },
+        }
+        try:
+            supabase.table("bot_trades").insert(payload).execute()
+        except Exception:
+            logging.exception("Failed inserting SCAN bot_trades row")
+        await asyncio.sleep(60)
+
+
 async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str, bot_id: str) -> bool:
     if not market_slug:
         return False
@@ -895,7 +936,7 @@ def restart_ws_task():
 async def rotate_loop():
     if not AUTO_ROTATE_ENABLED:
         return
-    global current_slug, current_yes_token, current_no_token, rotating, current_interval_seconds
+    global current_slug, current_yes_token, current_no_token, rotating, current_interval_seconds, current_prefix
     current_slug = None
     prefix_index = 0
     prefixes = MARKET_SLUG_PREFIXES
@@ -915,6 +956,7 @@ async def rotate_loop():
             slug,
         )
         current_interval_seconds = interval
+        current_prefix = prefix
         await asyncio.sleep(0)
         try:
             market = await fetch_event_by_slug_async(slug)
@@ -1378,8 +1420,9 @@ async def main():
     trading_client = build_trading_client()
     rotator = asyncio.create_task(rotate_loop())
     settlement = asyncio.create_task(paper_settlement_loop())
-    global live_balance_task
+    global live_balance_task, scan_task
     live_balance_task = asyncio.create_task(live_balance_loop(trading_client))
+    scan_task = asyncio.create_task(scan_loop())
     restart_ws_task()
     try:
         await heartbeat_loop(trading_client)
@@ -1388,6 +1431,8 @@ async def main():
         settlement.cancel()
         if live_balance_task:
             live_balance_task.cancel()
+        if scan_task:
+            scan_task.cancel()
         if ws_task:
             ws_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -1400,6 +1445,9 @@ async def main():
         with suppress(asyncio.CancelledError):
             if live_balance_task:
                 await live_balance_task
+        with suppress(asyncio.CancelledError):
+            if scan_task:
+                await scan_task
 
 
 if __name__ == "__main__":
