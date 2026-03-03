@@ -335,6 +335,64 @@ def create_copy_paper_position(
         return False
 
 
+def get_copy_open_position(market_slug: str, side: str):
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("id, shares, size_usd, entry_price, start_ts, market_slug, side")
+            .eq("bot_id", STRATEGY_COPY_BOT_ID)
+            .eq("strategy_id", STRATEGY_COPY)
+            .eq("status", "OPEN")
+            .eq("market_slug", market_slug)
+            .eq("side", side)
+            .order("start_ts", {"ascending": True})
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        logging.exception("Failed querying COPY open position slug=%s side=%s", market_slug, side)
+        return None
+
+
+def approx_mid_price():
+    ya = best_quotes["yes"]["ask"]
+    na = best_quotes["no"]["ask"]
+    if ya is None or na is None:
+        return None
+    return (ya + na) / 2
+
+
+def close_copy_position(position, exit_price: float, approx: bool):
+    row_id = position.get("id")
+    shares = float_or_none(position.get("shares")) or 0.0
+    size_usd = float_or_none(position.get("size_usd")) or 0.0
+    if shares <= 0 or size_usd <= 0:
+        logging.warning("COPY_CLOSE skip invalid shares/size id=%s shares=%s size=%s", row_id, shares, size_usd)
+        return None
+    payout = shares * exit_price
+    pnl_usd = payout - size_usd
+    updates = {
+        "status": "CLOSED",
+        "end_price": exit_price,
+        "pnl_usd": pnl_usd,
+        "resolved_side": position.get("side"),
+        "closed_at": utc_now_iso(),
+    }
+    try:
+        supabase.table("paper_positions").update(updates).eq("id", row_id).execute()
+        logging.info(
+            "COPY_SELL_MIRROR slug=%s side=%s exit_price=%s pnl_usd=%s approx=%s",
+            position.get("market_slug"),
+            position.get("side"),
+            exit_price,
+            pnl_usd,
+            approx,
+        )
+    except Exception:
+        logging.exception("Failed closing COPY position id=%s", row_id)
+
 def interval_from_prefix(prefix: str) -> int:
     if "-15m" in prefix:
         return 900
@@ -830,6 +888,16 @@ async def copy_watch_loop():
                         price,
                         size,
                     )
+                    if market_slug:
+                        position = get_copy_open_position(market_slug, trade_side)
+                        if position:
+                            exit_price = price
+                            approx = False
+                            if exit_price is None:
+                                exit_price = approx_mid_price() or price or 0.0
+                                approx = True
+                            if exit_price and exit_price > 0:
+                                close_copy_position(position, exit_price, approx)
                 logging.info(
                     "COPY_FEED trade_id=%s side=%s action=%s size=%s price=%s market_slug=%s",
                     trade_id,
