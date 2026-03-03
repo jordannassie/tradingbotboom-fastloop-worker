@@ -27,6 +27,7 @@ STRATEGY_SCALPER = "SCALPER"
 SNIPER_SECONDS_THRESHOLD = 30
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
+COPY_SIZE_CAP_USD = float(os.getenv("COPY_SIZE_CAP_USD", "50"))
 
 STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
 STRATEGY_SNIPER_BOT_ID = "paper_sniper"
@@ -106,6 +107,7 @@ refresh_asset_map()
 strategy_trade_timestamps = {
     STRATEGY_SNIPER: deque(),
     STRATEGY_FASTLOOP: deque(),
+    STRATEGY_COPY: deque(),
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
@@ -270,6 +272,11 @@ def compute_strategy_size(settings: dict[str, object], strategy_id: str) -> floa
         if base_size <= 1 and paper_balance > 0:
             base_size = paper_balance * base_size
         size = min(base_size, SNIPER_SIZE_CAP_USD)
+    elif strategy_id == STRATEGY_COPY:
+        paper_balance = settings.get("paper_balance_usd") or 0.0
+        if base_size <= 1 and paper_balance > 0:
+            base_size = paper_balance * base_size
+        size = min(base_size, COPY_SIZE_CAP_USD)
     else:
         size = base_size
     return size
@@ -282,6 +289,50 @@ def compute_shares_from_size(size_usd: float, price: float) -> float:
     if raw <= 0:
         return 0.0
     return floor(raw * 1e8) / 1e8
+
+
+def create_copy_paper_position(
+    market_slug: str,
+    side: str,
+    entry_price: float,
+    size_usd: float,
+    shares: float,
+    meta: dict[str, object],
+) -> bool:
+    start_ts = slug_start_timestamp(market_slug)
+    if start_ts is None:
+        logging.warning("COPY_BUY_MIRROR skip slug=%s start_ts missing", market_slug)
+        return False
+
+    position_payload = {
+        "bot_id": STRATEGY_COPY_BOT_ID,
+        "market_slug": market_slug,
+        "side": side,
+        "entry_price": entry_price,
+        "size_usd": size_usd,
+        "shares": shares,
+        "start_ts": start_ts,
+        "end_ts": start_ts + current_interval_seconds,
+        "status": "OPEN",
+        "strategy_id": STRATEGY_COPY,
+        "meta": meta,
+    }
+    position_payload["meta"].setdefault("timestamp", utc_now_iso())
+    try:
+        supabase.table("paper_positions").insert(position_payload).execute()
+        logging.info(
+            "COPY_BUY_MIRROR slug=%s side=%s price=%s size_usd=%s shares=%s meta=%s",
+            market_slug,
+            side.upper(),
+            entry_price,
+            size_usd,
+            shares,
+            {k: position_payload["meta"].get(k) for k in ("target_trade_id", "target_wallet")},
+        )
+        return True
+    except Exception:
+        logging.exception("Failed inserting COPY paper_positions row")
+        return False
 
 
 def interval_from_prefix(prefix: str) -> int:
@@ -728,12 +779,57 @@ async def copy_watch_loop():
                 if not track_copy_trade_id(trade_id):
                     continue
                 market_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("market") or "none"
-                trade_side = (trade.get("outcome") or trade.get("side") or trade.get("symbol") or "").upper()
-                if trade_side not in {"YES", "NO"}:
-                    trade_side = trade.get("type", "UNKNOWN").upper()
-                action = (trade.get("action") or trade.get("type") or trade.get("direction") or "UNKNOWN").upper()
+                trade_side = (trade.get("outcome") or trade.get("side") or trade.get("symbol") or "").lower()
+                if trade_side not in {"yes", "no"}:
+                    trade_side = (trade.get("type") or "unknown").lower()
+                action = (trade.get("action") or trade.get("type") or trade.get("direction") or "unknown").upper()
                 size = float_or_none(trade.get("size") or trade.get("amount") or trade.get("sizeUsd") or 0.0)
                 price = float_or_none(trade.get("price") or trade.get("executionPrice"))
+                if action == "BUY":
+                    if not price or not market_slug:
+                        continue
+                    if not has_strategy_trade_capacity(
+                        STRATEGY_COPY, 2, settings["max_trades_per_hour"]
+                    ):
+                        logging.info(
+                            "Rate limit reached for COPY max_trades_per_hour=%s",
+                            settings["max_trades_per_hour"],
+                        )
+                        continue
+                    size_usd = compute_strategy_size(settings, STRATEGY_COPY)
+                    shares = compute_shares_from_size(size_usd, price)
+                    if size_usd <= 0 or shares <= 0:
+                        logging.warning(
+                            "COPY_BUY_MIRROR skip trade_id=%s size_usd=%s shares=%s",
+                            trade_id,
+                            size_usd,
+                            shares,
+                        )
+                        continue
+                    if not create_copy_paper_position(
+                        market_slug,
+                        trade_side,
+                        price,
+                        size_usd,
+                        shares,
+                        {
+                            "target_wallet": COPY_TARGET_WALLET,
+                            "target_trade_id": trade_id,
+                            "target_price": price,
+                            "target_size": size,
+                        },
+                    ):
+                        continue
+                    mark_strategy_trade_attempts(STRATEGY_COPY, 2)
+                else:
+                    logging.info(
+                        "COPY_SELL_SEEN trade_id=%s slug=%s side=%s price=%s size=%s",
+                        trade_id,
+                        market_slug,
+                        trade_side,
+                        price,
+                        size,
+                    )
                 logging.info(
                     "COPY_FEED trade_id=%s side=%s action=%s size=%s price=%s market_slug=%s",
                     trade_id,
