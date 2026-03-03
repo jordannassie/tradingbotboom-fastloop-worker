@@ -35,6 +35,13 @@ STRATEGY_COPY_BOT_ID = "paper_copy"
 STRATEGY_SCALPER_BOT_ID = "paper_scalper"
 LIVE_MASTER_BOT_ID = "live"
 
+STRATEGY_TO_BOT_ID = {
+    STRATEGY_FASTLOOP: STRATEGY_FASTLOOP_BOT_ID,
+    STRATEGY_SNIPER: STRATEGY_SNIPER_BOT_ID,
+    STRATEGY_COPY: STRATEGY_COPY_BOT_ID,
+    STRATEGY_SCALPER: STRATEGY_SCALPER_BOT_ID,
+}
+
 COPY_TARGET_WALLET = os.getenv(
     "COPY_TARGET_WALLET", "0xd0d6053c3c37e727402d84c14069780d360993aa"
 )
@@ -931,6 +938,10 @@ async def copy_watch_loop():
         await asyncio.sleep(10)
 
 
+def get_paper_bot_id(strategy_id: str) -> str:
+    return STRATEGY_TO_BOT_ID.get(strategy_id, BOT_ID)
+
+
 async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str, bot_id: str) -> bool:
     if not market_slug:
         return False
@@ -970,9 +981,7 @@ async def create_paper_strategy_position(
         logging.warning("Missing slug for strategy %s paper decision", strategy_id)
         return
 
-    strategy_bot_id = (
-        STRATEGY_SNIPER_BOT_ID if strategy_id == STRATEGY_SNIPER else STRATEGY_FASTLOOP_BOT_ID
-    )
+    strategy_bot_id = get_paper_bot_id(strategy_id)
     if await has_open_paper_position_for_strategy(current_slug, strategy_id, strategy_bot_id):
         logging.info(
             "Skipping new paper_position since one is already open slug=%s strategy_id=%s",
@@ -1004,8 +1013,9 @@ async def create_paper_strategy_position(
         "strategy_id": strategy_id,
     }
 
+    bot_id_override = get_paper_bot_id(strategy_id)
     paper_payload = {
-        "bot_id": BOT_ID,
+        "bot_id": bot_id_override,
         "market": "FASTLOOP",
         "side": "BUY_BOTH",
         "price": total_ask,
@@ -1021,7 +1031,7 @@ async def create_paper_strategy_position(
         logging.exception("Failed inserting PAPER_DECISION for strategy %s", strategy_id)
 
     position_payload = {
-        "bot_id": BOT_ID,
+        "bot_id": bot_id_override,
         "market_slug": current_slug,
         "side": paper_side,
         "entry_price": entry_price,
@@ -1046,10 +1056,11 @@ async def create_paper_strategy_position(
     try:
         supabase.table("paper_positions").insert(position_payload).execute()
         logging.info(
-            "Inserted OPEN paper_positions row slug=%s side=%s strategy_id=%s",
-            current_slug,
-            paper_side,
+            "PAPER_OPEN bot_id=%s strategy_id=%s slug=%s end_ts=%s",
+            bot_id_override,
             strategy_id,
+            position_payload["market_slug"],
+            position_payload["end_ts"],
         )
     except Exception:
         logging.exception(
@@ -1579,7 +1590,16 @@ async def paper_settlement_loop():
                 .select(
                     "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id",
                 )
-                .in_("bot_id", [STRATEGY_FASTLOOP_BOT_ID, STRATEGY_SNIPER_BOT_ID])
+                .in_(
+                    "bot_id",
+                    [
+                        STRATEGY_FASTLOOP_BOT_ID,
+                        STRATEGY_SNIPER_BOT_ID,
+                        STRATEGY_COPY_BOT_ID,
+                        STRATEGY_SCALPER_BOT_ID,
+                        BOT_ID,
+                    ],
+                )
                 .eq("status", "OPEN")
                 .lte("end_ts", now_ts)
                 .execute()
@@ -1589,15 +1609,19 @@ async def paper_settlement_loop():
             logging.exception("Failed querying OPEN paper_positions")
             rows = []
 
-        if rows:
-            fastloop_count = sum(1 for r in rows if r.get("bot_id") == STRATEGY_FASTLOOP_BOT_ID)
-            sniper_count = sum(1 for r in rows if r.get("bot_id") == STRATEGY_SNIPER_BOT_ID)
-            logging.info(
-                "Found OPEN paper_positions fastloop=%d sniper=%d total=%d",
-                fastloop_count,
-                sniper_count,
-                len(rows),
-            )
+            if rows:
+                counts = {bot_id: sum(1 for r in rows if r.get("bot_id") == bot_id) for bot_id in [
+                    STRATEGY_FASTLOOP_BOT_ID,
+                    STRATEGY_SNIPER_BOT_ID,
+                    STRATEGY_COPY_BOT_ID,
+                    STRATEGY_SCALPER_BOT_ID,
+                    BOT_ID,
+                ]}
+                logging.info(
+                    "Found OPEN paper_positions %s total=%d",
+                    ", ".join(f"{bot_id}={counts[bot_id]}" for bot_id in counts),
+                    len(rows),
+                )
 
         for row in rows:
             row_id = row.get("id")
@@ -1681,6 +1705,13 @@ async def paper_settlement_loop():
                 logging.info(
                     "Closed paper_position id=%s slug=%s pnl_usd=%s",
                     row_id,
+                    market_slug,
+                    pnl_usd,
+                )
+                logging.info(
+                    "PAPER_CLOSE bot_id=%s strategy_id=%s slug=%s pnl_usd=%s",
+                    bot_id,
+                    strategy_id,
                     market_slug,
                     pnl_usd,
                 )
