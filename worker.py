@@ -22,12 +22,16 @@ WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
+STRATEGY_COPY = "COPY"
+STRATEGY_SCALPER = "SCALPER"
 SNIPER_SECONDS_THRESHOLD = 30
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
 
 STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
 STRATEGY_SNIPER_BOT_ID = "paper_sniper"
+STRATEGY_COPY_BOT_ID = "paper_copy"
+STRATEGY_SCALPER_BOT_ID = "paper_scalper"
 LIVE_MASTER_BOT_ID = "live"
 
 load_dotenv()
@@ -1157,6 +1161,20 @@ async def heartbeat_loop(client: ClobClient | None):
         now_ts = int(time())
         sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
         fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
+        copy_settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
+        scalper_settings = read_strategy_settings(STRATEGY_SCALPER_BOT_ID)
+        logging.info(
+            "Loaded strategy settings bot_id=%s is_enabled=%s arm_live=%s",
+            STRATEGY_COPY_BOT_ID,
+            copy_settings["is_enabled"],
+            copy_settings["arm_live"],
+        )
+        logging.info(
+            "Loaded strategy settings bot_id=%s is_enabled=%s arm_live=%s",
+            STRATEGY_SCALPER_BOT_ID,
+            scalper_settings["is_enabled"],
+            scalper_settings["arm_live"],
+        )
         live_master_enabled = read_live_master_enabled()
         is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"]
         mode = fastloop_settings["mode"]
