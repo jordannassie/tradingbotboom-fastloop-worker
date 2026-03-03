@@ -57,6 +57,7 @@ rotating = False
 ws_task = None
 live_balance_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
+current_interval_seconds = INTERVAL_SECONDS
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -111,6 +112,15 @@ MAX_CONSECUTIVE_ERRORS = 5
 AUTO_ROTATE_ENV = os.getenv("AUTO_ROTATE", "true")
 AUTO_ROTATE_ENABLED = AUTO_ROTATE_ENV.strip().lower() in ("1", "true", "yes", "y")
 MARKET_SLUG_PREFIX = os.getenv("MARKET_SLUG_PREFIX", "btc-updown-5m")
+MARKET_SLUG_PREFIXES_ENV = os.getenv("MARKET_SLUG_PREFIXES", "")
+MARKET_SLUG_PREFIXES = [
+    prefix.strip()
+    for prefix in MARKET_SLUG_PREFIXES_ENV.split(",")
+    if prefix.strip()
+]
+if not MARKET_SLUG_PREFIXES:
+    MARKET_SLUG_PREFIXES = [MARKET_SLUG_PREFIX]
+logging.info("MARKET_SLUG_PREFIXES parsed: %s", MARKET_SLUG_PREFIXES)
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
 ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
 ROTATE_LOOKAHEAD_SECONDS = int(os.getenv("ROTATE_LOOKAHEAD_SECONDS", "20"))
@@ -124,10 +134,10 @@ logging.info(
     (FUNDER[:6] + "...") if FUNDER else "None",
 )
 logging.info(
-    "Rotation config AUTO_ROTATE_ENABLED=%s AUTO_ROTATE_RAW=%s MARKET_SLUG_PREFIX=%s INTERVAL_SECONDS=%s ROTATE_POLL_SECONDS=%s ROTATE_LOOKAHEAD_SECONDS=%s",
+    "Rotation config AUTO_ROTATE_ENABLED=%s AUTO_ROTATE_RAW=%s MARKET_SLUG_PREFIXES=%s INTERVAL_SECONDS=%s ROTATE_POLL_SECONDS=%s ROTATE_LOOKAHEAD_SECONDS=%s",
     AUTO_ROTATE_ENABLED,
     AUTO_ROTATE_ENV,
-    MARKET_SLUG_PREFIX,
+    ",".join(MARKET_SLUG_PREFIXES),
     INTERVAL_SECONDS,
     ROTATE_POLL_SECONDS,
     ROTATE_LOOKAHEAD_SECONDS,
@@ -258,6 +268,14 @@ def compute_shares_from_size(size_usd: float, price: float) -> float:
     if raw <= 0:
         return 0.0
     return floor(raw * 1e8) / 1e8
+
+
+def interval_from_prefix(prefix: str) -> int:
+    if "-15m" in prefix:
+        return 900
+    if "-5m" in prefix:
+        return 300
+    return INTERVAL_SECONDS
 
 
 def should_trade_strategy(settings: dict[str, object], strategy_id: str, edge: float | None) -> bool:
@@ -552,18 +570,6 @@ def fetch_event_by_slug_sync(slug):
     return None
 
 
-async def fetch_event_by_slug_async(slug):
-    return await asyncio.to_thread(fetch_event_by_slug_sync, slug)
-
-
-def compute_target_start(now_epoch):
-    interval = INTERVAL_SECONDS
-    start = floor(now_epoch / interval) * interval
-    if (start + interval - now_epoch) <= ROTATE_LOOKAHEAD_SECONDS:
-        return start + interval
-    return start
-
-
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
@@ -714,7 +720,7 @@ async def create_paper_strategy_position(
         "size_usd": size_usd,
         "shares": shares,
         "start_ts": start_ts,
-        "end_ts": start_ts + INTERVAL_SECONDS,
+        "end_ts": start_ts + current_interval_seconds,
         "status": "OPEN",
         "strategy_id": strategy_id,
     }
@@ -885,56 +891,34 @@ def restart_ws_task():
 async def rotate_loop():
     if not AUTO_ROTATE_ENABLED:
         return
-    global current_slug, current_yes_token, current_no_token, rotating
+    global current_slug, current_yes_token, current_no_token, rotating, current_interval_seconds
     current_slug = None
+    prefix_index = 0
+    prefixes = MARKET_SLUG_PREFIXES
     while True:
+        prefix = prefixes[prefix_index]
+        interval = interval_from_prefix(prefix)
         now = int(time())
-        target_start = compute_target_start(now)
+        target_start = floor(now / interval) * interval
+        slug = f"{prefix}-{target_start}"
         logging.info(
-            "ROTATE_TICK now=%s target_start=%s current_slug=%s",
-            now,
+            "ROTATE_PREFIX i=%d/%d prefix=%s interval=%s target_start=%s slug=%s",
+            prefix_index + 1,
+            len(prefixes),
+            prefix,
+            interval,
             target_start,
-            current_slug or "none",
+            slug,
         )
+        current_interval_seconds = interval
         await asyncio.sleep(0)
         try:
-            candidates = [
-                target_start,
-                target_start - INTERVAL_SECONDS,
-                target_start + INTERVAL_SECONDS,
-            ]
-            found_market = None
-            found_slug = None
-            for candidate in candidates:
-                if candidate < 0:
-                    continue
-                slug = slug_from_start(candidate)
-                logging.info("ROTATE_FETCH_START slug=%s", slug)
-                start_fetch = time()
-                market = None
-                found = False
-                try:
-                    market = await fetch_event_by_slug_async(slug)
-                    found = bool(market)
-                except Exception:
-                    logging.exception("ROTATE_ERROR")
-                    found = False
-                duration_ms = int((time() - start_fetch) * 1000)
-                logging.info(
-                    "ROTATE_FETCH_DONE slug=%s found=%s duration_ms=%s",
-                    slug,
-                    "true" if found else "false",
-                    duration_ms,
-                )
-                if found:
-                    found_market = market
-                    found_slug = slug
-                    break
-
-            if found_market and found_slug != current_slug:
-                current_slug = found_slug
-                outcomes = [o.lower() for o in found_market["outcomes"]]
-                clobs = found_market["clobTokenIds"]
+            market = await fetch_event_by_slug_async(slug)
+            found = bool(market)
+            if found and slug != current_slug:
+                current_slug = slug
+                outcomes = [o.lower() for o in market["outcomes"]]
+                clobs = market["clobTokenIds"]
                 for name, token in zip(outcomes, clobs):
                     if name == "up":
                         current_yes_token = token
@@ -957,6 +941,7 @@ async def rotate_loop():
                 )
         except Exception:
             logging.exception("ROTATE_ERROR")
+        prefix_index = (prefix_index + 1) % len(prefixes)
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
 
@@ -1190,7 +1175,7 @@ async def heartbeat_loop(client: ClobClient | None):
             paper_mode_active
             and edge is not None
             and edge < edge_threshold
-            and now_ts - last_paper_skip_ts >= INTERVAL_SECONDS
+            and now_ts - last_paper_skip_ts >= current_interval_seconds
         ):
             paper_skip_payload = {
                 "bot_id": BOT_ID,
