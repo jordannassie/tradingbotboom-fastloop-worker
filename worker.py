@@ -27,7 +27,7 @@ STRATEGY_SCALPER = "SCALPER"
 SNIPER_SECONDS_THRESHOLD = 30
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
-COPY_SIZE_CAP_USD = float(os.getenv("COPY_SIZE_CAP_USD", "50"))
+COPY_SIZE_CAP_USD = float(os.getenv("COPY_SIZE_CAP_USD", "25"))
 
 STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
 STRATEGY_SNIPER_BOT_ID = "paper_sniper"
@@ -111,6 +111,7 @@ strategy_trade_timestamps = {
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
+last_copy_target_log_ts = 0
 consecutive_trade_errors = 0
 last_trade_error = None
 paused_due_to_errors = False
@@ -179,8 +180,9 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         "max_trades_per_hour": MAX_TRADES_PER_HOUR,
         "paper_balance_usd": 0.0,
         "arm_live": False,
+        "copy_target_wallet": COPY_TARGET_WALLET,
     }
-    columns = "is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour, paper_balance_usd, arm_live"
+    columns = "is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour, paper_balance_usd, arm_live, strategy_settings"
     try:
         resp = (
             supabase.table("bot_settings")
@@ -196,6 +198,16 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
                 strategy_missing_rows.add(bot_id)
             return defaults
         row = data[0]
+        raw_strategy_settings = row.get("strategy_settings")
+        parsed_strategy = {}
+        if isinstance(raw_strategy_settings, str):
+            try:
+                parsed_strategy = json.loads(raw_strategy_settings)
+            except json.JSONDecodeError:
+                parsed_strategy = {}
+        elif isinstance(raw_strategy_settings, dict):
+            parsed_strategy = raw_strategy_settings
+
         settings = {
             "bot_id": bot_id,
             "is_enabled": bool(row.get("is_enabled")),
@@ -205,7 +217,10 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "max_trades_per_hour": int(row.get("max_trades_per_hour") or MAX_TRADES_PER_HOUR),
             "paper_balance_usd": float_or_none(row.get("paper_balance_usd")) or 0.0,
             "arm_live": bool(row.get("arm_live")),
+            "strategy_settings": parsed_strategy,
         }
+        if bot_id == STRATEGY_COPY_BOT_ID:
+            settings["copy_target_wallet"] = parsed_strategy.get("copy_target_wallet") or COPY_TARGET_WALLET
         logging.info(
             "Loaded strategy settings bot_id=%s is_enabled=%s edge_threshold=%s arm_live=%s",
             bot_id,
@@ -708,10 +723,10 @@ def track_copy_trade_id(trade_id: str) -> bool:
     return True
 
 
-def fetch_copy_feed() -> list[dict]:
+def fetch_copy_feed(wallet: str) -> list[dict]:
     if not COPY_TARGET_WALLET:
         return []
-    url = f"{GAMMA_API_BASE}/trades?accountId={parse.quote(COPY_TARGET_WALLET)}&limit=50"
+    url = f"{GAMMA_API_BASE}/trades?accountId={parse.quote(wallet)}&limit=50"
     try:
         req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
         with request.urlopen(req, timeout=5) as resp:
@@ -829,7 +844,13 @@ async def copy_watch_loop():
     while True:
         settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
         if settings["is_enabled"]:
-            trades = fetch_copy_feed()
+            target_wallet = settings.get("copy_target_wallet") or COPY_TARGET_WALLET
+            now = int(time())
+            global last_copy_target_log_ts
+            if now - last_copy_target_log_ts >= 60:
+                logging.info("COPY_TARGET wallet=%s", target_wallet)
+                last_copy_target_log_ts = now
+            trades = fetch_copy_feed(target_wallet)
             for trade in trades:
                 trade_id = trade.get("id") or trade.get("tradeId") or trade.get("hash")
                 if not trade_id:
