@@ -198,7 +198,7 @@ def read_live_master_enabled() -> bool:
     try:
         resp = (
             supabase.table("bot_settings")
-            .select("is_enabled, live_enabled")
+            .select("is_enabled")
             .eq("bot_id", LIVE_MASTER_BOT_ID)
             .limit(1)
             .execute()
@@ -779,7 +779,7 @@ def fetch_bot_settings_row() -> dict[str, object] | None:
         return None
 
 
-def sum_closed_paper_pnl() -> float | None:
+def summation_columns_for_closed_paper_pnl() -> float | None:
     try:
         resp = (
             supabase.table("paper_positions")
@@ -796,7 +796,7 @@ def sum_closed_paper_pnl() -> float | None:
 
 
 def update_paper_settings_from_positions() -> None:
-    pnl_total = sum_closed_paper_pnl()
+    pnl_total = summation_columns_for_closed_paper_pnl()
     if pnl_total is None:
         return
 
@@ -826,6 +826,40 @@ def update_paper_settings_from_positions() -> None:
             supabase.table("bot_settings").insert({"bot_id": BOT_ID, **payload}).execute()
     except Exception:
         logging.exception("Failed updating bot_settings after paper settlement")
+
+
+def update_bot_settings_with_realized_pnl(bot_id: str, realized_pnl: float) -> None:
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("paper_balance_usd, paper_pnl_usd")
+            .eq("bot_id", bot_id)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        current_balance = float_or_none(row.get("paper_balance_usd")) if row else 0.0
+        current_pnl = float_or_none(row.get("paper_pnl_usd")) if row else 0.0
+        balance = (current_balance or 0.0) + realized_pnl
+        pnl = (current_pnl or 0.0) + realized_pnl
+        payload = {
+            "paper_balance_usd": balance,
+            "paper_pnl_usd": pnl,
+            "updated_at": utc_now_iso(),
+        }
+        if row:
+            supabase.table("bot_settings").update(payload).eq("bot_id", bot_id).execute()
+        else:
+            supabase.table("bot_settings").insert({"bot_id": bot_id, **payload}).execute()
+        logging.info(
+            "PAPER_BALANCE_UPDATE bot_id=%s pnl_delta=%s new_balance=%s new_pnl=%s",
+            bot_id,
+            realized_pnl,
+            balance,
+            pnl,
+        )
+    except Exception:
+        logging.exception("Failed updating bot_settings after paper settlement for bot_id=%s", bot_id)
 
 
 def slug_start_timestamp(slug: str | None) -> int | None:
@@ -1229,7 +1263,7 @@ async def paper_settlement_loop():
             resp = (
                 supabase.table("paper_positions")
                 .select(
-                    "id, market_slug, side, shares, size_usd, start_price, strategy_id",
+                    "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id",
                 )
                 .eq("bot_id", BOT_ID)
                 .eq("status", "OPEN")
@@ -1245,6 +1279,7 @@ async def paper_settlement_loop():
             row_id = row.get("id")
             if not row_id:
                 continue
+            bot_id = row.get("bot_id") or BOT_ID
             market_slug = row.get("market_slug")
             row_side = (row.get("side") or "").lower()
             strategy_id = row.get("strategy_id")
@@ -1294,6 +1329,8 @@ async def paper_settlement_loop():
             except Exception:
                 logging.exception("Failed updating paper_positions row id=%s", row_id)
                 continue
+            else:
+                update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
             trade_payload = {
                 "bot_id": BOT_ID,
