@@ -617,14 +617,14 @@ async def live_balance_loop(client: ClobClient | None):
         await asyncio.sleep(60)
 
 
-async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str) -> bool:
+async def has_open_paper_position_for_strategy(market_slug: str | None, strategy_id: str, bot_id: str) -> bool:
     if not market_slug:
         return False
     try:
         resp = (
             supabase.table("paper_positions")
             .select("id")
-            .eq("bot_id", BOT_ID)
+            .eq("bot_id", bot_id)
             .eq("market_slug", market_slug)
             .eq("strategy_id", strategy_id)
             .eq("status", "OPEN")
@@ -656,7 +656,10 @@ async def create_paper_strategy_position(
         logging.warning("Missing slug for strategy %s paper decision", strategy_id)
         return
 
-    if await has_open_paper_position_for_strategy(current_slug, strategy_id):
+    strategy_bot_id = (
+        STRATEGY_SNIPER_BOT_ID if strategy_id == STRATEGY_SNIPER else STRATEGY_FASTLOOP_BOT_ID
+    )
+    if await has_open_paper_position_for_strategy(current_slug, strategy_id, strategy_bot_id):
         logging.info(
             "Skipping new paper_position since one is already open slug=%s strategy_id=%s",
             current_slug,
@@ -1265,7 +1268,7 @@ async def paper_settlement_loop():
                 .select(
                     "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id",
                 )
-                .eq("bot_id", BOT_ID)
+                .in_("bot_id", [STRATEGY_FASTLOOP_BOT_ID, STRATEGY_SNIPER_BOT_ID])
                 .eq("status", "OPEN")
                 .lte("end_ts", now_ts)
                 .execute()
@@ -1274,6 +1277,16 @@ async def paper_settlement_loop():
         except Exception:
             logging.exception("Failed querying OPEN paper_positions")
             rows = []
+
+        if rows:
+            fastloop_count = sum(1 for r in rows if r.get("bot_id") == STRATEGY_FASTLOOP_BOT_ID)
+            sniper_count = sum(1 for r in rows if r.get("bot_id") == STRATEGY_SNIPER_BOT_ID)
+            logging.info(
+                "Found OPEN paper_positions fastloop=%d sniper=%d total=%d",
+                fastloop_count,
+                sniper_count,
+                len(rows),
+            )
 
         for row in rows:
             row_id = row.get("id")
