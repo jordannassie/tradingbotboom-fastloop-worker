@@ -570,6 +570,10 @@ def fetch_event_by_slug_sync(slug):
     return None
 
 
+async def fetch_event_by_slug_async(slug):
+    return await asyncio.to_thread(fetch_event_by_slug_sync, slug)
+
+
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
@@ -914,33 +918,36 @@ async def rotate_loop():
         await asyncio.sleep(0)
         try:
             market = await fetch_event_by_slug_async(slug)
-            found = bool(market)
-            if found and slug != current_slug:
-                current_slug = slug
-                outcomes = [o.lower() for o in market["outcomes"]]
-                clobs = market["clobTokenIds"]
-                for name, token in zip(outcomes, clobs):
-                    if name == "up":
-                        current_yes_token = token
-                    elif name == "down":
-                        current_no_token = token
-                refresh_asset_map()
-                reset_best_quotes()
-                logging.info(
-                    "ASSET_MAP refreshed yes=%s no=%s",
-                    current_yes_token or "none",
-                    current_no_token or "none",
-                )
-                rotating = True
-                restart_ws_task()
-                logging.info(
-                    "ROTATED slug=%s yes=%s no=%s",
-                    current_slug,
-                    (current_yes_token[:6] + "...") if current_yes_token else "none",
-                    (current_no_token[:6] + "...") if current_no_token else "none",
-                )
         except Exception:
-            logging.exception("ROTATE_ERROR")
+            logging.exception("ROTATE_ERROR slug=%s", slug)
+            prefix_index = (prefix_index + 1) % len(prefixes)
+            await asyncio.sleep(ROTATE_POLL_SECONDS)
+            continue
+        found = bool(market)
+        if found and slug != current_slug:
+            current_slug = slug
+            outcomes = [o.lower() for o in market["outcomes"]]
+            clobs = market["clobTokenIds"]
+            for name, token in zip(outcomes, clobs):
+                if name == "up":
+                    current_yes_token = token
+                elif name == "down":
+                    current_no_token = token
+            refresh_asset_map()
+            reset_best_quotes()
+            logging.info(
+                "ASSET_MAP refreshed yes=%s no=%s",
+                current_yes_token or "none",
+                current_no_token or "none",
+            )
+            rotating = True
+            restart_ws_task()
+            logging.info(
+                "ROTATED slug=%s yes=%s no=%s",
+                current_slug,
+                (current_yes_token[:6] + "...") if current_yes_token else "none",
+                (current_no_token[:6] + "...") if current_no_token else "none",
+            )
         prefix_index = (prefix_index + 1) % len(prefixes)
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
