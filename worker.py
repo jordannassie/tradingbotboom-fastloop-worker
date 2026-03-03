@@ -57,7 +57,6 @@ rotating = False
 ws_task = None
 live_balance_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
-current_interval_seconds = INTERVAL_SECONDS
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -122,6 +121,7 @@ if not MARKET_SLUG_PREFIXES:
     MARKET_SLUG_PREFIXES = [MARKET_SLUG_PREFIX]
 logging.info("MARKET_SLUG_PREFIXES parsed: %s", MARKET_SLUG_PREFIXES)
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
+current_interval_seconds = INTERVAL_SECONDS
 ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
 ROTATE_LOOKAHEAD_SECONDS = int(os.getenv("ROTATE_LOOKAHEAD_SECONDS", "20"))
 
