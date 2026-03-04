@@ -385,18 +385,21 @@ def get_live_balance_value() -> float:
             .execute()
         )
         row = (resp.data or [None])[0]
-        return float_or_none(row.get("live_balance_usd")) or 0.0 if row else 0.0
+        value = float_or_none(row.get("live_balance_usd")) if row else None
+        return value
     except Exception:
         logging.exception("Failed reading live balance")
-        return 0.0
+        return None
 
 
 def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: str) -> float:
     base_size = max(settings["trade_size_usd"], 0.0)
     balance_base = "n/a"
+    live_balance_val = None
     if base_size <= 1:
         if mode == "LIVE":
-            balance_base = get_live_balance_value()
+            live_balance_val = get_live_balance_value()
+            balance_base = live_balance_val if live_balance_val is not None else 0.0
         else:
             balance_base = settings.get("paper_balance_usd") or 0.0
             if PAPER_BANKROLL_SHARED_ENABLED:
@@ -683,9 +686,9 @@ async def execute_strategy(
             live_master_enabled,
         )
         live_balance = get_live_balance_value()
-        if live_balance <= 0:
+        if live_balance is None or live_balance <= 0:
             logging.warning(
-                "LIVE_SKIP_NO_BANKROLL strategy=%s live_balance_usd=%s",
+                "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_balance_usd=%s",
                 strategy_id,
                 live_balance,
             )
