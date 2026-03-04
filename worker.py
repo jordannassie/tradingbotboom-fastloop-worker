@@ -1902,6 +1902,23 @@ def submit_order(
                     body_text = str(arg0)
             else:
                 body_text = str(arg0)
+        err_lower = body_text.lower()
+        if "not enough balance / allowance" in err_lower:
+            logging.warning("LIVE_SKIP_ALLOWANCE error=%s", body_text)
+            last_trade_error = str(exc)[:512]
+            record_trade(
+                token_id,
+                side_label,
+                "ERROR",
+                float(price_q),
+                edge,
+                ya,
+                na,
+                trade_size,
+                error=str(exc),
+                strategy_id=strategy_id,
+            )
+            return False
         if "400" in body_text and not last_live_order_400_body:
             logging.warning("LIVE_ORDER_400 body=%s", body_text)
             last_live_order_400_body = body_text
