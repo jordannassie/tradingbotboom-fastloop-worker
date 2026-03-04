@@ -734,15 +734,9 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
     if not wallet:
         return []
     candidates = [
-        f"{GAMMA_API_BASE}/trades?accountId={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/trades?account={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/trades?maker={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/trades?taker={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/trades?trader={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/trades?address={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/activity?accountId={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/activity?account={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/activity?address={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/users/{parse.quote(wallet)}/trades?limit=50",
+        f"{GAMMA_API_BASE}/users/trades?user={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/users/{parse.quote(wallet)}/trades?limit=50&offset=0",
     ]
     tried = []
     for url in candidates:
@@ -760,17 +754,20 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
             tried.append(url)
             logging.warning("COPY_FEED_FAIL url=%s err=%s", url, exc)
             continue
-        trades = data
-        if isinstance(data, dict):
-            if "trades" in data and isinstance(data["trades"], list):
-                trades = data["trades"]
-            elif "data" in data and isinstance(data["data"], list):
-                trades = data["data"]
-            else:
-                trades = []
-        if not isinstance(trades, list):
-            trades = []
-        logging.info("COPY_FEED_OK url=%s items=%s", url, len(trades))
+        trades = []
+        if isinstance(data, list):
+            trades = data
+        elif isinstance(data, dict):
+            for key in ("trades", "data", "items"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    trades = value
+                    break
+        if not trades:
+            tried.append(url)
+            logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
+            continue
+        logging.info("COPY_FEED_OK url=%s count=%d", url, len(trades))
         return trades
     logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried), candidates)
     return []
