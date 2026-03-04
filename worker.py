@@ -733,41 +733,46 @@ def track_copy_trade_id(trade_id: str) -> bool:
 def fetch_copy_feed(wallet: str) -> list[dict]:
     if not wallet:
         return []
-    endpoints = [
+    candidates = [
         f"{GAMMA_API_BASE}/trades?accountId={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/trades?account={parse.quote(wallet)}&limit=50",
         f"{GAMMA_API_BASE}/trades?maker={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/trades?taker={parse.quote(wallet)}&limit=50",
         f"{GAMMA_API_BASE}/trades?trader={parse.quote(wallet)}&limit=50",
         f"{GAMMA_API_BASE}/trades?address={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/activity?accountId={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/activity?account={parse.quote(wallet)}&limit=50",
         f"{GAMMA_API_BASE}/activity?address={parse.quote(wallet)}&limit=50",
     ]
     tried = []
-    data = None
-    for url in endpoints:
+    for url in candidates:
         logging.info("COPY_FEED_TRY url=%s", url)
         try:
             req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
             with request.urlopen(req, timeout=5) as resp:
-                if resp.status != 200:
+                status = getattr(resp, "status", None)
+                if status not in (None, 200):
                     tried.append(url)
+                    logging.warning("COPY_FEED_FAIL url=%s err=status=%s", url, status)
                     continue
                 data = json.loads(resp.read())
-                trade_list = data
-                if isinstance(data, dict):
-                    if "trades" in data and isinstance(data["trades"], list):
-                        trade_list = data["trades"]
-                    elif "data" in data and isinstance(data["data"], list):
-                        trade_list = data["data"]
-                    else:
-                        trade_list = []
-                if not isinstance(trade_list, list):
-                    trade_list = []
-                logging.info("COPY_FEED_OK url=%s count=%d", url, len(trade_list))
-                return trade_list
         except Exception as exc:
             tried.append(url)
-            logging.warning("COPY_FEED_TRY url=%s error=%s", url, exc)
+            logging.warning("COPY_FEED_FAIL url=%s err=%s", url, exc)
             continue
-    logging.warning("COPY_FEED_UNAVAILABLE urls_tried=%s", tried)
+        trades = data
+        if isinstance(data, dict):
+            if "trades" in data and isinstance(data["trades"], list):
+                trades = data["trades"]
+            elif "data" in data and isinstance(data["data"], list):
+                trades = data["data"]
+            else:
+                trades = []
+        if not isinstance(trades, list):
+            trades = []
+        logging.info("COPY_FEED_OK url=%s items=%s", url, len(trades))
+        return trades
+    logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried), candidates)
     return []
 
     trades = data
