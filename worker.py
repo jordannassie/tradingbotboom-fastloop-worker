@@ -730,15 +730,55 @@ def track_copy_trade_id(trade_id: str) -> bool:
     return True
 
 
+def normalize_copy_trade(raw: dict[str, object]) -> dict[str, object] | None:
+    trade_id = raw.get("id") or raw.get("tradeId") or raw.get("hash")
+    action = (raw.get("action") or raw.get("type") or "").upper()
+    side = (raw.get("side") or raw.get("outcome") or raw.get("symbol") or "").upper()
+    price = float_or_none(raw.get("price") or raw.get("executionPrice") or raw.get("priceUsd"))
+    size = float_or_none(raw.get("size") or raw.get("amount") or raw.get("sizeUsd"))
+    slug = (
+        raw.get("slug")
+        or raw.get("marketSlug")
+        or raw.get("market")
+        or raw.get("event")
+        or raw.get("market_id")
+    )
+    missing = []
+    if not trade_id:
+        missing.append("id")
+    if not slug:
+        missing.append("slug")
+    if price is None:
+        missing.append("price")
+    if size is None:
+        missing.append("size")
+    if not action:
+        missing.append("action")
+    if not trade_id or not slug or price is None or size is None or not action:
+        short = slug or trade_id or raw.get("market") or raw.get("type")
+        logging.info("COPY_FEED_SKIP missing_fields=%s raw=%s", missing, short)
+        return None
+    return {
+        "id": trade_id,
+        "action": action,
+        "side": side,
+        "price": price,
+        "size": size,
+        "slug": slug,
+        **raw,
+    }
+
+
 def fetch_copy_feed(wallet: str) -> list[dict]:
     if not wallet:
         return []
+    base = "https://data-api.polymarket.com"
     candidates = [
-        f"{GAMMA_API_BASE}/users/{parse.quote(wallet)}/trades?limit=50",
-        f"{GAMMA_API_BASE}/users/trades?user={parse.quote(wallet)}&limit=50",
-        f"{GAMMA_API_BASE}/users/{parse.quote(wallet)}/trades?limit=50&offset=0",
+        f"{base}/trades?user={parse.quote(wallet)}&limit=50&takerOnly=false",
+        f"{base}/activity?user={parse.quote(wallet)}&limit=50&type=TRADE",
+        f"{base}/users/{parse.quote(wallet)}/trades?limit=50&offset=0",
     ]
-    tried = []
+    tried_urls = []
     for url in candidates:
         logging.info("COPY_FEED_TRY url=%s", url)
         try:
@@ -746,30 +786,37 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
             with request.urlopen(req, timeout=5) as resp:
                 status = getattr(resp, "status", None)
                 if status not in (None, 200):
-                    tried.append(url)
+                    tried_urls.append(url)
                     logging.warning("COPY_FEED_FAIL url=%s err=status=%s", url, status)
                     continue
                 data = json.loads(resp.read())
         except Exception as exc:
-            tried.append(url)
+            tried_urls.append(url)
             logging.warning("COPY_FEED_FAIL url=%s err=%s", url, exc)
             continue
-        trades = []
+        trades_raw = []
         if isinstance(data, list):
-            trades = data
+            trades_raw = data
         elif isinstance(data, dict):
             for key in ("trades", "data", "items"):
                 value = data.get(key)
                 if isinstance(value, list):
-                    trades = value
+                    trades_raw = value
                     break
-        if not trades:
-            tried.append(url)
+        normalized = []
+        for item in trades_raw:
+            if not isinstance(item, dict):
+                continue
+            entry = normalize_copy_trade(item)
+            if entry:
+                normalized.append(entry)
+        if not normalized:
+            tried_urls.append(url)
             logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
             continue
-        logging.info("COPY_FEED_OK url=%s count=%d", url, len(trades))
-        return trades
-    logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried), candidates)
+        logging.info("COPY_FEED_OK url=%s items=%d", url, len(normalized))
+        return normalized
+    logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried_urls), candidates)
     return []
 
     trades = data
