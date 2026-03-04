@@ -531,6 +531,43 @@ def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: s
     return size
 
 
+def compute_live_size_usd(settings: dict[str, object], strategy_id: str, live_balance_plain: float | None) -> float | None:
+    if live_balance_plain is None:
+        return None
+    base_size = max(settings["trade_size_usd"], 0.0)
+    balance_base = live_balance_plain
+    is_percent = base_size <= 1
+    if base_size <= 1:
+        size = balance_base * base_size
+    else:
+        size = base_size
+    cap_applied = False
+    cap_value = None
+    if strategy_id == STRATEGY_SNIPER and size > SNIPER_SIZE_CAP_USD:
+        size = SNIPER_SIZE_CAP_USD
+        cap_applied = True
+        cap_value = SNIPER_SIZE_CAP_USD
+    if strategy_id == STRATEGY_COPY and size > COPY_SIZE_CAP_USD:
+        cap_applied = True
+        cap_value = COPY_SIZE_CAP_USD
+        logging.info(
+            "COPY_SIZE_CAP_APPLIED live wanted=%s capped=%s",
+            size,
+            COPY_SIZE_CAP_USD,
+        )
+        size = COPY_SIZE_CAP_USD
+    logging.info(
+        "LIVE_SIZE_COMPUTE strategy=%s trade_size_input=%s base_balance=%s size_usd=%s is_percent=%s cap=%s",
+        strategy_id,
+        settings["trade_size_usd"],
+        balance_base,
+        size,
+        is_percent,
+        cap_value if cap_applied else "none",
+    )
+    return size
+
+
 def compute_shares_from_size(size_usd: float, price: float) -> float:
     if not price or price <= 0:
         return 0.0
@@ -760,6 +797,7 @@ async def execute_strategy(
 
     route_live = live_master_enabled and settings["arm_live"]
     executed_live = False
+    live_size_usd = None
     if route_live:
         logging.info(
             "Live gating requested for strategy=%s arm_live=%s live_master_enabled=%s",
@@ -776,31 +814,40 @@ async def execute_strategy(
                 live_balance,
             )
             route_live = False
-        elif allowance is not None and allowance < size_usd:
-            logging.warning(
-                "LIVE_SKIP_ALLOWANCE strategy=%s allowance_usd=%s size_usd=%s",
-                strategy_id,
-                allowance,
-                size_usd,
-            )
-            route_live = False
-        elif live_balance < size_usd:
-            logging.warning(
-                "LIVE_SKIP_INSUFFICIENT_BALANCE strategy=%s balance_usd=%s size_usd=%s",
-                strategy_id,
-                live_balance,
-                size_usd,
-            )
-            route_live = False
         else:
-            executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, size_usd)
-            if not executed_live:
-                logging.info(
-                    "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
+            live_size_usd = compute_live_size_usd(settings, strategy_id, live_balance)
+            if not live_size_usd or live_size_usd <= 0:
+                logging.warning(
+                    "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_size_usd=%s",
                     strategy_id,
-                    live_master_enabled,
-                    "available" if client else "missing",
+                    live_size_usd,
                 )
+                route_live = False
+            elif allowance is not None and allowance < live_size_usd:
+                logging.warning(
+                    "LIVE_SKIP_ALLOWANCE strategy=%s allowance_usd=%s live_size_usd=%s",
+                    strategy_id,
+                    allowance,
+                    live_size_usd,
+                )
+                route_live = False
+            elif live_balance < live_size_usd:
+                logging.warning(
+                    "LIVE_SKIP_INSUFFICIENT_BALANCE strategy=%s balance_usd=%s live_size_usd=%s",
+                    strategy_id,
+                    live_balance,
+                    live_size_usd,
+                )
+                route_live = False
+            else:
+                executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, live_size_usd)
+                if not executed_live:
+                    logging.info(
+                        "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
+                        strategy_id,
+                        live_master_enabled,
+                        "available" if client else "missing",
+                    )
     if not executed_live:
         logging.info(
             "PAPER_EXEC strategy=%s slug=%s size_usd=%s",
