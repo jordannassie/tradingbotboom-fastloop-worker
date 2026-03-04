@@ -2253,12 +2253,12 @@ def submit_order(
         )
         return False
 
-    order_args = OrderArgs(
-        token_id=token_id,
-        price=float(price_q),
-        size=float(shares_q),
-        side=BUY,
-    )
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=float(price_q),
+            size=float(shares_q),
+            side="BUY",
+        )
     logging.info(
         "LIVE_LIMIT_ARGS token_id=%s side=%s price=%s shares=%s size_usd=%s",
         token_id,
