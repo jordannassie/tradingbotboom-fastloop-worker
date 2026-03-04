@@ -426,9 +426,15 @@ def refresh_live_bankroll_usd_if_needed(
     buying_power = fetch_account_buying_power_usd()
     try:
         patch_payload = {}
+        source_balance = None
         if buying_power is not None:
-            live_balance_cache = buying_power
-            patch_payload["live_balance_usd"] = buying_power
+            source_balance = buying_power
+        elif raw_balance is not None:
+            source_balance = float(raw_balance) / decimals
+            logging.info("LIVE_BANKROLL_FALLBACK_TO_CLOB balance_usd=%s", source_balance)
+        if source_balance is not None:
+            live_balance_cache = source_balance
+            patch_payload["live_balance_usd"] = source_balance
         if patch_payload:
             logging.info("LIVE_BANKROLL_PATCH_KEYS keys=%s", list(patch_payload.keys()))
             resp_update = (
@@ -644,7 +650,7 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     global live_balance_cache, live_allowance_cache, last_live_bankroll_log_ts
     if not client:
         return None, None
-    balance = fetch_account_buying_power_usd()
+    buying_power = fetch_account_buying_power_usd()
     allowance = None
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
     try:
@@ -660,9 +666,22 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     except Exception:
         logging.exception("LIVE_BANKROLL_FETCH_FAIL")
     patch_payload = {}
-    if balance is not None:
-        live_balance_cache = balance
-        patch_payload["live_balance_usd"] = balance
+    source_balance = None
+    if buying_power is not None:
+        source_balance = buying_power
+    elif resp is not None:
+        raw_balance = (
+            resp.get("balance")
+            or resp.get("amount")
+            or resp.get("collateral_balance")
+            or resp.get("collateralBalance")
+        )
+        if raw_balance is not None:
+            source_balance = float(raw_balance) / (10 ** LIVE_USDC_DECIMALS)
+            logging.info("LIVE_BANKROLL_FALLBACK_TO_CLOB balance_usd=%s", source_balance)
+    if source_balance is not None:
+        live_balance_cache = source_balance
+        patch_payload["live_balance_usd"] = source_balance
     if patch_payload:
         logging.info("LIVE_BANKROLL_PATCH_KEYS_SYNC keys=%s", list(patch_payload.keys()))
         try:
