@@ -5,6 +5,7 @@ import os
 from collections import deque
 from contextlib import suppress
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import floor
 from time import time
 from urllib import parse, request
@@ -112,6 +113,24 @@ def reset_best_quotes():
     best_quotes["yes"]["ask"] = None
     best_quotes["no"]["bid"] = None
     best_quotes["no"]["ask"] = None
+
+TWOPLACES = Decimal("0.01")
+FOURPLACES = Decimal("0.0001")
+
+def q2(value: float | Decimal | str | None) -> Decimal:
+    try:
+        base = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    return base.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+
+def q4(value: float | Decimal | str | None) -> Decimal:
+    try:
+        base = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    return base.quantize(FOURPLACES, rounding=ROUND_HALF_UP)
 
 def get_shared_paper_balance():
     global shared_paper_balance_cache, shared_paper_balance_ts, shared_paper_balance_error_logged
@@ -1726,8 +1745,32 @@ def submit_order(
 ):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors
 
+    maker_raw = Decimal(str(price)) * Decimal(str(trade_size))
+    taker_raw = Decimal(str(trade_size))
+    maker_q = q2(maker_raw)
+    taker_q = q4(taker_raw)
+    if taker_q == 0:
+        taker_q = FOURPLACES
+        logging.warning(
+            "LIVE_ORDER_ADJUST fallback_taker=0.0001 original_size=%s",
+            trade_size,
+        )
+    adjusted_price = maker_q / taker_q if taker_q != 0 else Decimal(str(price))
+    logging.info(
+        "LIVE_ORDER_PREP slug=%s side=%s maker=%s taker=%s",
+        current_slug or "unknown",
+        side_label,
+        maker_q,
+        taker_q,
+    )
+
     try:
-        order = OrderArgs(token_id=token_id, price=price, size=trade_size, side=BUY)
+        order = OrderArgs(
+            token_id=token_id,
+            price=float(adjusted_price),
+            size=float(taker_q),
+            side=BUY,
+        )
         signed = client.create_order(order)
         resp = client.post_order(signed, OrderType.FAK)
         record_trade(
@@ -1759,6 +1802,15 @@ def submit_order(
             error=str(exc),
             strategy_id=strategy_id,
         )
+        err_lower = str(exc).lower()
+        if "invalid amount" in err_lower or "invalid amounts" in err_lower:
+            logging.warning(
+                "LIVE_ORDER_REJECT_INVALID_AMOUNTS maker_raw=%s taker_raw=%s maker_q=%s taker_q=%s",
+                maker_raw,
+                taker_raw,
+                maker_q,
+                taker_q,
+            )
         if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
             paused_due_to_errors = True
             logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
