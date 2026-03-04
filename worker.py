@@ -119,23 +119,8 @@ def reset_best_quotes():
     best_quotes["no"]["bid"] = None
     best_quotes["no"]["ask"] = None
 
-TWOPLACES = Decimal("0.01")
-FOURPLACES = Decimal("0.0001")
-
-def q2(value: float | Decimal | str | None) -> Decimal:
-    try:
-        base = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return Decimal("0")
-    return base.quantize(TWOPLACES, rounding=ROUND_DOWN)
-
-
-def q4(value: float | Decimal | str | None) -> Decimal:
-    try:
-        base = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return Decimal("0")
-    return base.quantize(FOURPLACES, rounding=ROUND_DOWN)
+SHARE_QUANT = Decimal("0.0001")
+DEFAULT_TICK = Decimal("0.01")
 
 def get_shared_paper_balance():
     if not PAPER_BANKROLL_SHARED_ENABLED:
@@ -183,6 +168,7 @@ paused_due_to_errors = False
 paused_due_to_max_trades = False
 trade_triggers = 0  # counts 2-leg attempts (YES+NO)
 last_paper_skip_ts = 0
+last_live_order_400_body: str | None = None
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -1801,43 +1787,89 @@ def submit_order(
     trade_size: float,
     strategy_id: str | None = None,
 ):
-    global consecutive_trade_errors, last_trade_error, paused_due_to_errors
+    global consecutive_trade_errors, last_trade_error, paused_due_to_errors, last_live_order_400_body
 
-    maker_raw = Decimal(str(price)) * Decimal(str(trade_size))
-    taker_raw = Decimal(str(trade_size))
-    maker_q = q2(maker_raw)
-    taker_q = q4(taker_raw)
-    if taker_q == Decimal("0"):
-        taker_q = FOURPLACES
+    price_decimal = None
+    try:
+        side_ask = best_quotes[side_label]["ask"]
+    except KeyError:
+        side_ask = None
+    if side_ask is not None:
+        price_decimal = Decimal(str(side_ask))
+    else:
+        asks = []
+        for label in ("yes", "no"):
+            ask_val = best_quotes[label]["ask"]
+            if ask_val is not None:
+                asks.append(Decimal(str(ask_val)))
+        if asks:
+            price_decimal = sum(asks, Decimal("0")) / Decimal(len(asks))
+    if price_decimal is None or price_decimal <= 0:
+        logging.warning("LIVE_SKIP_NO_PRICE token_id=%s side=%s", token_id, side_label)
+        return False
+
+    try:
+        tick_str = client.get_tick_size(token_id)
+        tick_size = Decimal(str(tick_str)) if tick_str else DEFAULT_TICK
+    except Exception:
+        tick_size = DEFAULT_TICK
+    if tick_size <= 0:
+        tick_size = DEFAULT_TICK
+
+    price_candidate = price_decimal + tick_size
+    try:
+        price_q = price_candidate.quantize(tick_size, rounding=ROUND_DOWN)
+    except InvalidOperation:
+        price_q = price_decimal.quantize(tick_size, rounding=ROUND_DOWN)
+    if price_q <= 0:
         logging.warning(
-            "LIVE_ORDER_ADJUST fallback_taker=0.0001 original_size=%s",
+            "LIVE_SKIP_INVALID_PRICE token_id=%s price=%s tick=%s",
+            token_id,
+            price_q,
+            tick_size,
+        )
+        return False
+
+    size_decimal = Decimal(str(trade_size))
+    if size_decimal <= 0:
+        logging.warning("LIVE_SKIP_INVALID_SIZE token_id=%s size_usd=%s", token_id, trade_size)
+        return False
+
+    shares_raw = size_decimal / price_q if price_q != 0 else Decimal("0")
+    shares_q = shares_raw.quantize(SHARE_QUANT, rounding=ROUND_DOWN)
+    if shares_q <= 0:
+        logging.warning(
+            "LIVE_SKIP_ZERO_SHARES token_id=%s shares=%s price=%s size_usd=%s",
+            token_id,
+            shares_q,
+            price_q,
             trade_size,
         )
-    adjusted_price = maker_q / taker_q if taker_q != 0 else Decimal(str(price))
+        return False
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=float(price_q),
+        size=float(shares_q),
+        side=BUY,
+    )
     logging.info(
-        "LIVE_ORDER_AMOUNTS slug=%s side=%s maker_raw=%s maker_q=%s taker_raw=%s taker_q=%s",
-        current_slug or "unknown",
+        "LIVE_LIMIT_ARGS token_id=%s side=%s price=%s shares=%s size_usd=%s",
+        token_id,
         side_label,
-        maker_raw,
-        maker_q,
-        taker_raw,
-        taker_q,
+        price_q,
+        shares_q,
+        trade_size,
     )
 
     try:
-        order = OrderArgs(
-            token_id=token_id,
-            price=float(adjusted_price),
-            size=float(taker_q),
-            side=BUY,
-        )
-        signed = client.create_order(order)
-        resp = client.post_order(signed, OrderType.FAK)
+        signed = client.create_order(order_args)
+        resp = client.post_order(signed, OrderType.GTC)
         record_trade(
             token_id,
             side_label,
             "SUBMITTED",
-            price,
+            float(price_q),
             edge,
             ya,
             na,
@@ -1847,26 +1879,28 @@ def submit_order(
         )
         consecutive_trade_errors = 0
         last_trade_error = None
+        return True
     except Exception as exc:
-        err_lower = str(exc).lower()
-        invalid_amount_error = "invalid amount" in err_lower or "invalid amounts" in err_lower
-        if invalid_amount_error:
-            logging.warning(
-                "LIVE_ORDER_REJECT_INVALID_AMOUNTS maker_raw=%s taker_raw=%s maker_q=%s taker_q=%s",
-                maker_raw,
-                taker_raw,
-                maker_q,
-                taker_q,
-            )
-            paused_due_to_errors = False
-        else:
-            consecutive_trade_errors += 1
+        body_text = str(exc)
+        if hasattr(exc, "args") and exc.args:
+            arg0 = exc.args[0]
+            if isinstance(arg0, dict):
+                try:
+                    body_text = json.dumps(arg0, ensure_ascii=False)
+                except Exception:
+                    body_text = str(arg0)
+            else:
+                body_text = str(arg0)
+        if "400" in body_text and not last_live_order_400_body:
+            logging.warning("LIVE_ORDER_400 body=%s", body_text)
+            last_live_order_400_body = body_text
+        consecutive_trade_errors += 1
         last_trade_error = str(exc)[:512]
         record_trade(
             token_id,
             side_label,
             "ERROR",
-            price,
+            float(price_q),
             edge,
             ya,
             na,
@@ -1874,9 +1908,10 @@ def submit_order(
             error=str(exc),
             strategy_id=strategy_id,
         )
-        if not invalid_amount_error and consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
+        if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
             paused_due_to_errors = True
             logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
+        return False
 
 
 async def heartbeat_loop(client: ClobClient | None):
