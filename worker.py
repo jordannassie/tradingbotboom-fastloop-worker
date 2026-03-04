@@ -337,8 +337,6 @@ def refresh_live_bankroll_usd_if_needed(
             balance_usd = float(raw_balance) / decimals
             live_balance_cache = balance_usd
             patch_payload["live_balance_usd"] = balance_usd
-            if live_signer_address:
-                patch_payload["bot_wallet"] = live_signer_address
         if raw_allowance is not None:
             allowance_usd = float(raw_allowance) / decimals
             live_allowance_cache = allowance_usd
