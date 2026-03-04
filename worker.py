@@ -13,8 +13,12 @@ from urllib import parse, request
 import websockets
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.clob_types import (
+    BalanceAllowanceParams,
+    OrderArgs,
+    OrderType,
+    AssetType,
+)
 from supabase import create_client
 
 HOST = "https://clob.polymarket.com"
@@ -168,6 +172,9 @@ paused_due_to_errors = False
 paused_due_to_max_trades = False
 trade_triggers = 0  # counts 2-leg attempts (YES+NO)
 last_paper_skip_ts = 0
+live_balance_cache: float | None = None
+live_allowance_cache: float | None = None
+last_live_bankroll_log_ts = 0
 last_live_order_400_body: str | None = None
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
@@ -386,10 +393,55 @@ def get_live_balance_value() -> float:
         )
         row = (resp.data or [None])[0]
         value = float_or_none(row.get("live_balance_usd")) if row else None
-        return value
+        if value is not None:
+            return value
+        return live_balance_cache
     except Exception:
         logging.exception("Failed reading live balance")
-        return None
+        return live_balance_cache
+
+
+def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float | None]:
+    global live_balance_cache, live_allowance_cache, last_live_bankroll_log_ts
+    if not client:
+        return None, None
+    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
+    try:
+        resp = client.get_balance_allowance(params=params)
+    except Exception:
+        logging.exception("LIVE_BANKROLL_FETCH_FAIL")
+        return None, None
+    balance = float_or_none(
+        resp.get("balance")
+        or resp.get("amount")
+        or resp.get("collateral_balance")
+        or resp.get("collateralBalance")
+    )
+    allowance = float_or_none(
+        resp.get("allowance")
+        or resp.get("allowanceUsd")
+        or resp.get("allowance_usd")
+        or resp.get("collateral_allowance")
+        or resp.get("collateralAllowance")
+    )
+    if balance is not None:
+        live_balance_cache = balance
+        try:
+            supabase.table("bot_settings").update(
+                {
+                    "live_balance_usd": balance,
+                    "live_updated_at": int(time()),
+                }
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+        except Exception:
+            logging.exception("Failed updating live_balance_usd")
+    if allowance is not None:
+        live_allowance_cache = allowance
+    now_ts = int(time())
+    if now_ts - last_live_bankroll_log_ts >= 60:
+        last_live_bankroll_log_ts = now_ts
+        logging.info("LIVE_BANKROLL balance_usd=%s allowance_usd=%s", balance, allowance)
+    return balance, allowance
 
 
 def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: str) -> float:
@@ -686,11 +738,28 @@ async def execute_strategy(
             live_master_enabled,
         )
         live_balance = get_live_balance_value()
+        allowance = live_allowance_cache
         if live_balance is None or live_balance <= 0:
             logging.warning(
                 "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_balance_usd=%s",
                 strategy_id,
                 live_balance,
+            )
+            route_live = False
+        elif allowance is not None and allowance < size_usd:
+            logging.warning(
+                "LIVE_SKIP_ALLOWANCE strategy=%s allowance_usd=%s size_usd=%s",
+                strategy_id,
+                allowance,
+                size_usd,
+            )
+            route_live = False
+        elif live_balance < size_usd:
+            logging.warning(
+                "LIVE_SKIP_INSUFFICIENT_BALANCE strategy=%s balance_usd=%s size_usd=%s",
+                strategy_id,
+                live_balance,
+                size_usd,
             )
             route_live = False
         else:
@@ -1208,17 +1277,7 @@ def get_live_balance_usd(client: ClobClient | None) -> float | None:
 
 async def live_balance_loop(client: ClobClient | None):
     while True:
-        balance = get_live_balance_usd(client)
-        if balance is not None:
-            try:
-                supabase.table("bot_settings").update(
-                    {
-                        "live_balance_usd": balance,
-                        "live_updated_at": utc_now_iso(),
-                    }
-                ).eq("bot_id", BOT_ID).execute()
-            except Exception:
-                logging.exception("Failed updating live balance bot_settings")
+        sync_live_bankroll(client)
         await asyncio.sleep(60)
 
 
@@ -1780,6 +1839,9 @@ def build_trading_client() -> ClobClient | None:
     funder = FUNDER if FUNDER else None
     client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=sig, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
+    address = client.get_address()
+    if address:
+        logging.info("BOT_WALLET address=%s", address)
     return client
 
 
