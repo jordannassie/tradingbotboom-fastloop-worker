@@ -110,6 +110,32 @@ def reset_best_quotes():
     best_quotes["no"]["bid"] = None
     best_quotes["no"]["ask"] = None
 
+def get_shared_paper_balance():
+    global shared_paper_balance_cache, shared_paper_balance_ts
+    now_ts = time()
+    if shared_paper_balance_cache is not None and (now_ts - shared_paper_balance_ts) < 10:
+        return shared_paper_balance_cache
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("paper_balance_usd")
+            .eq("bot_id", "default")
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        balance = float_or_none(row.get("paper_balance_usd")) if row else None
+    except Exception:
+        logging.exception("Failed reading shared paper_balance_usd")
+        balance = None
+    if balance is None:
+        balance = DEFAULT_PAPER_START_BALANCE
+    shared_paper_balance_cache = balance
+    shared_paper_balance_ts = now_ts
+    return balance
+
+logging.info("PAPER_BANKROLL_SHARED enabled base_balance=%s", get_shared_paper_balance())
+
 refresh_asset_map()
 strategy_trade_timestamps = {
     STRATEGY_SNIPER: deque(),
@@ -118,9 +144,12 @@ strategy_trade_timestamps = {
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
+shared_paper_balance_cache: float | None = None
+shared_paper_balance_ts: float = 0
 global_trade_mode_cache: str | None = None
 last_copy_schema_log_ts = 0
 last_copy_target_log_ts = 0
+schema_probe_last_ts = 0
 consecutive_trade_errors = 0
 last_trade_error = None
 paused_due_to_errors = False
@@ -387,6 +416,14 @@ def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: s
         is_percent,
         cap_value if cap_applied else "none",
     )
+    if mode == "PAPER":
+        logging.info(
+            "PAPER_SIZE_BASE strategy=%s base_balance=%s trade_size_usd=%s size_usd=%s",
+            strategy_id,
+            balance_base if base_size <= 1 else "n/a",
+            settings["trade_size_usd"],
+            size,
+        )
     return size
 
 
@@ -817,43 +854,158 @@ def track_copy_trade_id(trade_id: str) -> bool:
     return True
 
 
-def normalize_copy_trade(raw: dict[str, object]) -> dict[str, object] | None:
-    trade_id = raw.get("id") or raw.get("tradeId") or raw.get("hash")
-    action = (raw.get("action") or raw.get("type") or "").upper()
-    side = (raw.get("side") or raw.get("outcome") or raw.get("symbol") or "").upper()
-    price = float_or_none(raw.get("price") or raw.get("executionPrice") or raw.get("priceUsd"))
-    size = float_or_none(raw.get("size") or raw.get("amount") or raw.get("sizeUsd"))
-    slug = (
-        raw.get("slug")
-        or raw.get("marketSlug")
-        or raw.get("market")
-        or raw.get("event")
-        or raw.get("market_id")
-    )
+def normalize_copy_trade(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, dict):
+        logging.info(
+            "COPY_FEED_BAD_ITEM kind=%s value=%s",
+            type(raw).__name__,
+            str(raw)[:100],
+        )
+        return None
+    id_keys = ["id", "tradeId", "txHash", "transactionHash", "hash"]
+    action_keys = ["action", "type", "direction", "sideAction", "tradeType"]
+    side_keys = ["side", "outcome", "outcomeSide", "tokenSide", "betSide"]
+    price_keys = ["price", "avgPrice", "avg_price", "fillPrice", "executionPrice"]
+    size_keys = ["size", "sizeUsd", "amount", "notional", "usdAmount", "value"]
+    slug_keys = ["market_slug", "marketSlug", "slug", "market", "event", "eventSlug", "ticker"]
+    trade_id = next((raw.get(k) for k in id_keys if raw.get(k)), None)
+    action_val = next((raw.get(k) for k in action_keys if raw.get(k)), None)
+    slug = next((raw.get(k) for k in slug_keys if raw.get(k)), None)
+    price = next((float_or_none(raw.get(k)) for k in price_keys if raw.get(k)), None)
+    size = next((float_or_none(raw.get(k)) for k in size_keys if raw.get(k)), None)
+    side = next((raw.get(k) for k in side_keys if raw.get(k)), None)
+    if isinstance(side, str):
+        sval = side.strip().lower()
+        if sval in ("yes", "no"):
+            side = sval.upper()
+        elif "yes" in sval or "up" in sval:
+            side = "YES"
+        elif "no" in sval or "down" in sval:
+            side = "NO"
+        else:
+            side = side.upper()
+    action = (action_val or "").upper()
+    if not action:
+        if raw.get("isBuy"):
+            action = "BUY"
+        elif raw.get("isSell"):
+            action = "SELL"
+        else:
+            for key in ("tradeType", "activityType", "eventType"):
+                value = raw.get(key)
+                if value:
+                    action = str(value).upper()
+                    break
+            if not action:
+                maker_side = raw.get("makerSide")
+                taker_side = raw.get("takerSide")
+                if taker_side and maker_side:
+                    action = "BUY" if str(taker_side).upper() == "BUY" else "SELL"
+                elif maker_side:
+                    action = "BUY" if str(maker_side).upper() == "BUY" else "SELL"
+    if not trade_id:
+        ts = raw.get("timestamp") or raw.get("createdAt")
+        trade_id = f"{slug}:{ts}:{side}:{price}:{size}"
     missing = []
     if not trade_id:
         missing.append("id")
+    if not action:
+        missing.append("action")
     if not slug:
         missing.append("slug")
     if price is None:
         missing.append("price")
     if size is None:
         missing.append("size")
-    if not action:
-        missing.append("action")
-    if not trade_id or not slug or price is None or size is None or not action:
-        short = slug or trade_id or raw.get("market") or raw.get("type")
-        logging.info("COPY_FEED_SKIP missing_fields=%s raw=%s", missing, short)
+    if missing:
+        sample_keys = list(raw.keys())[:5]
+        logging.info(
+            "COPY_FEED_SKIP missing_fields=%s sample_keys=%s",
+            missing,
+            sample_keys,
+        )
         return None
     return {
         "id": trade_id,
         "action": action,
-        "side": side,
+        "side": (side or "").upper(),
         "price": price,
         "size": size,
         "slug": slug,
         **raw,
     }
+
+
+def log_schema_probe(url: str, data: object) -> None:
+    global schema_probe_last_ts
+    now_ts = time()
+    if now_ts - schema_probe_last_ts < 60:
+        return
+    schema_probe_last_ts = now_ts
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        logging.info("COPY_SCHEMA url=%s top_keys=%s type=dict", url, keys)
+        list_path: str | None = None
+        list_items: list | None = None
+        for key in ("trades", "data", "items", "activities", "events"):
+            value = data.get(key)
+            if isinstance(value, list):
+                list_path = key
+                list_items = value
+                break
+        if not list_path:
+            for key, value in data.items():
+                if isinstance(value, list):
+                    list_path = key
+                    list_items = value
+                    break
+        if list_path:
+            logging.info(
+                "COPY_SCHEMA items_path=%s items_count=%d",
+                list_path,
+                len(list_items or []),
+            )
+            sample = (list_items or [None])[0]
+            if isinstance(sample, dict):
+                logging.info(
+                    "COPY_SCHEMA sample_item_keys=%s sample_item_str=%s",
+                    list(sample.keys()),
+                    json.dumps(sample)[:500],
+                )
+        else:
+            logging.info("COPY_SCHEMA url=%s items_path=none", url)
+    elif isinstance(data, list):
+        logging.info("COPY_SCHEMA url=%s top_keys=[] type=list items_count=%d", url, len(data))
+        if data:
+            sample = data[0]
+            if isinstance(sample, dict):
+                logging.info(
+                    "COPY_SCHEMA sample_item_keys=%s sample_item_str=%s",
+                    list(sample.keys()),
+                    json.dumps(sample)[:500],
+                )
+            else:
+                logging.info(
+                    "COPY_FEED_BAD_ITEM kind=%s value=%s",
+                    type(sample).__name__,
+                    str(sample)[:100],
+                )
+    else:
+        logging.info("COPY_SCHEMA url=%s type=%s", url, type(data).__name__)
+
+
+def extract_trade_list(data: object) -> tuple[list[object], str | None]:
+    if isinstance(data, list):
+        return data, "root"
+    if isinstance(data, dict):
+        for key in ("trades", "data", "items", "activities", "events"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value, key
+        for key, value in data.items():
+            if isinstance(value, list):
+                return value, key
+    return [], None
 
 
 def fetch_copy_feed(wallet: str) -> list[dict]:
@@ -881,19 +1033,14 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
             tried_urls.append(url)
             logging.warning("COPY_FEED_FAIL url=%s err=%s", url, exc)
             continue
-        trades_raw = []
-        if isinstance(data, list):
-            trades_raw = data
-        elif isinstance(data, dict):
-            for key in ("trades", "data", "items"):
-                value = data.get(key)
-                if isinstance(value, list):
-                    trades_raw = value
-                    break
+        log_schema_probe(url, data)
+        trades_raw, path = extract_trade_list(data)
+        if not trades_raw:
+            tried_urls.append(url)
+            logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
+            continue
         normalized = []
         for item in trades_raw:
-            if not isinstance(item, dict):
-                continue
             entry = normalize_copy_trade(item)
             if entry:
                 normalized.append(entry)
@@ -901,10 +1048,36 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
             tried_urls.append(url)
             logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
             continue
-        logging.info("COPY_FEED_OK url=%s items=%d", url, len(normalized))
+        logging.info(
+            "COPY_FEED_OK normalized=%d raw_items=%d path=%s",
+            len(normalized),
+            len(trades_raw),
+            path or "unknown",
+        )
         return normalized
     logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried_urls), candidates)
     return []
+
+
+def update_shared_paper_balance(pnl_usd: float, strategy_id: str) -> float:
+    global shared_paper_balance_cache, shared_paper_balance_ts
+    base_balance = get_shared_paper_balance()
+    new_balance = base_balance + pnl_usd
+    try:
+        supabase.table("bot_settings").update(
+            {"paper_balance_usd": new_balance}
+        ).eq("bot_id", "default").execute()
+        shared_paper_balance_cache = new_balance
+        shared_paper_balance_ts = time()
+        logging.info(
+            "PAPER_BANKROLL_UPDATE strategy=%s pnl_usd=%s new_shared_balance=%s",
+            strategy_id,
+            pnl_usd,
+            new_balance,
+        )
+    except Exception:
+        logging.exception("Failed updating shared paper_balance_usd")
+    return new_balance
 
     trades = data
     if isinstance(data, dict):
