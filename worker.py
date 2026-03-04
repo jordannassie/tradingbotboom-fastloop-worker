@@ -118,6 +118,8 @@ strategy_trade_timestamps = {
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
+global_trade_mode_cache: str | None = None
+last_copy_schema_log_ts = 0
 last_copy_target_log_ts = 0
 consecutive_trade_errors = 0
 last_trade_error = None
@@ -175,6 +177,48 @@ def float_or_none(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def parse_strategy_settings_field(payload) -> dict[str, object]:
+    parsed = {}
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            parsed = {}
+    elif isinstance(payload, dict):
+        parsed = payload
+    return parsed
+
+
+def get_global_trade_mode() -> str:
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings")
+            .eq("bot_id", "default")
+            .limit(1)
+            .execute()
+        )
+        data = resp.data or []
+        if not data:
+            return "ONE"
+        raw_settings = data[0].get("strategy_settings")
+        parsed = parse_strategy_settings_field(raw_settings)
+        mode = (parsed.get("trade_mode") or "ONE").upper()
+        return mode if mode in ("ONE", "ALL") else "ONE"
+    except Exception:
+        logging.exception("Failed reading global trade_mode")
+        return "ONE"
+
+
+def current_global_trade_mode() -> str:
+    global global_trade_mode_cache
+    mode = get_global_trade_mode()
+    if global_trade_mode_cache is None:
+        logging.info("GLOBAL_TRADE_MODE trade_mode=%s", mode)
+    global_trade_mode_cache = mode
+    return mode
 
 
 def read_strategy_settings(bot_id: str) -> dict[str, object]:
@@ -1510,6 +1554,9 @@ async def heartbeat_loop(client: ClobClient | None):
         fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
         copy_settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
         scalper_settings = read_strategy_settings(STRATEGY_SCALPER_BOT_ID)
+        trade_mode = current_global_trade_mode()
+        copy_settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
+        scalper_settings = read_strategy_settings(STRATEGY_SCALPER_BOT_ID)
         logging.info(
             "Loaded strategy settings bot_id=%s is_enabled=%s arm_live=%s",
             STRATEGY_COPY_BOT_ID,
@@ -1638,8 +1685,13 @@ async def heartbeat_loop(client: ClobClient | None):
                     client,
                     live_master_enabled,
                 )
-            if sniper_traded:
-                logging.info("SNIPER blocked FASTLOOP slug=%s", current_slug or "none")
+            if sniper_traded and trade_mode == "ONE":
+                logging.info(
+                    "TRADE_MODE_BLOCK trade_mode=ONE blocked_strategy=%s by_strategy=%s slug=%s",
+                    STRATEGY_FASTLOOP,
+                    STRATEGY_SNIPER,
+                    current_slug or "none",
+                )
             else:
                 if should_trade_strategy(fastloop_settings, STRATEGY_FASTLOOP, edge):
                     await execute_strategy(
