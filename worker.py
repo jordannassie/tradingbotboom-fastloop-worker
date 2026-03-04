@@ -682,15 +682,23 @@ async def execute_strategy(
             settings["arm_live"],
             live_master_enabled,
         )
-        executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, size_usd)
-        if not executed_live:
-            logging.info(
-                "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
+        live_balance = get_live_balance_value()
+        if live_balance <= 0:
+            logging.warning(
+                "LIVE_SKIP_NO_BANKROLL strategy=%s live_balance_usd=%s",
                 strategy_id,
-                live_master_enabled,
-                "available" if client else "missing",
+                live_balance,
             )
-
+            route_live = False
+        else:
+            executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, size_usd)
+            if not executed_live:
+                logging.info(
+                    "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
+                    strategy_id,
+                    live_master_enabled,
+                    "available" if client else "missing",
+                )
     if not executed_live:
         logging.info(
             "PAPER_EXEC strategy=%s slug=%s size_usd=%s",
