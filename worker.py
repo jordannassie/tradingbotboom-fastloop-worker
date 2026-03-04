@@ -337,10 +337,6 @@ def refresh_live_bankroll_usd_if_needed(
             balance_usd = float(raw_balance) / decimals
             live_balance_cache = balance_usd
             patch_payload["live_balance_usd"] = balance_usd
-        if raw_allowance is not None:
-            allowance_usd = float(raw_allowance) / decimals
-            live_allowance_cache = allowance_usd
-            patch_payload["live_allowance_usd"] = allowance_usd
         if patch_payload:
             logging.info("LIVE_BANKROLL_PATCH_KEYS keys=%s", list(patch_payload.keys()))
             resp_update = (
@@ -579,11 +575,6 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     if balance is not None:
         live_balance_cache = balance
         patch_payload["live_balance_usd"] = balance
-        if live_signer_address:
-            patch_payload["bot_wallet"] = live_signer_address
-    if allowance is not None:
-        live_allowance_cache = allowance
-        patch_payload["live_allowance_usd"] = allowance
     if patch_payload:
         logging.info("LIVE_BANKROLL_PATCH_KEYS_SYNC keys=%s", list(patch_payload.keys()))
         try:
@@ -599,6 +590,7 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
         except Exception:
             logging.exception("Failed updating live_balance_usd")
     if allowance is not None:
+        live_allowance_cache = allowance
         persist_live_strategy_settings(None, allowance)
     now_ts = int(time())
     if now_ts - last_live_bankroll_log_ts >= 60:
