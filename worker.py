@@ -5,7 +5,7 @@ import os
 from collections import deque
 from contextlib import suppress
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from math import floor
 from time import time
 from urllib import parse, request
@@ -122,7 +122,7 @@ def q2(value: float | Decimal | str | None) -> Decimal:
         base = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
-    return base.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+    return base.quantize(TWOPLACES, rounding=ROUND_DOWN)
 
 
 def q4(value: float | Decimal | str | None) -> Decimal:
@@ -130,7 +130,7 @@ def q4(value: float | Decimal | str | None) -> Decimal:
         base = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
-    return base.quantize(FOURPLACES, rounding=ROUND_HALF_UP)
+    return base.quantize(FOURPLACES, rounding=ROUND_DOWN)
 
 def get_shared_paper_balance():
     global shared_paper_balance_cache, shared_paper_balance_ts, shared_paper_balance_error_logged
@@ -1178,20 +1178,20 @@ async def fetch_btc_spot_price() -> float | None:
 
 
 def get_live_balance_usd(client: ClobClient | None) -> float | None:
-    if not client:
-        return None
     try:
-        resp = client.get_balance(asset_type="COLLATERAL")
-        if not resp:
-            return None
-        for key in ("balance", "collateral_balance", "amount", "collateralBalance"):
-            value = resp.get(key)
-            if value is not None:
-                return float(value)
-        return None
-    except Exception:
-        logging.exception("Failed fetching live collateral balance")
-        return None
+        resp = (
+            supabase.table("bot_settings")
+            .select("live_balance_usd")
+            .eq("bot_id", LIVE_MASTER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        value = float_or_none(row.get("live_balance_usd")) if row else None
+        return value or 0.0
+    except Exception as exc:
+        logging.warning("LIVE_BALANCE_FETCH_FAIL err=%s", exc)
+        return 0.0
 
 
 async def live_balance_loop(client: ClobClient | None):
@@ -1792,7 +1792,7 @@ def submit_order(
     taker_raw = Decimal(str(trade_size))
     maker_q = q2(maker_raw)
     taker_q = q4(taker_raw)
-    if taker_q == 0:
+    if taker_q == Decimal("0"):
         taker_q = FOURPLACES
         logging.warning(
             "LIVE_ORDER_ADJUST fallback_taker=0.0001 original_size=%s",
@@ -1800,10 +1800,12 @@ def submit_order(
         )
     adjusted_price = maker_q / taker_q if taker_q != 0 else Decimal(str(price))
     logging.info(
-        "LIVE_ORDER_PREP slug=%s side=%s maker=%s taker=%s",
+        "LIVE_ORDER_AMOUNTS slug=%s side=%s maker_raw=%s maker_q=%s taker_raw=%s taker_q=%s",
         current_slug or "unknown",
         side_label,
+        maker_raw,
         maker_q,
+        taker_raw,
         taker_q,
     )
 
@@ -1831,7 +1833,19 @@ def submit_order(
         consecutive_trade_errors = 0
         last_trade_error = None
     except Exception as exc:
-        consecutive_trade_errors += 1
+        err_lower = str(exc).lower()
+        invalid_amount_error = "invalid amount" in err_lower or "invalid amounts" in err_lower
+        if invalid_amount_error:
+            logging.warning(
+                "LIVE_ORDER_REJECT_INVALID_AMOUNTS maker_raw=%s taker_raw=%s maker_q=%s taker_q=%s",
+                maker_raw,
+                taker_raw,
+                maker_q,
+                taker_q,
+            )
+            paused_due_to_errors = False
+        else:
+            consecutive_trade_errors += 1
         last_trade_error = str(exc)[:512]
         record_trade(
             token_id,
@@ -1845,16 +1859,7 @@ def submit_order(
             error=str(exc),
             strategy_id=strategy_id,
         )
-        err_lower = str(exc).lower()
-        if "invalid amount" in err_lower or "invalid amounts" in err_lower:
-            logging.warning(
-                "LIVE_ORDER_REJECT_INVALID_AMOUNTS maker_raw=%s taker_raw=%s maker_q=%s taker_q=%s",
-                maker_raw,
-                taker_raw,
-                maker_q,
-                taker_q,
-            )
-        if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
+        if not invalid_amount_error and consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
             paused_due_to_errors = True
             logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
 
