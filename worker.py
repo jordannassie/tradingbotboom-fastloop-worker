@@ -876,6 +876,24 @@ def track_copy_trade_id(trade_id: str) -> bool:
     return True
 
 
+def log_copy_schema_sample(raw: dict[str, object]) -> None:
+    global last_copy_schema_log_ts
+    now_ts = time()
+    if now_ts - last_copy_schema_log_ts < 60:
+        return
+    last_copy_schema_log_ts = now_ts
+    sample_keys = list(raw.keys())
+    sample = {}
+    for key in sample_keys[:5]:
+        value = raw.get(key)
+        sample[key] = str(value)[:120]
+    logging.info(
+        "COPY_FEED_SCHEMA sample_keys=%s sample_item=%s",
+        sample_keys,
+        json.dumps(sample, ensure_ascii=False),
+    )
+
+
 def normalize_copy_trade(raw: object) -> dict[str, object] | None:
     if not isinstance(raw, dict):
         logging.info(
@@ -889,13 +907,15 @@ def normalize_copy_trade(raw: object) -> dict[str, object] | None:
     side_keys = ["side", "outcome", "outcomeSide", "tokenSide", "betSide"]
     price_keys = ["price", "avgPrice", "avg_price", "fillPrice", "executionPrice"]
     size_keys = ["size", "sizeUsd", "amount", "notional", "usdAmount", "value"]
-    slug_keys = ["market_slug", "marketSlug", "slug", "market", "event", "eventSlug", "ticker"]
+    slug_keys = ["market_slug", "marketSlug", "slug", "market", "event", "eventSlug", "ticker", "conditionId", "condition_id"]
     trade_id = next((raw.get(k) for k in id_keys if raw.get(k)), None)
     action_val = next((raw.get(k) for k in action_keys if raw.get(k)), None)
     slug = next((raw.get(k) for k in slug_keys if raw.get(k)), None)
     price = next((float_or_none(raw.get(k)) for k in price_keys if raw.get(k)), None)
     size = next((float_or_none(raw.get(k)) for k in size_keys if raw.get(k)), None)
     side = next((raw.get(k) for k in side_keys if raw.get(k)), None)
+    condition_id = raw.get("conditionId") or raw.get("condition_id")
+    asset_val = raw.get("asset") or raw.get("assetId") or raw.get("asset_id")
     if isinstance(side, str):
         sval = side.strip().lower()
         if sval in ("yes", "no"):
@@ -925,9 +945,32 @@ def normalize_copy_trade(raw: object) -> dict[str, object] | None:
                     action = "BUY" if str(taker_side).upper() == "BUY" else "SELL"
                 elif maker_side:
                     action = "BUY" if str(maker_side).upper() == "BUY" else "SELL"
+    if not action:
+        action = "BUY"
+    if not slug and condition_id:
+        slug = str(condition_id)
+        log_copy_schema_sample(raw)
+    if not slug and asset_val:
+        slug = str(asset_val)
     if not trade_id:
+        components = []
+        if condition_id:
+            components.append(str(condition_id))
+        if asset_val:
+            components.append(str(asset_val))
+        if slug:
+            components.append(str(slug))
+        if side:
+            components.append(str(side))
+        if size is not None:
+            components.append(str(size))
+        proxy_wallet = raw.get("proxyWallet")
+        if proxy_wallet:
+            components.append(str(proxy_wallet))
         ts = raw.get("timestamp") or raw.get("createdAt")
-        trade_id = f"{slug}:{ts}:{side}:{price}:{size}"
+        if ts:
+            components.append(str(ts))
+        trade_id = ":".join([c for c in components if c])
     missing = []
     if not trade_id:
         missing.append("id")
