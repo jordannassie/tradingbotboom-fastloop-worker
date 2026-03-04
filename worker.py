@@ -47,6 +47,11 @@ COPY_TARGET_WALLET = os.getenv(
     "COPY_TARGET_WALLET", "0xd0d6053c3c37e727402d84c14069780d360993aa"
 )
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+PAPER_BANKROLL_SHARED_ENABLED = os.getenv("PAPER_BANKROLL_SHARED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 load_dotenv()
 
@@ -133,6 +138,8 @@ def q4(value: float | Decimal | str | None) -> Decimal:
     return base.quantize(FOURPLACES, rounding=ROUND_DOWN)
 
 def get_shared_paper_balance():
+    if not PAPER_BANKROLL_SHARED_ENABLED:
+        return None
     global shared_paper_balance_cache, shared_paper_balance_ts, shared_paper_balance_error_logged
     now_ts = time()
     if shared_paper_balance_cache is not None and (now_ts - shared_paper_balance_ts) < 10:
@@ -151,14 +158,12 @@ def get_shared_paper_balance():
         if not shared_paper_balance_error_logged:
             logging.warning("PAPER_BANKROLL_SHARED_ERROR err=%s", exc)
             shared_paper_balance_error_logged = True
-        balance = None
+        return None
     if balance is None:
         balance = DEFAULT_PAPER_START_BALANCE
     shared_paper_balance_cache = balance
     shared_paper_balance_ts = now_ts
     return balance
-
-logging.info("PAPER_BANKROLL_SHARED enabled base_balance=%s", get_shared_paper_balance())
 
 refresh_asset_map()
 strategy_trade_timestamps = {
@@ -219,6 +224,8 @@ logging.info(
     ROTATE_POLL_SECONDS,
     ROTATE_LOOKAHEAD_SECONDS,
 )
+shared_mode = "ON" if PAPER_BANKROLL_SHARED_ENABLED else "OFF"
+logging.info("PAPER_BANKROLL_SHARED mode=%s", shared_mode)
 
 
 def float_or_none(v):
@@ -406,6 +413,10 @@ def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: s
             balance_base = get_live_balance_value()
         else:
             balance_base = settings.get("paper_balance_usd") or 0.0
+            if PAPER_BANKROLL_SHARED_ENABLED:
+                shared_balance = get_shared_paper_balance()
+                if shared_balance is not None:
+                    balance_base = shared_balance
         size = balance_base * base_size
         is_percent = True
     else:
@@ -1125,8 +1136,12 @@ def fetch_copy_feed(wallet: str) -> list[dict]:
 
 
 def update_shared_paper_balance(pnl_usd: float, strategy_id: str) -> float:
+    if not PAPER_BANKROLL_SHARED_ENABLED:
+        return 0.0
     global shared_paper_balance_cache, shared_paper_balance_ts
     base_balance = get_shared_paper_balance()
+    if base_balance is None:
+        return 0.0
     new_balance = base_balance + pnl_usd
     try:
         supabase.table("bot_settings").update(
