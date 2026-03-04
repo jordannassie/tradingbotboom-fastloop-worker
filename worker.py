@@ -63,6 +63,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
+
+LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
+LIVE_BANKROLL_REFRESH_SECONDS = int(os.getenv("LIVE_BANKROLL_REFRESH_SECONDS", "30"))
+LIVE_TEST_ORDER_USD = (
+    float(os.getenv("LIVE_TEST_ORDER_USD")) if os.getenv("LIVE_TEST_ORDER_USD") else None
+)
+LIVE_USDC_DECIMALS = int(os.getenv("LIVE_USDC_DECIMALS", "6"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -176,6 +184,10 @@ live_balance_cache: float | None = None
 live_allowance_cache: float | None = None
 last_live_bankroll_log_ts = 0
 last_live_order_400_body: str | None = None
+last_live_bankroll_refresh_ts = 0
+live_wallet_ok = False
+live_signer_address: str | None = None
+live_funder_address: str | None = None
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -240,6 +252,111 @@ def parse_strategy_settings_field(payload) -> dict[str, object]:
     elif isinstance(payload, dict):
         parsed = payload
     return parsed
+
+
+def derive_wallet_addresses(client: ClobClient | None) -> bool:
+    global live_wallet_ok, live_signer_address, live_funder_address
+    if not client:
+        return False
+    signer = client.get_address()
+    funder_addr = FUNDER if FUNDER else signer
+    live_signer_address = signer
+    live_funder_address = funder_addr
+    expected = (LIVE_WALLET_ADDRESS_EXPECTED or "").lower()
+    match = False
+    if expected:
+        match = any(
+            addr and addr.lower() == expected
+            for addr in (live_signer_address, live_funder_address)
+        )
+    else:
+        match = True
+    logging.info(
+        "LIVE_WALLET_CHECK expected=%s signer=%s funder=%s match=%s",
+        LIVE_WALLET_ADDRESS_EXPECTED,
+        live_signer_address,
+        live_funder_address,
+        match,
+    )
+    live_wallet_ok = match
+    return match
+
+
+def refresh_live_bankroll_usd_if_needed(
+    client: ClobClient | None, force: bool = False
+) -> tuple[float | None, float | None]:
+    global last_live_bankroll_refresh_ts, live_balance_cache, live_allowance_cache
+    now_ts = int(time())
+    if not live_wallet_ok:
+        logging.warning(
+            "LIVE_BLOCK_WALLET_MISMATCH expected=%s signer=%s funder=%s",
+            LIVE_WALLET_ADDRESS_EXPECTED,
+            live_signer_address,
+            live_funder_address,
+        )
+        return live_balance_cache, live_allowance_cache
+    if not force and now_ts - last_live_bankroll_refresh_ts < LIVE_BANKROLL_REFRESH_SECONDS:
+        return live_balance_cache, live_allowance_cache
+    last_live_bankroll_refresh_ts = now_ts
+    if not client:
+        return live_balance_cache, live_allowance_cache
+    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
+    try:
+        client.update_balance_allowance(params=params)
+        resp = client.get_balance_allowance(params=params)
+    except AttributeError as attr:
+        methods = [
+            m for m in dir(client) if "balance" in m.lower() or "allowance" in m.lower()
+        ]
+        logging.warning(
+            "LIVE_BANKROLL_REFRESH_FAIL err=%s available_methods=%s", attr, methods
+        )
+        return live_balance_cache, live_allowance_cache
+    except Exception as exc:
+        logging.warning("LIVE_BANKROLL_REFRESH_FAIL err=%s", exc)
+        return live_balance_cache, live_allowance_cache
+    raw_balance = (
+        resp.get("balance")
+        or resp.get("amount")
+        or resp.get("collateral_balance")
+        or resp.get("collateralBalance")
+    )
+    raw_allowance = (
+        resp.get("allowance")
+        or resp.get("allowanceUsd")
+        or resp.get("allowance_usd")
+        or resp.get("collateral_allowance")
+        or resp.get("collateralAllowance")
+    )
+    decimals = 10 ** LIVE_USDC_DECIMALS
+    balance_usd = None
+    allowance_usd = None
+    try:
+        if raw_balance is not None:
+            balance_usd = float(raw_balance) / decimals
+            live_balance_cache = balance_usd
+            resp_update = supabase.table("bot_settings").update(
+                {
+                    "live_balance_usd": balance_usd,
+                    "live_updated_at": now_ts,
+                }
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+            status = getattr(resp_update, "status_code", None)
+            logging.info("LIVE_BANKROLL_WRITE status_code=%s", status)
+    except Exception as exc:
+        logging.exception("Failed updating live_balance_usd")
+    if raw_allowance is not None:
+        allowance_usd = float(raw_allowance) / decimals
+        live_allowance_cache = allowance_usd
+    logging.info(
+        "LIVE_BANKROLL_REFRESH balance_usd=%s allowance_usd=%s raw_balance=%s raw_allowance=%s decimals=%s",
+        live_balance_cache,
+        live_allowance_cache,
+        raw_balance,
+        raw_allowance,
+        LIVE_USDC_DECIMALS,
+    )
+    return live_balance_cache, live_allowance_cache
 
 
 def persist_live_strategy_settings(wallet_address: str | None, allowance_usd: float | None = None):
@@ -805,8 +922,17 @@ async def execute_strategy(
             settings["arm_live"],
             live_master_enabled,
         )
+        derive_wallet_addresses(client)
         live_balance = get_live_balance_value()
         allowance = live_allowance_cache
+        new_balance, new_allowance = refresh_live_bankroll_usd_if_needed(
+            client, force=(live_balance is None or live_balance <= 0)
+        )
+        if new_balance is not None:
+            live_balance = new_balance
+        if new_allowance is not None:
+            allowance = new_allowance
+        logging.info("LIVE_BANKROLL_AFTER_REFRESH live_balance_usd=%s", live_balance)
         if live_balance is None or live_balance <= 0:
             logging.warning(
                 "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_balance_usd=%s",
@@ -815,7 +941,19 @@ async def execute_strategy(
             )
             route_live = False
         else:
+            logging.info(
+                "LIVE_ALLOWANCE_CHECK balance_usd=%s allowance_usd=%s",
+                live_balance,
+                allowance,
+            )
             live_size_usd = compute_live_size_usd(settings, strategy_id, live_balance)
+            if LIVE_TEST_ORDER_USD:
+                override_size = min(LIVE_TEST_ORDER_USD, live_balance)
+                live_size_usd = override_size
+                logging.info(
+                    "LIVE_SIZE_OVERRIDE live_size_usd=%s reason=LIVE_TEST_ORDER_USD",
+                    live_size_usd,
+                )
             if not live_size_usd or live_size_usd <= 0:
                 logging.warning(
                     "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_size_usd=%s",
@@ -1921,6 +2059,7 @@ def build_trading_client() -> ClobClient | None:
         logging.info("BOT_WALLET address=%s", address)
         logging.info("LIVE_WALLET address=%s", address)
         persist_live_strategy_settings(address)
+        derive_wallet_addresses(client)
     return client
 
 
