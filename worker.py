@@ -332,17 +332,28 @@ def refresh_live_bankroll_usd_if_needed(
     balance_usd = None
     allowance_usd = None
     try:
+        patch_payload = {}
         if raw_balance is not None:
             balance_usd = float(raw_balance) / decimals
             live_balance_cache = balance_usd
-            resp_update = supabase.table("bot_settings").update(
-                {
-                    "live_balance_usd": balance_usd,
-                    "live_updated_at": now_ts,
-                }
-            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+            patch_payload["live_balance_usd"] = balance_usd
+            if live_signer_address:
+                patch_payload["bot_wallet"] = live_signer_address
+        if raw_allowance is not None:
+            allowance_usd = float(raw_allowance) / decimals
+            live_allowance_cache = allowance_usd
+            patch_payload["live_allowance_usd"] = allowance_usd
+        if patch_payload:
+            logging.info("LIVE_BANKROLL_PATCH_KEYS keys=%s", list(patch_payload.keys()))
+            resp_update = (
+                supabase.table("bot_settings")
+                .update(patch_payload)
+                .eq("bot_id", LIVE_MASTER_BOT_ID)
+                .execute()
+            )
             status = getattr(resp_update, "status_code", None)
-            logging.info("LIVE_BANKROLL_WRITE status_code=%s", status)
+            ok = status in (200, 201)
+            logging.info("LIVE_BANKROLL_WRITE ok=%s status_code=%s", ok, status)
     except Exception as exc:
         logging.exception("Failed updating live_balance_usd")
     if raw_allowance is not None:
