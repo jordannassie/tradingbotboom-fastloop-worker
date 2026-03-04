@@ -577,19 +577,29 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
         or resp.get("collateral_allowance")
         or resp.get("collateralAllowance")
     )
+    patch_payload = {}
     if balance is not None:
         live_balance_cache = balance
-        try:
-            supabase.table("bot_settings").update(
-                {
-                    "live_balance_usd": balance,
-                    "live_updated_at": int(time()),
-                }
-            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
-        except Exception:
-            logging.exception("Failed updating live_balance_usd")
+        patch_payload["live_balance_usd"] = balance
+        if live_signer_address:
+            patch_payload["bot_wallet"] = live_signer_address
     if allowance is not None:
         live_allowance_cache = allowance
+        patch_payload["live_allowance_usd"] = allowance
+    if patch_payload:
+        logging.info("LIVE_BANKROLL_PATCH_KEYS_SYNC keys=%s", list(patch_payload.keys()))
+        try:
+            resp = (
+                supabase.table("bot_settings")
+                .update(patch_payload)
+                .eq("bot_id", LIVE_MASTER_BOT_ID)
+                .execute()
+            )
+            status = getattr(resp, "status_code", None)
+            ok = status in (200, 201)
+            logging.info("LIVE_BANKROLL_WRITE_SYNC ok=%s status_code=%s", ok, status)
+        except Exception:
+            logging.exception("Failed updating live_balance_usd")
     if allowance is not None:
         persist_live_strategy_settings(None, allowance)
     now_ts = int(time())
