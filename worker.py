@@ -356,9 +356,6 @@ def refresh_live_bankroll_usd_if_needed(
             logging.info("LIVE_BANKROLL_WRITE ok=%s status_code=%s", ok, status)
     except Exception as exc:
         logging.exception("Failed updating live_balance_usd")
-    if raw_allowance is not None:
-        allowance_usd = float(raw_allowance) / decimals
-        live_allowance_cache = allowance_usd
     logging.info(
         "LIVE_BANKROLL_REFRESH balance_usd=%s allowance_usd=%s raw_balance=%s raw_allowance=%s decimals=%s",
         live_balance_cache,
