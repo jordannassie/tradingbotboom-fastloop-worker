@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -9,6 +10,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from math import floor
 from time import time
 from urllib import parse, request
+from urllib.error import HTTPError
+
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import websockets
 from dotenv import load_dotenv
@@ -63,6 +67,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
+PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
+PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
 
 LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
@@ -254,6 +261,66 @@ def parse_strategy_settings_field(payload) -> dict[str, object]:
     return parsed
 
 
+def pm_headers(method: str, path: str) -> dict | None:
+    if not PM_ACCESS_KEY or not PM_ED25519_PRIVATE_KEY_B64:
+        return None
+    try:
+        timestamp_ms = str(int(time() * 1000))
+        message = f"{timestamp_ms}{method.upper()}{path}"
+        key_bytes = base64.b64decode(PM_ED25519_PRIVATE_KEY_B64)
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes[:32])
+        signature = private_key.sign(message.encode())
+        signature_b64 = base64.b64encode(signature).decode()
+        return {
+            "X-PM-Access-Key": PM_ACCESS_KEY,
+            "X-PM-Timestamp": timestamp_ms,
+            "X-PM-Signature": signature_b64,
+            "Content-Type": "application/json",
+        }
+    except Exception:
+        logging.exception("Failed building PM headers")
+        return None
+
+
+def fetch_account_buying_power_usd() -> float | None:
+    path = "/v1/account/balances"
+    url = f"{PM_ACCOUNT_HOST.rstrip('/')}{path}"
+    headers = pm_headers("GET", path)
+    if not headers:
+        logging.warning("ACCOUNT_BUYING_POWER_UNAVAILABLE reason=missing_headers")
+        return None
+    req = request.Request(url, headers=headers, method="GET")
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode()
+            truncated = body[:300]
+            status = getattr(resp, "status", None)
+            logging.info("PM_BALANCES_HTTP status=%s body=%s", status, truncated)
+            try:
+                payload = json.loads(body)
+                balances = payload.get("balances") or []
+                buying_power = (
+                    float_or_none(balances[0].get("buyingPower"))
+                    if balances and balances[0].get("buyingPower") is not None
+                    else None
+                )
+            except Exception as exc:
+                logging.warning("ACCOUNT_BUYING_POWER_UNAVAILABLE reason=parse_error %s", exc)
+                buying_power = None
+            logging.info("ACCOUNT_BUYING_POWER buying_power_usd=%s", buying_power)
+            return buying_power
+    except HTTPError as err:
+        body = err.read().decode(errors="ignore")[:300]
+        logging.warning("PM_BALANCES_HTTP status=%s body=%s", err.code, body)
+        logging.warning(
+            "ACCOUNT_BUYING_POWER_UNAVAILABLE reason=HTTP %s body=%s", err.code, body
+        )
+        return None
+    except Exception as exc:
+        logging.warning("ACCOUNT_BUYING_POWER_UNAVAILABLE reason=%s", exc)
+        return None
+
+
 def log_clob_balance_allowance_response(resp, client: ClobClient | None):
     status = getattr(resp, "status_code", None)
     try:
@@ -351,12 +418,12 @@ def refresh_live_bankroll_usd_if_needed(
     decimals = 10 ** LIVE_USDC_DECIMALS
     balance_usd = None
     allowance_usd = None
+    buying_power = fetch_account_buying_power_usd()
     try:
         patch_payload = {}
-        if raw_balance is not None:
-            balance_usd = float(raw_balance) / decimals
-            live_balance_cache = balance_usd
-            patch_payload["live_balance_usd"] = balance_usd
+        if buying_power is not None:
+            live_balance_cache = buying_power
+            patch_payload["live_balance_usd"] = buying_power
         if patch_payload:
             logging.info("LIVE_BANKROLL_PATCH_KEYS keys=%s", list(patch_payload.keys()))
             resp_update = (
@@ -572,26 +639,21 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     global live_balance_cache, live_allowance_cache, last_live_bankroll_log_ts
     if not client:
         return None, None
+    balance = fetch_account_buying_power_usd()
+    allowance = None
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
     try:
         resp = client.get_balance_allowance(params=params)
         log_clob_balance_allowance_response(resp, client)
+        allowance = float_or_none(
+            resp.get("allowance")
+            or resp.get("allowanceUsd")
+            or resp.get("allowance_usd")
+            or resp.get("collateral_allowance")
+            or resp.get("collateralAllowance")
+        )
     except Exception:
         logging.exception("LIVE_BANKROLL_FETCH_FAIL")
-        return None, None
-    balance = float_or_none(
-        resp.get("balance")
-        or resp.get("amount")
-        or resp.get("collateral_balance")
-        or resp.get("collateralBalance")
-    )
-    allowance = float_or_none(
-        resp.get("allowance")
-        or resp.get("allowanceUsd")
-        or resp.get("allowance_usd")
-        or resp.get("collateral_allowance")
-        or resp.get("collateralAllowance")
-    )
     patch_payload = {}
     if balance is not None:
         live_balance_cache = balance
@@ -599,13 +661,13 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     if patch_payload:
         logging.info("LIVE_BANKROLL_PATCH_KEYS_SYNC keys=%s", list(patch_payload.keys()))
         try:
-            resp = (
+            resp_update = (
                 supabase.table("bot_settings")
                 .update(patch_payload)
                 .eq("bot_id", LIVE_MASTER_BOT_ID)
                 .execute()
             )
-            status = getattr(resp, "status_code", None)
+            status = getattr(resp_update, "status_code", None)
             ok = status in (200, 201)
             logging.info("LIVE_BANKROLL_WRITE_SYNC ok=%s status_code=%s", ok, status)
         except Exception:
