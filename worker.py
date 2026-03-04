@@ -96,6 +96,9 @@ best_quotes = {
 ASSET_TO_SIDE = {}
 copy_last_seen_trade_ids = deque()
 copy_seen_trade_id_set = set()
+shared_paper_balance_cache: float | None = None
+shared_paper_balance_ts: float = 0
+shared_paper_balance_error_logged = False
 
 def refresh_asset_map():
     ASSET_TO_SIDE.clear()
@@ -111,7 +114,7 @@ def reset_best_quotes():
     best_quotes["no"]["ask"] = None
 
 def get_shared_paper_balance():
-    global shared_paper_balance_cache, shared_paper_balance_ts
+    global shared_paper_balance_cache, shared_paper_balance_ts, shared_paper_balance_error_logged
     now_ts = time()
     if shared_paper_balance_cache is not None and (now_ts - shared_paper_balance_ts) < 10:
         return shared_paper_balance_cache
@@ -125,8 +128,10 @@ def get_shared_paper_balance():
         )
         row = (resp.data or [None])[0]
         balance = float_or_none(row.get("paper_balance_usd")) if row else None
-    except Exception:
-        logging.exception("Failed reading shared paper_balance_usd")
+    except Exception as exc:
+        if not shared_paper_balance_error_logged:
+            logging.warning("PAPER_BANKROLL_SHARED_ERROR err=%s", exc)
+            shared_paper_balance_error_logged = True
         balance = None
     if balance is None:
         balance = DEFAULT_PAPER_START_BALANCE
@@ -144,8 +149,6 @@ strategy_trade_timestamps = {
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
-shared_paper_balance_cache: float | None = None
-shared_paper_balance_ts: float = 0
 global_trade_mode_cache: str | None = None
 last_copy_schema_log_ts = 0
 last_copy_target_log_ts = 0
