@@ -242,6 +242,34 @@ def parse_strategy_settings_field(payload) -> dict[str, object]:
     return parsed
 
 
+def persist_live_strategy_settings(wallet_address: str | None, allowance_usd: float | None = None):
+    if wallet_address is None and allowance_usd is None:
+        return
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings")
+            .eq("bot_id", LIVE_MASTER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        current = parse_strategy_settings_field(row.get("strategy_settings") if row else {})
+        changed = False
+        if wallet_address and current.get("live_wallet_address") != wallet_address:
+            current["live_wallet_address"] = wallet_address
+            changed = True
+        if allowance_usd is not None and current.get("live_allowance_usd") != allowance_usd:
+            current["live_allowance_usd"] = allowance_usd
+            changed = True
+        if changed:
+            supabase.table("bot_settings").update(
+                {"strategy_settings": current}
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+    except Exception:
+        logging.exception("Failed updating live strategy settings")
+
+
 def get_global_trade_mode() -> str:
     try:
         resp = (
@@ -437,6 +465,8 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
             logging.exception("Failed updating live_balance_usd")
     if allowance is not None:
         live_allowance_cache = allowance
+    if allowance is not None:
+        persist_live_strategy_settings(None, allowance)
     now_ts = int(time())
     if now_ts - last_live_bankroll_log_ts >= 60:
         last_live_bankroll_log_ts = now_ts
@@ -1842,6 +1872,8 @@ def build_trading_client() -> ClobClient | None:
     address = client.get_address()
     if address:
         logging.info("BOT_WALLET address=%s", address)
+        logging.info("LIVE_WALLET address=%s", address)
+        persist_live_strategy_settings(address)
     return client
 
 
