@@ -71,6 +71,11 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
+logging.info(
+    "PM_ENV_CHECK access_key_present=%s privkey_present=%s",
+    bool(PM_ACCESS_KEY),
+    bool(PM_ED25519_PRIVATE_KEY_B64),
+)
 
 LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
 LIVE_BANKROLL_REFRESH_SECONDS = int(os.getenv("LIVE_BANKROLL_REFRESH_SECONDS", "30"))
