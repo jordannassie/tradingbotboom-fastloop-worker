@@ -731,16 +731,44 @@ def track_copy_trade_id(trade_id: str) -> bool:
 
 
 def fetch_copy_feed(wallet: str) -> list[dict]:
-    if not COPY_TARGET_WALLET:
+    if not wallet:
         return []
-    url = f"{GAMMA_API_BASE}/trades?accountId={parse.quote(wallet)}&limit=50"
-    try:
-        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
-        with request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-    except Exception as exc:
-        logging.warning("COPY_FEED_UNAVAILABLE url=%s error=%s", url, exc)
-        return []
+    endpoints = [
+        f"{GAMMA_API_BASE}/trades?accountId={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/trades?maker={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/trades?trader={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/trades?address={parse.quote(wallet)}&limit=50",
+        f"{GAMMA_API_BASE}/activity?address={parse.quote(wallet)}&limit=50",
+    ]
+    tried = []
+    data = None
+    for url in endpoints:
+        logging.info("COPY_FEED_TRY url=%s", url)
+        try:
+            req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+            with request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    tried.append(url)
+                    continue
+                data = json.loads(resp.read())
+                trade_list = data
+                if isinstance(data, dict):
+                    if "trades" in data and isinstance(data["trades"], list):
+                        trade_list = data["trades"]
+                    elif "data" in data and isinstance(data["data"], list):
+                        trade_list = data["data"]
+                    else:
+                        trade_list = []
+                if not isinstance(trade_list, list):
+                    trade_list = []
+                logging.info("COPY_FEED_OK url=%s count=%d", url, len(trade_list))
+                return trade_list
+        except Exception as exc:
+            tried.append(url)
+            logging.warning("COPY_FEED_TRY url=%s error=%s", url, exc)
+            continue
+    logging.warning("COPY_FEED_UNAVAILABLE urls_tried=%s", tried)
+    return []
 
     trades = data
     if isinstance(data, dict):
