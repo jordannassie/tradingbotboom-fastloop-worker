@@ -331,20 +331,62 @@ def mark_strategy_trade_attempts(strategy_id: str, n=1):
         dq.append(ts)
 
 
-def compute_strategy_size(settings: dict[str, object], strategy_id: str) -> float:
+def get_live_balance_value() -> float:
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("live_balance_usd")
+            .eq("bot_id", LIVE_MASTER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        return float_or_none(row.get("live_balance_usd")) or 0.0 if row else 0.0
+    except Exception:
+        logging.exception("Failed reading live balance")
+        return 0.0
+
+
+def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: str) -> float:
     base_size = max(settings["trade_size_usd"], 0.0)
-    if strategy_id == STRATEGY_SNIPER:
-        paper_balance = settings.get("paper_balance_usd") or 0.0
-        if base_size <= 1 and paper_balance > 0:
-            base_size = paper_balance * base_size
-        size = min(base_size, SNIPER_SIZE_CAP_USD)
-    elif strategy_id == STRATEGY_COPY:
-        paper_balance = settings.get("paper_balance_usd") or 0.0
-        if base_size <= 1 and paper_balance > 0:
-            base_size = paper_balance * base_size
-        size = min(base_size, COPY_SIZE_CAP_USD)
+    balance_base = "n/a"
+    if base_size <= 1:
+        if mode == "LIVE":
+            balance_base = get_live_balance_value()
+        else:
+            balance_base = settings.get("paper_balance_usd") or 0.0
+        size = balance_base * base_size
+        is_percent = True
     else:
         size = base_size
+        is_percent = False
+    cap_applied = False
+    cap_value = None
+    if strategy_id == STRATEGY_SNIPER:
+        if size > SNIPER_SIZE_CAP_USD:
+            size = SNIPER_SIZE_CAP_USD
+            cap_applied = True
+            cap_value = SNIPER_SIZE_CAP_USD
+    if strategy_id == STRATEGY_COPY:
+        if size > COPY_SIZE_CAP_USD:
+            cap_applied = True
+            cap_value = COPY_SIZE_CAP_USD
+            logging.info(
+                "COPY_SIZE_CAP_APPLIED wanted=%s capped=%s",
+                size,
+                COPY_SIZE_CAP_USD,
+            )
+            size = COPY_SIZE_CAP_USD
+    logging.info(
+        "SIZE_COMPUTE strategy=%s mode=%s trade_size_input=%s base_balance=%s size_usd=%s is_percent=%s cap=%s",
+        strategy_id,
+        mode,
+        settings["trade_size_usd"],
+        balance_base if base_size <= 1 else "n/a",
+        size,
+        is_percent,
+        cap_value if cap_applied else "none",
+    )
     return size
 
 
@@ -553,7 +595,8 @@ async def execute_strategy(
         logging.warning("Invalid entry price for %s slug=%s", strategy_id, current_slug)
         return False
 
-    size_usd = compute_strategy_size(settings, strategy_id)
+    mode = settings.get("mode", "PAPER").upper()
+    size_usd = compute_strategy_size(settings, strategy_id, mode)
     shares = compute_shares_from_size(size_usd, entry_price)
     if size_usd <= 0:
         logging.warning(
@@ -1003,7 +1046,7 @@ async def copy_watch_loop():
                             settings["max_trades_per_hour"],
                         )
                         continue
-                    size_usd = compute_strategy_size(settings, STRATEGY_COPY)
+                    size_usd = compute_strategy_size(settings, STRATEGY_COPY, settings.get("mode", "PAPER").upper())
                     shares = compute_shares_from_size(size_usd, price)
                     if size_usd <= 0 or shares <= 0:
                         logging.warning(
