@@ -254,6 +254,25 @@ def parse_strategy_settings_field(payload) -> dict[str, object]:
     return parsed
 
 
+def log_clob_balance_allowance_response(resp, client: ClobClient | None):
+    status = getattr(resp, "status_code", None)
+    try:
+        body = json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        body = str(resp)
+    truncated = body[:1200]
+    logging.info(
+        "CLOB_BALANCE_ALLOWANCE_HTTP status=%s body=%s", status, truncated
+    )
+    parsed_type = type(resp).__name__ if resp is not None else "NoneType"
+    keys = list(resp.keys()) if isinstance(resp, dict) else None
+    logging.info(
+        "CLOB_BALANCE_ALLOWANCE_PARSED type=%s keys=%s", parsed_type, keys
+    )
+    signer = client.get_address() if client else "none"
+    logging.info("CLOB_AUTH signer=%s signature_type=%s", signer, SIGNATURE_TYPE)
+
+
 def derive_wallet_addresses(client: ClobClient | None) -> bool:
     global live_wallet_ok, live_signer_address, live_funder_address
     if not client:
@@ -304,6 +323,7 @@ def refresh_live_bankroll_usd_if_needed(
     try:
         client.update_balance_allowance(params=params)
         resp = client.get_balance_allowance(params=params)
+        log_clob_balance_allowance_response(resp, client)
     except AttributeError as attr:
         methods = [
             m for m in dir(client) if "balance" in m.lower() or "allowance" in m.lower()
@@ -555,6 +575,7 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
     try:
         resp = client.get_balance_allowance(params=params)
+        log_clob_balance_allowance_response(resp, client)
     except Exception:
         logging.exception("LIVE_BANKROLL_FETCH_FAIL")
         return None, None
