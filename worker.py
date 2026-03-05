@@ -235,6 +235,7 @@ live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
 trades_auth_mode_logged = False
 trades_sample_logged = False
+live_positions: dict[str, float] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
