@@ -352,7 +352,7 @@ def _unwrap_list(result: object) -> list[dict[str, object]]:
 
 def get_live_positions_snapshot(
     client: ClobClient | None = None, log_snapshot: bool = True
-) -> dict[str, object]:
+ ) -> dict[str, object]:
     inferred_initial = {
         token: shares for token, shares in live_positions.items() if shares > 0
     }
@@ -481,6 +481,36 @@ def build_exit_order_params(
     }
 
 
+def get_token_midprice(client: ClobClient, token_id: str) -> float | None:
+    methods = [
+        "get_trades",
+        "get_trades_paginated",
+        "getTrades",
+        "getTradesPaginated",
+    ]
+    for method_name in methods:
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method()
+        except Exception:
+            continue
+        trades = _unwrap_list(result)
+        for trade in trades:
+            tid = _extract_token_id(trade)
+            if tid != token_id:
+                continue
+            price = (
+                _safe_parse_float(trade.get("price"))
+                or _safe_parse_float(trade.get("executionPrice"))
+                or _safe_parse_float(trade.get("avgPrice"))
+            )
+            if price:
+                return price
+    return None
+
+
 def _cancel_live_orders_for_token(client: ClobClient, token_id: str) -> None:
     snapshot = get_live_positions_snapshot(client, log_snapshot=False)
     for order in snapshot["open_orders"]:
@@ -535,69 +565,93 @@ async def close_live_position_ladder(
         return True
 
     close_side = "SELL" if shares > 0 else "BUY"
-    start_price = base_price or approx_mid_price()
-    if not start_price or start_price <= 0:
-        start_price = 0.01 if close_side == "SELL" else 0.99
-
-    improve = EXIT_LADDER_PRICE_IMPROVE_CENTS / 100.0
-    shares_now = shares
-    for step in range(1, EXIT_LADDER_MAX_STEPS + 1):
-        if close_side == "SELL":
-            price = max(0.01, start_price - (step - 1) * improve)
-        else:
-            price = min(0.99, start_price + (step - 1) * improve)
-
-        params = build_exit_order_params(token_id, shares_now, close_side, price)
-        if params["size_usd"] <= 0:
-            logging.warning("LIVE_EXIT_SKIP_ZERO_SIZE token_id=%s price=%s", token_id, price)
+    try:
+        price_base = base_price or get_token_midprice(client, token_id)
+        if not price_base:
+            logging.warning("LIVE_EXIT_NO_PRICE token_id=%s", token_id)
             return False
 
-        success = submit_order(
-            client,
-            token_id,
-            ASSET_TO_SIDE.get(token_id, "yes"),
-            price,
-            0.0,
-            best_quotes["yes"]["ask"] or 0.0,
-            best_quotes["no"]["ask"] or 0.0,
-            params["size_usd"],
-            strategy_id="force_exit",
-            order_side=close_side,
-        )
+        improve = EXIT_LADDER_PRICE_IMPROVE_CENTS / 100.0
+        shares_now = shares
+        for step in range(1, EXIT_LADDER_MAX_STEPS + 1):
+            if close_side == "SELL":
+                price = max(
+                    0.01, price_base - 0.01 - (step - 1) * improve
+                )
+            else:
+                price = min(
+                    0.99, price_base + 0.01 + (step - 1) * improve
+                )
 
-        logging.info(
-            "LIVE_EXIT_STEP token_id=%s close_side=%s shares=%s price=%s step=%s/%s reason=%s success=%s",
-            token_id,
-            close_side,
-            shares_abs,
-            price,
-            step,
-            EXIT_LADDER_MAX_STEPS,
-            reason,
-            success,
-        )
+            params = build_exit_order_params(token_id, shares_now, close_side, price)
+            if params["size_usd"] <= 0:
+                logging.warning(
+                    "LIVE_EXIT_SKIP_ZERO_SIZE token_id=%s price=%s",
+                    token_id,
+                    price,
+                )
+                return False
 
-        await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
-        snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-        shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
-        if abs(shares_now) <= 0.01:
-            logging.info(
-                "LIVE_EXIT_DONE token_id=%s remaining_shares=%s reason=%s",
+            success = submit_order(
+                client,
                 token_id,
-                shares_now,
-                reason,
+                ASSET_TO_SIDE.get(token_id, "yes"),
+                price,
+                0.0,
+                best_quotes["yes"]["ask"] or 0.0,
+                best_quotes["no"]["ask"] or 0.0,
+                params["size_usd"],
+                strategy_id="force_exit",
+                order_side=close_side,
             )
-            return True
 
-        _cancel_live_orders_for_token(client, token_id)
+            logging.info(
+                "LIVE_EXIT_STEP token_id=%s close_side=%s shares=%s price=%s step=%s/%s reason=%s success=%s",
+                token_id,
+                close_side,
+                shares_abs,
+                price,
+                step,
+                EXIT_LADDER_MAX_STEPS,
+                reason,
+                success,
+            )
 
-    logging.warning(
-        "LIVE_EXIT_FAILED token_id=%s shares_remaining=%s reason=%s",
-        token_id,
-        shares_now,
-        reason,
-    )
-    return False
+            await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
+            snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+            shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
+            if abs(shares_now) <= 0.01:
+                logging.info(
+                    "LIVE_EXIT_DONE token_id=%s remaining_shares=%s reason=%s",
+                    token_id,
+                    shares_now,
+                    reason,
+                )
+                return True
+
+            _cancel_live_orders_for_token(client, token_id)
+
+        logging.warning(
+            "LIVE_EXIT_FAILED token_id=%s shares_remaining=%s reason=%s",
+            token_id,
+            shares_now,
+            reason,
+        )
+        return False
+    except Exception as exc:
+        logging.warning(
+            "LIVE_EXIT_EXCEPTION token_id=%s err=%s",
+            token_id,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logging.warning(
+            "LIVE_EXIT_EXCEPTION token_id=%s err=%s",
+            token_id,
+            exc,
+        )
+        return False
 
 
 def pm_headers(method: str, path: str) -> dict | None:
