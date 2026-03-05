@@ -237,7 +237,7 @@ last_live_positions_snapshot_ts = 0
 trades_auth_mode_logged = False
 trades_sample_logged = False
 live_order_tracker: dict[str, dict[str, object]] = {}
-tracker_enabled_logged = False
+logging.info("LIVE_TRACKER_INIT empty=True")
 live_positions: dict[str, float] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
@@ -334,6 +334,63 @@ def _record_live_position(token_id: str, delta_shares: float) -> None:
         live_positions[token_id] = updated
 
 
+def tracker_apply_fill(
+    token_id: str | int | None,
+    order_side: str,
+    shares: float,
+    price: float | None,
+    now_ts: int,
+    order_id: str | None,
+) -> None:
+    if not token_id:
+        return
+    normalized_token = str(token_id)
+    shares_clamped = max(0.0, shares)
+    side = (order_side or "").upper()
+    if side not in ("BUY", "SELL"):
+        return
+    delta = shares_clamped if side == "BUY" else -shares_clamped
+    entry = live_order_tracker.setdefault(
+        normalized_token,
+        {
+            "shares": 0.0,
+            "last_price": None,
+            "last_update_ts": now_ts,
+            "last_order_id": None,
+        },
+    )
+    previous_shares = float(entry.get("shares") or 0.0)
+    new_shares = max(0.0, previous_shares + delta)
+    entry["shares"] = new_shares
+    entry["last_price"] = price if price is not None else entry.get("last_price")
+    entry["last_update_ts"] = now_ts
+    entry["last_order_id"] = order_id
+    logging.info(
+        "LIVE_TRACKER_APPLY token_id=%s side=%s delta=%.6f new_shares=%.6f price=%s order_id=%s",
+        normalized_token,
+        side,
+        delta,
+        new_shares,
+        price if price is not None else "none",
+        order_id or "none",
+    )
+
+
+def get_live_positions_from_tracker(min_shares: float = 0.01) -> dict[str, float]:
+    snapshot: dict[str, float] = {}
+    for token, data in live_order_tracker.items():
+        shares_value = float(data.get("shares") or 0.0)
+        if shares_value > min_shares:
+            snapshot[token] = shares_value
+    tokens = list(snapshot.items())[:3]
+    logging.info(
+        "LIVE_TRACKER_SNAPSHOT tokens=%s example=%s",
+        len(snapshot),
+        [(token, round(shares, 4)) for token, shares in tokens],
+    )
+    return snapshot
+
+
 def _safe_parse_float(value: object) -> float | None:
     if value is None:
         return None
@@ -394,6 +451,22 @@ def _extract_identifier(payload: dict[str, object], keys: tuple[str, ...]) -> st
     return None
 
 
+def _extract_order_id_from_response(resp: object) -> str | None:
+    if not resp:
+        return None
+    if isinstance(resp, dict):
+        return _extract_identifier(resp, ("order_id", "orderId", "id"))
+    json_method = getattr(resp, "json", None)
+    if callable(json_method):
+        try:
+            payload = json_method()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            return _extract_identifier(payload, ("order_id", "orderId", "id"))
+    return None
+
+
 def _unwrap_list(result: object) -> list[dict[str, object]]:
     if isinstance(result, list):
         return [item for item in result if isinstance(item, dict)]
@@ -425,7 +498,7 @@ def infer_positions_from_trades(client: ClobClient) -> dict[str, float]:
 def get_live_positions_truth(
     client: ClobClient | None, signer_address: str | None
 ) -> dict[str, float]:
-    tracker = get_live_tracker_snapshot()
+    tracker = get_live_positions_from_tracker()
     if tracker:
         logging.info(
             "LIVE_POSITIONS_SOURCE source=TRACKER tokens=%s", len(tracker)
@@ -866,82 +939,6 @@ def extract_trade_size(trade: dict[str, object]) -> float:
         if parsed:
             return parsed
     return 0.0
-
-
-def record_live_order_fill(
-    token_id: str,
-    order_side: str,
-    shares: float,
-    price: float,
-    strategy: str | None,
-    slug: str | None,
-    reason: str,
-    ts: int,
-) -> None:
-    if not token_id or shares <= 0:
-        return
-    entry = live_order_tracker.setdefault(
-        token_id,
-        {
-            "net_shares": 0.0,
-            "last_update_ts": ts,
-            "events": [],
-        },
-    )
-    net = entry["net_shares"]
-    if order_side.upper() == "BUY":
-        net += shares
-    else:
-        net -= shares
-    if abs(net) < 1e-6:
-        net = 0.0
-    entry["net_shares"] = net
-    entry["last_update_ts"] = ts
-    events = entry["events"]
-    events.append(
-        {
-            "ts": ts,
-            "token_id": token_id,
-            "order_side": order_side,
-            "shares": shares,
-            "price": price,
-            "strategy": strategy or "unknown",
-            "slug": slug or "none",
-            "reason": reason,
-        }
-    )
-    if len(events) > 50:
-        del events[0]
-    logging.info(
-        "LIVE_TRACKER_EVENT token_id=%s order_side=%s shares=%.4f price=%.4f net=%.4f strategy=%s slug=%s reason=%s",
-        token_id,
-        order_side,
-        shares,
-        price,
-        net,
-        strategy or "unknown",
-        slug or "none",
-        reason,
-    )
-
-
-def get_live_tracker_snapshot() -> dict[str, float]:
-    snapshot = {
-        token: entry["net_shares"]
-        for token, entry in live_order_tracker.items()
-        if abs(entry["net_shares"]) > 0.01
-    }
-    tokens = list(snapshot.items())[:3]
-    logging.info(
-        "LIVE_TRACKER_SNAPSHOT tokens=%s example=%s",
-        len(snapshot),
-        [(token, round(shares, 4)) for token, shares in tokens],
-    )
-    global tracker_enabled_logged
-    if not tracker_enabled_logged:
-        logging.info("LIVE_TRACKER_ENABLED enabled=true")
-        tracker_enabled_logged = True
-    return snapshot
 
 
 def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
@@ -3527,17 +3524,16 @@ def submit_order(
         )
         delta = float(shares_q) if order_side_normalized == "BUY" else -float(shares_q)
         _record_live_position(token_id, delta)
-        record_live_order_fill(
+        now_ts = int(time())
+        order_id = _extract_order_id_from_response(resp)
+        tracker_apply_fill(
             token_id,
             order_side_normalized,
             float(shares_q),
             float(price_q),
-            strategy_id,
-            current_slug,
-            reason,
-            int(time()),
+            now_ts,
+            order_id,
         )
-        now_ts = int(time())
         if strategy_id:
             live_entry_info[token_id] = {
                 "entry_price": float(price_q),
