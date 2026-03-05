@@ -331,6 +331,14 @@ def _extract_token_id(payload: dict[str, object]) -> str | None:
     return None
 
 
+def _extract_identifier(payload: dict[str, object], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def _unwrap_list(result: object) -> list[dict[str, object]]:
     if isinstance(result, list):
         return [item for item in result if isinstance(item, dict)]
@@ -342,7 +350,9 @@ def _unwrap_list(result: object) -> list[dict[str, object]]:
     return []
 
 
-def get_live_positions_snapshot(client: ClobClient | None = None) -> dict[str, object]:
+def get_live_positions_snapshot(
+    client: ClobClient | None = None, log_snapshot: bool = True
+) -> dict[str, object]:
     inferred_initial = {
         token: shares for token, shares in live_positions.items() if shares > 0
     }
@@ -353,13 +363,14 @@ def get_live_positions_snapshot(client: ClobClient | None = None) -> dict[str, o
     }
 
     if not client:
-        logging.info(
-            "LIVE_POSITIONS_SNAPSHOT open_orders=0 recent_trades=0 inferred_tokens=%s tokens=%s",
-            len(snapshot["inferred_positions"]),
-            list(snapshot["inferred_positions"].keys())[:3],
-        )
-        for token_id, shares in list(snapshot["inferred_positions"].items())[:5]:
-            logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
+        if log_snapshot:
+            logging.info(
+                "LIVE_POSITIONS_SNAPSHOT open_orders=0 recent_trades=0 inferred_tokens=%s tokens=%s",
+                len(snapshot["inferred_positions"]),
+                list(snapshot["inferred_positions"].keys())[:3],
+            )
+            for token_id, shares in list(snapshot["inferred_positions"].items())[:5]:
+                logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
         return snapshot
 
     def _call_method(method_names: list[str]) -> list[dict[str, object]]:
@@ -412,21 +423,23 @@ def get_live_positions_snapshot(client: ClobClient | None = None) -> dict[str, o
         if token_id:
             tokens.append(token_id[:6] + "..." if len(token_id) > 6 else token_id)
 
-    logging.info(
-        "LIVE_POSITIONS_SNAPSHOT open_orders=%s recent_trades=%s inferred_tokens=%s tokens=%s",
-        len(snapshot["open_orders"]),
-        len(snapshot["recent_trades"]),
-        len(snapshot["inferred_positions"]),
-        tokens,
-    )
+    if log_snapshot:
+        logging.info(
+            "LIVE_POSITIONS_SNAPSHOT open_orders=%s recent_trades=%s inferred_tokens=%s tokens=%s",
+            len(snapshot["open_orders"]),
+            len(snapshot["recent_trades"]),
+            len(snapshot["inferred_positions"]),
+            tokens,
+        )
 
-    inferred_sorted = sorted(
-        snapshot["inferred_positions"].items(),
-        key=lambda kv: abs(kv[1]),
-        reverse=True,
-    )
-    for token_id, shares in inferred_sorted[:5]:
-        logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
+    if log_snapshot:
+        inferred_sorted = sorted(
+            snapshot["inferred_positions"].items(),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )
+        for token_id, shares in inferred_sorted[:5]:
+            logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
 
     return snapshot
 
@@ -441,6 +454,150 @@ def parse_strategy_settings_field(payload) -> dict[str, object]:
     elif isinstance(payload, dict):
         parsed = payload
     return parsed
+
+
+def clamp_min_order_usd(size_usd: float, min_usd: float) -> float:
+    return max(size_usd, min_usd)
+
+
+def should_force_exit(time_to_end_s: float, force_exit_s: float) -> bool:
+    return time_to_end_s <= force_exit_s
+
+
+def build_exit_order_params(
+    token_id: str, shares: float, close_side: str, price_hint: float | None
+) -> dict[str, object]:
+    shares_abs = abs(shares)
+    size_usd = MIN_ORDER_USD
+    if price_hint and price_hint > 0:
+        size_usd = shares_abs * price_hint
+    size_usd = clamp_min_order_usd(size_usd, MIN_ORDER_USD)
+    return {
+        "token_id": token_id,
+        "shares_abs": shares_abs,
+        "close_side": close_side,
+        "price_hint": price_hint,
+        "size_usd": size_usd,
+    }
+
+
+def _cancel_live_orders_for_token(client: ClobClient, token_id: str) -> None:
+    snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+    for order in snapshot["open_orders"]:
+        if _extract_token_id(order) != token_id:
+            continue
+        order_id = _extract_identifier(order, ("orderId", "order_id", "id"))
+        if not order_id:
+            continue
+        for cancel_method_name in ("cancel_order", "cancelOrder", "cancel"):
+            cancel_method = getattr(client, cancel_method_name, None)
+            if callable(cancel_method):
+                try:
+                    cancel_method(order_id)
+                    logging.info(
+                        "LIVE_EXIT_CANCEL order_id=%s token_id=%s method=%s",
+                        order_id,
+                        token_id,
+                        cancel_method_name,
+                    )
+                    break
+                except Exception as exc:
+                    logging.warning(
+                        "LIVE_EXIT_CANCEL_ERROR order_id=%s err=%s",
+                        order_id,
+                        exc,
+                    )
+                    continue
+
+
+async def close_live_position_ladder(
+    client: ClobClient,
+    token_id: str,
+    shares: float,
+    base_price: float | None = None,
+    reason: str = "FORCE_EXIT",
+) -> bool:
+    if not client:
+        logging.warning(
+            "LIVE_EXIT_ERROR token_id=%s err=%s",
+            token_id,
+            "missing_client",
+        )
+        return False
+    shares_abs = abs(shares)
+    if shares_abs < 0.01:
+        logging.info(
+            "LIVE_EXIT_SKIP_TINY token_id=%s shares=%s reason=%s",
+            token_id,
+            shares,
+            reason,
+        )
+        return True
+
+    close_side = "SELL" if shares > 0 else "BUY"
+    start_price = base_price or approx_mid_price()
+    if not start_price or start_price <= 0:
+        start_price = 0.01 if close_side == "SELL" else 0.99
+
+    improve = EXIT_LADDER_PRICE_IMPROVE_CENTS / 100.0
+    shares_now = shares
+    for step in range(1, EXIT_LADDER_MAX_STEPS + 1):
+        if close_side == "SELL":
+            price = max(0.01, start_price - (step - 1) * improve)
+        else:
+            price = min(0.99, start_price + (step - 1) * improve)
+
+        params = build_exit_order_params(token_id, shares_now, close_side, price)
+        if params["size_usd"] <= 0:
+            logging.warning("LIVE_EXIT_SKIP_ZERO_SIZE token_id=%s price=%s", token_id, price)
+            return False
+
+        success = submit_order(
+            client,
+            token_id,
+            ASSET_TO_SIDE.get(token_id, "yes"),
+            price,
+            0.0,
+            best_quotes["yes"]["ask"] or 0.0,
+            best_quotes["no"]["ask"] or 0.0,
+            params["size_usd"],
+            strategy_id="force_exit",
+            order_side=close_side,
+        )
+
+        logging.info(
+            "LIVE_EXIT_STEP token_id=%s close_side=%s shares=%s price=%s step=%s/%s reason=%s success=%s",
+            token_id,
+            close_side,
+            shares_abs,
+            price,
+            step,
+            EXIT_LADDER_MAX_STEPS,
+            reason,
+            success,
+        )
+
+        await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
+        snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+        shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
+        if abs(shares_now) <= 0.01:
+            logging.info(
+                "LIVE_EXIT_DONE token_id=%s remaining_shares=%s reason=%s",
+                token_id,
+                shares_now,
+                reason,
+            )
+            return True
+
+        _cancel_live_orders_for_token(client, token_id)
+
+    logging.warning(
+        "LIVE_EXIT_FAILED token_id=%s shares_remaining=%s reason=%s",
+        token_id,
+        shares_now,
+        reason,
+    )
+    return False
 
 
 def pm_headers(method: str, path: str) -> dict | None:
@@ -1174,7 +1331,7 @@ def close_live_position(
             strategy_id or "unknown",
         )
         return False
-    get_live_positions_snapshot()
+    get_live_positions_snapshot(log_snapshot=False)
     shares = live_positions.get(token_id) or 0.0
     if shares <= 0:
         logging.info(
@@ -1226,6 +1383,7 @@ async def execute_strategy(
     na: float,
     client: ClobClient | None,
     live_master_enabled: bool,
+    skip_live: bool = False,
 ) -> bool:
     if not current_slug:
         logging.warning("Missing slug; skipping strategy %s", strategy_id)
@@ -1260,7 +1418,7 @@ async def execute_strategy(
         )
         return False
 
-    route_live = live_master_enabled and settings["arm_live"]
+    route_live = live_master_enabled and settings["arm_live"] and not skip_live
     executed_live = False
     live_size_usd = None
     if route_live:
@@ -2657,6 +2815,57 @@ async def heartbeat_loop(client: ClobClient | None):
 
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
+        force_exit_triggered = False
+        force_exit_ok = 0
+        force_exit_fail = 0
+        if (
+            live_master_enabled
+            and client
+            and current_slug
+            and (sniper_settings["arm_live"] or fastloop_settings["arm_live"])
+        ):
+            start_ts = slug_start_timestamp(current_slug)
+            if start_ts is not None:
+                time_to_end = (start_ts + current_interval_seconds) - now_ts
+                if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+                    force_exit_triggered = True
+                    logging.info(
+                        "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
+                        current_slug,
+                        time_to_end,
+                    )
+                    snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+                    inferred = snapshot.get("inferred_positions") or {}
+                    for token_id, shares in inferred.items():
+                        if abs(shares) < 0.01:
+                            continue
+                        try:
+                            ok = await close_live_position_ladder(
+                                client,
+                                token_id,
+                                shares,
+                                base_price=best_quotes.get(
+                                    ASSET_TO_SIDE.get(token_id, "yes"), {}
+                                ).get("bid"),
+                                reason="FORCE_EXIT",
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "LIVE_EXIT_ERROR token_id=%s err=%s",
+                                token_id,
+                                exc,
+                            )
+                            ok = False
+                        if ok:
+                            force_exit_ok += 1
+                        else:
+                            force_exit_fail += 1
+                    logging.info(
+                        "LIVE_FORCE_EXIT_RESULT slug=%s ok_count=%s fail_count=%s",
+                        current_slug,
+                        force_exit_ok,
+                        force_exit_fail,
+                    )
 
         status = "ENABLED" if is_enabled_combined else "DISABLED"
         msg = (
@@ -2760,6 +2969,7 @@ async def heartbeat_loop(client: ClobClient | None):
                     na,
                     client,
                     live_master_enabled,
+                    skip_live=force_exit_triggered,
                 )
             if sniper_traded and trade_mode == "ONE":
                 logging.info(
@@ -2780,6 +2990,7 @@ async def heartbeat_loop(client: ClobClient | None):
                         na,
                         client,
                         live_master_enabled,
+                        skip_live=force_exit_triggered,
                     )
         await asyncio.sleep(5)
         if rotating:
