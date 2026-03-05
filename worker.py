@@ -235,6 +235,7 @@ live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
 live_positions: dict[str, float] = {}
 live_entry_info: dict[str, dict[str, object]] = {}
+trades_auth_mode_logged = False
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -708,43 +709,48 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
     return positions
 
 
+def fetch_authenticated_trades(
+    client: ClobClient, cursor: str | None = None
+) -> tuple[list[dict[str, object]], str | None]:
+    global trades_auth_mode_logged
+    method = (
+        getattr(client, "get_trades_paginated", None)
+        or getattr(client, "getTradesPaginated", None)
+        or getattr(client, "get_trades", None)
+    )
+    if method and not trades_auth_mode_logged:
+        logging.info("LIVE_TRADES_AUTH_MODE mode=%s", method.__name__)
+        trades_auth_mode_logged = True
+    if method is None:
+        return [], None
+    try:
+        data = None
+        try:
+            data = method(next_cursor=cursor)
+        except TypeError:
+            data = method(cursor) if cursor else method()
+        trades = data if isinstance(data, list) else data.get("trades") or data.get("data") or data.get("items") or []
+        next_cursor = None
+        if isinstance(data, dict):
+            next_cursor = data.get("nextCursor") or data.get("next_cursor")
+        return _unwrap_list(trades), next_cursor
+    except Exception:
+        return [], None
+
+
 def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
     if not client or not signer_address:
         logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client_or_signer")
         return {}
-    url_base = "https://clob.polymarket.com/data/trades"
     holdings: defaultdict[str, float] = defaultdict(float)
     cursor: str | None = None
     now_ts = int(time())
     cutoff = now_ts - 86400
     while True:
-        url = url_base if not cursor else f"{url_base}?next_cursor={parse.quote(cursor)}"
-        logging.info("LIVE_HOLDINGS_ENDPOINT_TRY url=%s status=n/a", url)
-        try:
-            req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
-            with request.urlopen(req, timeout=10) as resp:
-                status = getattr(resp, "status", None)
-                text = resp.read().decode(errors="ignore")
-                logging.info(
-                    "LIVE_HOLDINGS_ENDPOINT_OK url=%s status=%s body_preview=%s",
-                    url,
-                    status,
-                    text[:800],
-                )
-                payload = json.loads(text)
-        except Exception as exc:
-            logging.info(
-                "LIVE_HOLDINGS_ENDPOINT_FAILED url=%s error=%s",
-                url,
-                exc,
-            )
-            break
-        trades = payload.get("trades") or payload.get("data") or payload.get("items") or []
-        if not isinstance(trades, list):
+        trades, next_cursor = fetch_authenticated_trades(client, cursor)
+        if not trades:
             break
         for trade in trades:
-            if not isinstance(trade, dict):
-                continue
             token_id = next(
                 (
                     str(trade.get(k))
@@ -755,11 +761,25 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
             )
             if not token_id:
                 continue
-            timestamp = _safe_parse_float(trade.get("timestamp") or trade.get("createdAt") or trade.get("executedAt"))
+            timestamp = _safe_parse_float(
+                trade.get("timestamp")
+                or trade.get("createdAt")
+                or trade.get("executedAt")
+            )
             if timestamp and timestamp < cutoff:
                 continue
-            maker = (trade.get("makerWallet") or trade.get("maker") or trade.get("makerAddress") or "").lower()
-            taker = (trade.get("takerWallet") or trade.get("taker") or trade.get("takerAddress") or "").lower()
+            maker = (
+                trade.get("makerWallet")
+                or trade.get("maker")
+                or trade.get("makerAddress")
+                or ""
+            ).lower()
+            taker = (
+                trade.get("takerWallet")
+                or trade.get("taker")
+                or trade.get("takerAddress")
+                or ""
+            ).lower()
             signer = signer_address.lower()
             role = None
             if signer == maker:
@@ -778,11 +798,12 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
             if not shares:
                 continue
             direction = (trade.get("side") or trade.get("type") or "").upper()
-            if direction == "SELL" or (role == "maker" and trade.get("makerSide", "").upper() == "SELL"):
+            if direction == "SELL" or (
+                role == "maker" and trade.get("makerSide", "").upper() == "SELL"
+            ):
                 holdings[token_id] -= shares
             else:
                 holdings[token_id] += shares
-        next_cursor = payload.get("nextCursor") or payload.get("next_cursor")
         if not next_cursor:
             break
         cursor = next_cursor
@@ -792,7 +813,7 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
         logging.info(
             "LIVE_POSITIONS_SOURCE source=FILLS count=%s example=%s",
             len(positions),
-            [(token, round(shares,4)) for token, shares in tokens],
+            [(token, round(shares, 4)) for token, shares in tokens],
         )
     else:
         logging.info("LIVE_HOLDINGS_FROM_FILLS_EMPTY")
