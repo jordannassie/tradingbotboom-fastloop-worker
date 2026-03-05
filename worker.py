@@ -338,6 +338,27 @@ def _safe_parse_float(value: object) -> float | None:
         return None
 
 
+def tpsl_reason(strategy: str, entry_price: float, mark_price: float, held_seconds: int) -> str | None:
+    if not entry_price or not mark_price:
+        return None
+    delta = mark_price - entry_price
+    if strategy == STRATEGY_FASTLOOP:
+        if delta >= FAST_TP_CENTS:
+            return "TP"
+        if -delta >= FAST_SL_CENTS:
+            return "SL"
+        if held_seconds >= FAST_MAX_HOLD_SECONDS:
+            return "MAX_HOLD"
+    if strategy == STRATEGY_SNIPER:
+        if delta >= SNIPE_TP_CENTS:
+            return "TP"
+        if -delta >= SNIPE_SL_CENTS:
+            return "SL"
+        if held_seconds >= SNIPE_MAX_HOLD_SECONDS:
+            return "MAX_HOLD"
+    return None
+
+
 def _extract_token_id(payload: dict[str, object]) -> str | None:
     for key in (
         "token_id",
@@ -577,6 +598,98 @@ def _cancel_live_orders_for_token(client: ClobClient, token_id: str) -> None:
                         exc,
                     )
                     continue
+
+
+def get_open_paper_positions(strategy_id: str) -> list[dict[str, object]]:
+    if not current_slug:
+        return []
+    bot_id = STRATEGY_TO_BOT_ID.get(strategy_id, BOT_ID)
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("id, bot_id, side, entry_price, shares, size_usd, start_ts")
+            .eq("bot_id", bot_id)
+            .eq("strategy_id", strategy_id)
+            .eq("status", "OPEN")
+            .eq("market_slug", current_slug)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        logging.exception(
+            "Failed fetching open paper positions for strategy=%s slug=%s",
+            strategy_id,
+            current_slug,
+        )
+        return []
+
+
+def close_paper_position_now(
+    position: dict[str, object],
+    token_id: str | None,
+    mark_price: float,
+    strategy_id: str,
+    reason: str,
+    held_seconds: int,
+) -> None:
+    row_id = position.get("id")
+    if not row_id:
+        return
+    bot_id = position.get("bot_id") or BOT_ID
+    shares = float_or_none(position.get("shares")) or 0.0
+    size_usd = float_or_none(position.get("size_usd")) or 0.0
+    entry_price = float_or_none(position.get("entry_price")) or 0.0
+    payout = shares * mark_price
+    pnl_usd = payout - size_usd
+    updates = {
+        "status": "CLOSED",
+        "end_price": mark_price,
+        "pnl_usd": pnl_usd,
+        "resolved_side": position.get("side"),
+        "closed_at": utc_now_iso(),
+    }
+    try:
+        supabase.table("paper_positions").update(updates).eq("id", row_id).execute()
+        update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
+        logging.info(
+            "PAPER_TPSL_EXIT id=%s strategy=%s token_id=%s reason=%s entry=%s mark=%s held=%s",
+            row_id,
+            strategy_id,
+            token_id or position.get("side"),
+            reason,
+            entry_price,
+            mark_price,
+            held_seconds,
+        )
+    except Exception:
+        logging.exception("Failed closing PAPER_TPSL_EXIT id=%s reason=%s", row_id, reason)
+
+
+def process_paper_tpsl_positions(now_ts: int) -> None:
+    if not current_slug:
+        return
+    for strategy in (STRATEGY_SNIPER, STRATEGY_FASTLOOP):
+        positions = get_open_paper_positions(strategy)
+        for position in positions:
+            token_side = (position.get("side") or "").lower()
+            token_id = current_yes_token if token_side == "yes" else current_no_token
+            mark_price = get_token_mark_price(token_id) if token_id else None
+            if mark_price is None:
+                logging.info(
+                    "PAPER_TPSL_SKIP_NO_MARK token_id=%s strategy=%s id=%s",
+                    token_id,
+                    strategy,
+                    position.get("id"),
+                )
+                continue
+            entry_price = float_or_none(position.get("entry_price"))
+            start_ts = int(position.get("start_ts") or 0)
+            held_seconds = max(0, now_ts - start_ts)
+            reason = tpsl_reason(strategy, entry_price or 0.0, mark_price, held_seconds)
+            if reason:
+                close_paper_position_now(
+                    position, token_id, mark_price, strategy, reason, held_seconds
+                )
 
 
 async def close_live_position_ladder(
@@ -2948,6 +3061,14 @@ async def heartbeat_loop(client: ClobClient | None):
 
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
+        start_ts = slug_start_timestamp(current_slug) if current_slug else None
+        time_to_end = (
+            (start_ts + current_interval_seconds) - now_ts if start_ts is not None else None
+        )
+        entry_cutoff_active = (
+            time_to_end is not None and time_to_end <= ENTRY_CUTOFF_SECONDS
+        )
+        process_paper_tpsl_positions(now_ts)
         force_exit_triggered = False
         force_exit_ok = 0
         force_exit_fail = 0
@@ -2956,49 +3077,47 @@ async def heartbeat_loop(client: ClobClient | None):
             and client
             and current_slug
             and (sniper_settings["arm_live"] or fastloop_settings["arm_live"])
+            and time_to_end is not None
         ):
-            start_ts = slug_start_timestamp(current_slug)
-            if start_ts is not None:
-                time_to_end = (start_ts + current_interval_seconds) - now_ts
-                if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
-                    force_exit_triggered = True
-                    logging.info(
-                        "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
-                        current_slug,
-                        time_to_end,
-                    )
-                    snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-                    inferred = snapshot.get("inferred_positions") or {}
-                    for token_id, shares in inferred.items():
-                        if abs(shares) < 0.01:
-                            continue
-                        try:
-                            ok = await close_live_position_ladder(
-                                client,
-                                token_id,
-                                shares,
-                                base_price=best_quotes.get(
-                                    ASSET_TO_SIDE.get(token_id, "yes"), {}
-                                ).get("bid"),
-                                reason="FORCE_EXIT",
-                            )
-                        except Exception as exc:
-                            logging.warning(
-                                "LIVE_EXIT_ERROR token_id=%s err=%s",
-                                token_id,
-                                exc,
-                            )
-                            ok = False
-                        if ok:
-                            force_exit_ok += 1
-                        else:
-                            force_exit_fail += 1
-                    logging.info(
-                        "LIVE_FORCE_EXIT_RESULT slug=%s ok_count=%s fail_count=%s",
-                        current_slug,
-                        force_exit_ok,
-                        force_exit_fail,
-                    )
+            if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+                force_exit_triggered = True
+                logging.info(
+                    "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
+                    current_slug,
+                    time_to_end,
+                )
+                snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+                inferred = snapshot.get("inferred_positions") or {}
+                for token_id, shares in inferred.items():
+                    if abs(shares) < 0.01:
+                        continue
+                    try:
+                        ok = await close_live_position_ladder(
+                            client,
+                            token_id,
+                            shares,
+                            base_price=best_quotes.get(
+                                ASSET_TO_SIDE.get(token_id, "yes"), {}
+                            ).get("bid"),
+                            reason="FORCE_EXIT",
+                        )
+                    except Exception as exc:
+                        logging.warning(
+                            "LIVE_EXIT_ERROR token_id=%s err=%s",
+                            token_id,
+                            exc,
+                        )
+                        ok = False
+                    if ok:
+                        force_exit_ok += 1
+                    else:
+                        force_exit_fail += 1
+                logging.info(
+                    "LIVE_FORCE_EXIT_RESULT slug=%s ok_count=%s fail_count=%s",
+                    current_slug,
+                    force_exit_ok,
+                    force_exit_fail,
+                )
 
         status = "ENABLED" if is_enabled_combined else "DISABLED"
         msg = (
@@ -3091,32 +3210,21 @@ async def heartbeat_loop(client: ClobClient | None):
 
         if trading_condition:
             sniper_traded = False
+            sniper_time_to_end = time_to_end or 0
             if should_trade_strategy(sniper_settings, STRATEGY_SNIPER, edge):
-                sniper_traded = await execute_strategy(
-                    STRATEGY_SNIPER,
-                    "SNIPER",
-                    sniper_settings,
-                    edge,
-                    total_ask,
-                    ya,
-                    na,
-                    client,
-                    live_master_enabled,
-                    skip_live=force_exit_triggered,
-                )
-            if sniper_traded and trade_mode == "ONE":
-                logging.info(
-                    "TRADE_MODE_BLOCK trade_mode=ONE blocked_strategy=%s by_strategy=%s slug=%s",
-                    STRATEGY_FASTLOOP,
-                    STRATEGY_SNIPER,
-                    current_slug or "none",
-                )
-            else:
-                if should_trade_strategy(fastloop_settings, STRATEGY_FASTLOOP, edge):
-                    await execute_strategy(
-                        STRATEGY_FASTLOOP,
-                        "BUY_BOTH",
-                        fastloop_settings,
+                if entry_cutoff_active:
+                    logging.info(
+                        "ENTRY_CUTOFF_SKIP mode=PAPER strategy=%s time_to_end=%s",
+                        STRATEGY_SNIPER,
+                        sniper_time_to_end,
+                    )
+                elif should_skip_low_funds(sniper_settings["paper_balance_usd"]):
+                    pass
+                else:
+                    sniper_traded = await execute_strategy(
+                        STRATEGY_SNIPER,
+                        "SNIPER",
+                        sniper_settings,
                         edge,
                         total_ask,
                         ya,
@@ -3125,6 +3233,37 @@ async def heartbeat_loop(client: ClobClient | None):
                         live_master_enabled,
                         skip_live=force_exit_triggered,
                     )
+            if sniper_traded and trade_mode == "ONE":
+                logging.info(
+                    "TRADE_MODE_BLOCK trade_mode=ONE blocked_strategy=%s by_strategy=%s slug=%s",
+                    STRATEGY_FASTLOOP,
+                    STRATEGY_SNIPER,
+                    current_slug or "none",
+                )
+            else:
+                fast_time_to_end = time_to_end or 0
+                if should_trade_strategy(fastloop_settings, STRATEGY_FASTLOOP, edge):
+                    if entry_cutoff_active:
+                        logging.info(
+                            "ENTRY_CUTOFF_SKIP mode=PAPER strategy=%s time_to_end=%s",
+                            STRATEGY_FASTLOOP,
+                            fast_time_to_end,
+                        )
+                    elif should_skip_low_funds(fastloop_settings["paper_balance_usd"]):
+                        pass
+                    else:
+                        await execute_strategy(
+                            STRATEGY_FASTLOOP,
+                            "BUY_BOTH",
+                            fastloop_settings,
+                            edge,
+                            total_ask,
+                            ya,
+                            na,
+                            client,
+                            live_master_enabled,
+                            skip_live=force_exit_triggered,
+                        )
         await asyncio.sleep(5)
         if rotating:
             rotating = False
