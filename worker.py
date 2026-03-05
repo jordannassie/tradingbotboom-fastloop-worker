@@ -209,6 +209,7 @@ last_live_bankroll_refresh_ts = 0
 live_wallet_ok = False
 live_signer_address: str | None = None
 live_funder_address: str | None = None
+live_positions: dict[str, float] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -278,6 +279,27 @@ def should_skip_new_entries(
         )
         return True
     return False
+
+
+def _record_live_position(token_id: str, delta_shares: float) -> None:
+    if not token_id or delta_shares == 0:
+        return
+    existing = live_positions.get(token_id, 0.0)
+    updated = existing + delta_shares
+    if updated <= 0:
+        live_positions.pop(token_id, None)
+    else:
+        live_positions[token_id] = updated
+
+
+def get_live_positions_snapshot() -> dict[str, float]:
+    snapshot = {token: shares for token, shares in live_positions.items() if shares > 0}
+    logging.info(
+        "LIVE_POSITIONS_FETCH count=%s positions=%s",
+        len(snapshot),
+        {token: round(shares, 8) for token, shares in snapshot.items()},
+    )
+    return snapshot
 
 
 def parse_strategy_settings_field(payload) -> dict[str, object]:
@@ -1009,6 +1031,60 @@ def execute_live_strategy(
     except Exception:
         logging.exception("Live execution failed for strategy %s", strategy_id)
         return False
+
+
+def close_live_position(
+    client: ClobClient | None,
+    token_id: str,
+    strategy_id: str | None = None,
+) -> bool:
+    if not client:
+        logging.warning(
+            "LIVE_CLOSE_ATTEMPT client_missing token_id=%s strategy=%s",
+            token_id,
+            strategy_id or "unknown",
+        )
+        return False
+    get_live_positions_snapshot()
+    shares = live_positions.get(token_id) or 0.0
+    if shares <= 0:
+        logging.info(
+            "LIVE_CLOSE_ATTEMPT no_position token_id=%s shares=%s",
+            token_id,
+            shares,
+        )
+        return False
+    side_label = ASSET_TO_SIDE.get(token_id) or "yes"
+    ya_price = best_quotes["yes"]["ask"]
+    na_price = best_quotes["no"]["ask"]
+    edge_value = 0.0
+    if ya_price is not None and na_price is not None:
+        edge_value = 1.0 - (ya_price + na_price)
+    price_reference = (
+        best_quotes.get(side_label, {}).get("bid")
+        or approx_mid_price()
+        or 0.0
+    )
+    logging.info(
+        "LIVE_CLOSE_ATTEMPT strategy=%s token_id=%s side=%s shares=%s price=%s",
+        strategy_id or "unknown",
+        token_id,
+        side_label,
+        shares,
+        price_reference,
+    )
+    return submit_order(
+        client,
+        token_id,
+        side_label,
+        price_reference,
+        edge_value,
+        ya_price or 0.0,
+        na_price or 0.0,
+        float(shares),
+        strategy_id=strategy_id,
+        order_side="SELL",
+    )
 
 
 async def execute_strategy(
@@ -2245,26 +2321,34 @@ def submit_order(
     na: float,
     trade_size: float,
     strategy_id: str | None = None,
+    order_side: str = "BUY",
 ):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors, last_live_order_400_body
 
+    order_side_normalized = order_side.upper()
     price_decimal = None
+    quote_key = "ask" if order_side_normalized == "BUY" else "bid"
     try:
-        side_ask = best_quotes[side_label]["ask"]
+        quote_value = best_quotes[side_label][quote_key]
     except KeyError:
-        side_ask = None
-    if side_ask is not None:
-        price_decimal = Decimal(str(side_ask))
+        quote_value = None
+    if quote_value is not None:
+        price_decimal = Decimal(str(quote_value))
     else:
-        asks = []
+        fallback_quotes: list[Decimal] = []
         for label in ("yes", "no"):
-            ask_val = best_quotes[label]["ask"]
-            if ask_val is not None:
-                asks.append(Decimal(str(ask_val)))
-        if asks:
-            price_decimal = sum(asks, Decimal("0")) / Decimal(len(asks))
+            fallback_val = best_quotes[label][quote_key]
+            if fallback_val is not None:
+                fallback_quotes.append(Decimal(str(fallback_val)))
+        if fallback_quotes:
+            price_decimal = sum(fallback_quotes, Decimal("0")) / Decimal(len(fallback_quotes))
     if price_decimal is None or price_decimal <= 0:
-        logging.warning("LIVE_SKIP_NO_PRICE token_id=%s side=%s", token_id, side_label)
+        logging.warning(
+            "LIVE_SKIP_NO_PRICE token_id=%s side=%s order_side=%s",
+            token_id,
+            side_label,
+            order_side_normalized,
+        )
         return False
 
     try:
@@ -2275,7 +2359,12 @@ def submit_order(
     if tick_size <= 0:
         tick_size = DEFAULT_TICK
 
-    price_candidate = price_decimal + tick_size
+    if order_side_normalized == "BUY":
+        price_candidate = price_decimal + tick_size
+    else:
+        price_candidate = price_decimal - tick_size
+        if price_candidate <= 0:
+            price_candidate = price_decimal
     try:
         price_q = price_candidate.quantize(tick_size, rounding=ROUND_DOWN)
     except InvalidOperation:
@@ -2310,12 +2399,13 @@ def submit_order(
         token_id=token_id,
         price=float(price_q),
         size=float(shares_q),
-        side="BUY",
+        side=order_side_normalized,
     )
     logging.info(
-        "LIVE_LIMIT_ARGS token_id=%s side=%s price=%s shares=%s size_usd=%s",
+        "LIVE_LIMIT_ARGS token_id=%s side=%s order_side=%s price=%s shares=%s size_usd=%s",
         token_id,
         side_label,
+        order_side_normalized,
         price_q,
         shares_q,
         trade_size,
@@ -2336,6 +2426,8 @@ def submit_order(
             strategy_id=strategy_id,
             response=resp,
         )
+        delta = float(shares_q) if order_side_normalized == "BUY" else -float(shares_q)
+        _record_live_position(token_id, delta)
         consecutive_trade_errors = 0
         last_trade_error = None
         return True
