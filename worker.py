@@ -366,7 +366,7 @@ def tracker_apply_fill(
     entry["last_update_ts"] = now_ts
     entry["last_order_id"] = order_id
     logging.info(
-        "LIVE_TRACKER_APPLY token_id=%s side=%s delta=%.6f new_shares=%.6f price=%s order_id=%s",
+        "LIVE_TRACKER_APPLY token_id=%s side=%s delta_shares=%.6f new_shares=%.6f price=%s order_id=%s",
         normalized_token,
         side,
         delta,
@@ -451,20 +451,25 @@ def _extract_identifier(payload: dict[str, object], keys: tuple[str, ...]) -> st
     return None
 
 
-def _extract_order_id_from_response(resp: object) -> str | None:
-    if not resp:
-        return None
+def _extract_order_id_from_response(resp: object) -> tuple[str | None, list[str], list[str]]:
+    resp_keys: list[str] = []
+    payload_keys: list[str] = []
+    payload: dict[str, object] | None = None
     if isinstance(resp, dict):
-        return _extract_identifier(resp, ("order_id", "orderId", "id"))
-    json_method = getattr(resp, "json", None)
-    if callable(json_method):
-        try:
-            payload = json_method()
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            return _extract_identifier(payload, ("order_id", "orderId", "id"))
-    return None
+        resp_keys = list(resp.keys())
+        payload = resp
+    else:
+        json_method = getattr(resp, "json", None)
+        if callable(json_method):
+            try:
+                payload = json_method()
+            except Exception:
+                payload = None
+    if isinstance(payload, dict):
+        payload_keys = list(payload.keys())
+    identifier_source = payload if isinstance(payload, dict) else (resp if isinstance(resp, dict) else {})
+    order_id = _extract_identifier(identifier_source, ("order_id", "orderId", "id"))
+    return order_id, resp_keys, payload_keys
 
 
 def _unwrap_list(result: object) -> list[dict[str, object]]:
@@ -505,10 +510,6 @@ def get_live_positions_truth(
         )
         return tracker
     logging.info("LIVE_POSITIONS_SOURCE source=TRACKER_EMPTY")
-    positions = get_live_token_holdings_truth(client, signer_address)
-    if positions:
-        return positions
-    logging.info("LIVE_POSITIONS_SOURCE source=FILLS_EMPTY")
     return {}
 
 
@@ -1203,7 +1204,7 @@ async def evaluate_live_tpsl_positions(
     signer = live_signer_address or live_funder_address
     positions_truth = get_live_positions_truth(client, signer)
     if not positions_truth:
-        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS reason=truth_empty")
+        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS")
         return
     for token_id, info in list(live_entry_info.items()):
         strategy = info.get("strategy")
@@ -1287,22 +1288,35 @@ async def close_live_position_ladder(
             reason,
         )
         return True
-    current_holdings = positions_truth.get(token_id, 0.0)
-    if current_holdings <= 0.01:
+    token_key = str(token_id)
+    true_shares = positions_truth.get(token_key, 0.0)
+    if true_shares <= 0.01:
         logging.info(
             "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s shares=%s reason=%s",
             token_id,
-            current_holdings,
+            true_shares,
             reason,
         )
+        logging.info(
+            "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
+            token_id,
+            reason,
+            0,
+        )
         return True
-    shares_to_close = min(shares, current_holdings)
+    shares_to_close = min(shares_abs, true_shares)
     if shares_to_close <= 0.01:
         logging.info(
             "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s shares_to_close=%s reason=%s",
             token_id,
             shares_to_close,
             reason,
+        )
+        logging.info(
+            "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
+            token_id,
+            reason,
+            0,
         )
         return True
     close_side = "SELL"
@@ -1313,7 +1327,6 @@ async def close_live_position_ladder(
             return False
 
         improve = EXIT_LADDER_PRICE_IMPROVE_CENTS / 100.0
-        shares_now = shares
         for step in range(1, EXIT_LADDER_MAX_STEPS + 1):
             if close_side == "SELL":
                 price = max(
@@ -1344,13 +1357,14 @@ async def close_live_position_ladder(
                 params["size_usd"],
                 strategy_id="force_exit",
                 order_side=close_side,
+                suppress_error_count=True,
             )
 
             logging.info(
                 "LIVE_EXIT_STEP token_id=%s close_side=%s shares=%s price=%s step=%s/%s reason=%s success=%s",
                 token_id,
                 close_side,
-                shares_abs,
+                shares_to_close,
                 price,
                 step,
                 EXIT_LADDER_MAX_STEPS,
@@ -3525,15 +3539,44 @@ def submit_order(
         delta = float(shares_q) if order_side_normalized == "BUY" else -float(shares_q)
         _record_live_position(token_id, delta)
         now_ts = int(time())
-        order_id = _extract_order_id_from_response(resp)
-        tracker_apply_fill(
-            token_id,
-            order_side_normalized,
-            float(shares_q),
-            float(price_q),
-            now_ts,
-            order_id,
-        )
+        order_id, resp_keys, payload_keys = _extract_order_id_from_response(resp)
+        price_value = float(price_q)
+        shares_value = float(shares_q)
+        missing_field = None
+        if not token_id:
+            missing_field = "token_id"
+        elif not order_side_normalized:
+            missing_field = "order_side"
+        elif shares_value <= 0:
+            missing_field = "shares"
+        elif price_value <= 0:
+            missing_field = "price"
+        elif not order_id:
+            missing_field = "order_id"
+        if missing_field:
+            logging.warning(
+                "LIVE_TRACKER_APPLY_SKIP reason=%s resp_keys=%s payload_keys=%s",
+                missing_field,
+                resp_keys,
+                payload_keys,
+            )
+        else:
+            logging.info(
+                "LIVE_ORDER_OK token_id=%s side=%s price=%.6f shares=%.6f order_id=%s",
+                token_id,
+                order_side_normalized,
+                price_value,
+                shares_value,
+                order_id,
+            )
+            tracker_apply_fill(
+                token_id,
+                order_side_normalized,
+                shares_value,
+                price_value,
+                now_ts,
+                order_id,
+            )
         if strategy_id:
             live_entry_info[token_id] = {
                 "entry_price": float(price_q),
@@ -3719,7 +3762,7 @@ async def heartbeat_loop(client: ClobClient | None):
             and (sniper_settings["arm_live"] or fastloop_settings["arm_live"])
             and time_to_end is not None
         ):
-                if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+            if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
                     force_exit_triggered = True
                     logging.info(
                         "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
@@ -3737,7 +3780,7 @@ async def heartbeat_loop(client: ClobClient | None):
                     for token_id, shares in positions_truth.items():
                         if shares <= 0.01:
                             logging.info(
-                                "LIVE_FORCE_EXIT_SKIP_NO_HOLDINGS token_id=%s shares=%s",
+                                "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s shares=%s",
                                 token_id,
                                 shares,
                             )
