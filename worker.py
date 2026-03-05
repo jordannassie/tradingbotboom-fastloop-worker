@@ -3051,6 +3051,7 @@ def submit_order(
     trade_size: float,
     strategy_id: str | None = None,
     order_side: str = "BUY",
+    suppress_error_count: bool = False,
 ):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors, last_live_order_400_body
 
@@ -3250,24 +3251,32 @@ def submit_order(
             )
             if resp_text and not last_live_order_400_body:
                 last_live_order_400_body = resp_text
+            if suppress_error_count:
+                logging.info(
+                    "LIVE_EXIT_ORDER_FAILED_NO_PAUSE token_id=%s status=%s msg=%s",
+                    token_id,
+                    status,
+                    resp_json_str or resp_text,
+                )
 
-        consecutive_trade_errors += 1
-        last_trade_error = str(exc)[:512]
-        record_trade(
-            token_id,
-            side_label,
-            "ERROR",
-            float(price_q),
-            edge,
-            ya,
-            na,
-            trade_size,
-            error=str(exc),
-            strategy_id=strategy_id,
-        )
-        if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
-            paused_due_to_errors = True
-            logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
+        if not suppress_error_count:
+            consecutive_trade_errors += 1
+            last_trade_error = str(exc)[:512]
+            record_trade(
+                token_id,
+                side_label,
+                "ERROR",
+                float(price_q),
+                edge,
+                ya,
+                na,
+                trade_size,
+                error=str(exc),
+                strategy_id=strategy_id,
+            )
+            if consecutive_trade_errors >= MAX_CONSECUTIVE_ERRORS:
+                paused_due_to_errors = True
+                logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
         return False
 
 
