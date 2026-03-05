@@ -644,6 +644,7 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
         return {}
     base = "https://data-api.polymarket.com/positions"
     url = f"{base}?user={parse.quote(user_address)}"
+    logging.info("LIVE_POSITIONS_DATA_API_REQUEST url=%s", url)
     try:
         req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
         with request.urlopen(req, timeout=10) as resp:
@@ -665,16 +666,25 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
         return {}
 
     positions = {}
-    items = data if isinstance(data, list) else data.get("positions") or []
+    items = data if isinstance(data, list) else data.get("positions") or data.get("assets") or []
     for item in items:
         if not isinstance(item, dict):
             continue
-        token_id = _extract_token_id(item) or str(item.get("token") or item.get("assetId") or item.get("asset_id") or "")
-        shares = (
-            _safe_parse_float(item.get("size"))
-            or _safe_parse_float(item.get("shares"))
-            or _safe_parse_float(item.get("amount"))
+        token_id = next(
+            (
+                str(item.get(k))
+                for k in ("token_id", "tokenId", "token", "asset_id", "assetId")
+                if item.get(k)
+            ),
+            None,
         )
+        shares = None
+        for key in ("shares", "size", "quantity", "balance", "position"):
+            value = item.get(key)
+            parsed = _safe_parse_float(value)
+            if parsed:
+                shares = parsed
+                break
         if not token_id or not shares or shares <= 0.01:
             continue
         positions[token_id] = positions.get(token_id, 0.0) + shares
@@ -686,6 +696,18 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
             [(token, round(shares, 4)) for token, shares in tokens],
         )
     else:
+        snippet = ""
+        try:
+            snippet = raw.decode(errors="ignore")[:800]
+        except Exception:
+            snippet = str(raw)[:800]
+        logging.info(
+            "LIVE_POSITIONS_DATA_API_EMPTY status=200 body_preview=%s",
+            snippet.replace("\\n", ""),
+        )
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            logging.info("LIVE_POSITIONS_DATA_API_KEYS keys=%s", keys)
         logging.info(
             "LIVE_POSITIONS_SOURCE source=DATA_API_FAILED error=no_positive_shares status=200"
         )
