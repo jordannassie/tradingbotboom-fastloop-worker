@@ -236,6 +236,8 @@ live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
 trades_auth_mode_logged = False
 trades_sample_logged = False
+live_order_tracker: dict[str, dict[str, object]] = {}
+tracker_enabled_logged = False
 live_positions: dict[str, float] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
@@ -423,6 +425,13 @@ def infer_positions_from_trades(client: ClobClient) -> dict[str, float]:
 def get_live_positions_truth(
     client: ClobClient | None, signer_address: str | None
 ) -> dict[str, float]:
+    tracker = get_live_tracker_snapshot()
+    if tracker:
+        logging.info(
+            "LIVE_POSITIONS_SOURCE source=TRACKER tokens=%s", len(tracker)
+        )
+        return tracker
+    logging.info("LIVE_POSITIONS_SOURCE source=TRACKER_EMPTY")
     positions = get_live_token_holdings_truth(client, signer_address)
     if positions:
         return positions
@@ -859,6 +868,82 @@ def extract_trade_size(trade: dict[str, object]) -> float:
     return 0.0
 
 
+def record_live_order_fill(
+    token_id: str,
+    order_side: str,
+    shares: float,
+    price: float,
+    strategy: str | None,
+    slug: str | None,
+    reason: str,
+    ts: int,
+) -> None:
+    if not token_id or shares <= 0:
+        return
+    entry = live_order_tracker.setdefault(
+        token_id,
+        {
+            "net_shares": 0.0,
+            "last_update_ts": ts,
+            "events": [],
+        },
+    )
+    net = entry["net_shares"]
+    if order_side.upper() == "BUY":
+        net += shares
+    else:
+        net -= shares
+    if abs(net) < 1e-6:
+        net = 0.0
+    entry["net_shares"] = net
+    entry["last_update_ts"] = ts
+    events = entry["events"]
+    events.append(
+        {
+            "ts": ts,
+            "token_id": token_id,
+            "order_side": order_side,
+            "shares": shares,
+            "price": price,
+            "strategy": strategy or "unknown",
+            "slug": slug or "none",
+            "reason": reason,
+        }
+    )
+    if len(events) > 50:
+        del events[0]
+    logging.info(
+        "LIVE_TRACKER_EVENT token_id=%s order_side=%s shares=%.4f price=%.4f net=%.4f strategy=%s slug=%s reason=%s",
+        token_id,
+        order_side,
+        shares,
+        price,
+        net,
+        strategy or "unknown",
+        slug or "none",
+        reason,
+    )
+
+
+def get_live_tracker_snapshot() -> dict[str, float]:
+    snapshot = {
+        token: entry["net_shares"]
+        for token, entry in live_order_tracker.items()
+        if abs(entry["net_shares"]) > 0.01
+    }
+    tokens = list(snapshot.items())[:3]
+    logging.info(
+        "LIVE_TRACKER_SNAPSHOT tokens=%s example=%s",
+        len(snapshot),
+        [(token, round(shares, 4)) for token, shares in tokens],
+    )
+    global tracker_enabled_logged
+    if not tracker_enabled_logged:
+        logging.info("LIVE_TRACKER_ENABLED enabled=true")
+        tracker_enabled_logged = True
+    return snapshot
+
+
 def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
     if not client or not signer_address:
         logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client_or_signer")
@@ -1121,7 +1206,7 @@ async def evaluate_live_tpsl_positions(
     signer = live_signer_address or live_funder_address
     positions_truth = get_live_positions_truth(client, signer)
     if not positions_truth:
-        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS")
+        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS reason=truth_empty")
         return
     for token_id, info in list(live_entry_info.items()):
         strategy = info.get("strategy")
@@ -1137,7 +1222,11 @@ async def evaluate_live_tpsl_positions(
             continue
         shares = positions_truth.get(token_id, 0.0)
         if shares <= 0:
-            logging.warning("LIVE_SKIP_NEG_SHARES token_id=%s shares=%s", token_id, shares)
+            logging.info(
+                "LIVE_TPSL_SKIP_NO_POSITIONS token_id=%s shares=%s",
+                token_id,
+                shares,
+            )
             continue
         held_seconds = max(0, now_ts - int(info.get("start_ts") or now_ts))
         reason = live_tpsl_reason(strategy, entry_price, mark_price, held_seconds)
@@ -1194,14 +1283,29 @@ async def close_live_position_ladder(
 
     signer = live_signer_address or live_funder_address
     positions_truth = get_live_positions_truth(client, signer)
+    if not positions_truth:
+        logging.info(
+            "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s reason=%s",
+            token_id,
+            reason,
+        )
+        return True
     current_holdings = positions_truth.get(token_id, 0.0)
+    if current_holdings <= 0.01:
+        logging.info(
+            "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s shares=%s reason=%s",
+            token_id,
+            current_holdings,
+            reason,
+        )
+        return True
     shares_to_close = min(shares, current_holdings)
     if shares_to_close <= 0.01:
         logging.info(
-            "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
+            "LIVE_FORCE_EXIT_SKIP_NO_POSITIONS token_id=%s shares_to_close=%s reason=%s",
             token_id,
+            shares_to_close,
             reason,
-            0,
         )
         return True
     close_side = "SELL"
@@ -3305,6 +3409,7 @@ def submit_order(
     strategy_id: str | None = None,
     order_side: str = "BUY",
     suppress_error_count: bool = False,
+    reason: str = "ENTRY",
 ):
     global consecutive_trade_errors, last_trade_error, paused_due_to_errors, last_live_order_400_body
 
@@ -3422,6 +3527,16 @@ def submit_order(
         )
         delta = float(shares_q) if order_side_normalized == "BUY" else -float(shares_q)
         _record_live_position(token_id, delta)
+        record_live_order_fill(
+            token_id,
+            order_side_normalized,
+            float(shares_q),
+            float(price_q),
+            strategy_id,
+            current_slug,
+            reason,
+            int(time()),
+        )
         now_ts = int(time())
         if strategy_id:
             live_entry_info[token_id] = {
