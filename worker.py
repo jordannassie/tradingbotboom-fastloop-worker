@@ -70,7 +70,9 @@ logging.basicConfig(
 PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
+logging.info("MIN_ORDER_CONFIG min_order_usd=%s", MIN_ORDER_USD)
 logging.info(
     "PM_ENV_CHECK access_key_present=%s privkey_present=%s",
     bool(PM_ACCESS_KEY),
@@ -1062,6 +1064,15 @@ async def execute_strategy(
                 allowance,
             )
             live_size_usd = compute_live_size_usd(settings, strategy_id, live_balance)
+            if live_size_usd is not None and live_size_usd < MIN_ORDER_USD:
+                logging.warning(
+                    "MIN_ORDER_SKIP mode=LIVE strategy=%s size_usd=%s min=%s",
+                    strategy_id,
+                    live_size_usd,
+                    MIN_ORDER_USD,
+                )
+                route_live = False
+                live_size_usd = None
             if LIVE_TEST_ORDER_USD:
                 override_size = min(LIVE_TEST_ORDER_USD, live_balance)
                 live_size_usd = override_size
@@ -1108,7 +1119,15 @@ async def execute_strategy(
             current_slug,
             size_usd,
         )
-        await create_paper_strategy_position(
+        if size_usd < MIN_ORDER_USD:
+            logging.warning(
+                "MIN_ORDER_SKIP mode=PAPER strategy=%s size_usd=%s min=%s",
+                strategy_id,
+                size_usd,
+                MIN_ORDER_USD,
+            )
+        else:
+            await create_paper_strategy_position(
             strategy_id,
             action_label,
             edge,
