@@ -797,6 +797,67 @@ def extract_token_and_size(trade: dict[str, object]) -> tuple[str | None, float 
     return token, shares
 
 
+def _norm_addr(value: object) -> str:
+    if not value:
+        return ""
+    try:
+        return str(value).strip().lower()
+    except Exception:
+        return ""
+
+
+def is_our_trade(trade: dict[str, object], signer: str) -> bool:
+    s = _norm_addr(signer)
+    if not s:
+        return False
+    keys = (
+        "owner",
+        "maker_address",
+        "taker_address",
+        "trader",
+        "trader_address",
+    )
+    for key in keys:
+        if _norm_addr(trade.get(key)) == s:
+            return True
+    maker_orders = trade.get("maker_orders") or []
+    for entry in maker_orders:
+        if not isinstance(entry, dict):
+            continue
+        if _norm_addr(entry.get("maker")) == s or _norm_addr(entry.get("maker_address")) == s:
+            return True
+    return False
+
+
+def extract_trade_token_id(trade: dict[str, object]) -> str | None:
+    for key in ("asset_id", "token_id", "assetId", "tokenId"):
+        value = trade.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def extract_trade_side(trade: dict[str, object]) -> str | None:
+    for key in ("side", "trader_side"):
+        value = trade.get(key)
+        if isinstance(value, str):
+            sval = value.upper()
+            if "BUY" in sval:
+                return "BUY"
+            if "SELL" in sval:
+                return "SELL"
+    return None
+
+
+def extract_trade_size(trade: dict[str, object]) -> float:
+    for key in ("size", "amount", "shares"):
+        value = trade.get(key)
+        parsed = _safe_parse_float(value)
+        if parsed:
+            return parsed
+    return 0.0
+
+
 def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
     if not client or not signer_address:
         logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client_or_signer")
@@ -815,6 +876,16 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
                 "LIVE_TRADES_SAMPLE keys=%s preview=%s",
                 list(sample.keys()),
                 str(sample)[:200],
+            )
+            logging.info(
+                "LIVE_TRADES_SCHEMA_HINT signer=%s sample_owner=%s sample_maker=%s sample_trader_side=%s sample_side=%s sample_asset_id=%s sample_token_id=%s",
+                (_norm_addr(signer_address) if signer_address else "none"),
+                _norm_addr(sample.get("owner") or sample.get("maker")),
+                _norm_addr(sample.get("maker")),
+                extract_trade_side(sample),
+                sample.get("side"),
+                extract_trade_token_id(sample),
+                sample.get("token_id") or sample.get("asset_id"),
             )
             trades_sample_logged = True
         if not trades:
