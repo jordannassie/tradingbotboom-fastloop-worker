@@ -234,6 +234,7 @@ live_signer_address: str | None = None
 live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
 live_positions: dict[str, float] = {}
+live_entry_info: dict[str, dict[str, object]] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -357,6 +358,12 @@ def tpsl_reason(strategy: str, entry_price: float, mark_price: float, held_secon
         if held_seconds >= SNIPE_MAX_HOLD_SECONDS:
             return "MAX_HOLD"
     return None
+
+
+def live_tpsl_reason(
+    strategy: str, entry_price: float, mark_price: float, held_seconds: int
+) -> str | None:
+    return tpsl_reason(strategy, entry_price, mark_price, held_seconds)
 
 
 def _extract_token_id(payload: dict[str, object]) -> str | None:
@@ -692,6 +699,58 @@ def process_paper_tpsl_positions(now_ts: int) -> None:
                 )
 
 
+async def evaluate_live_tpsl_positions(
+    client: ClobClient | None, now_ts: int
+) -> None:
+    if not client:
+        return
+    snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+    inferred = snapshot.get("inferred_positions") or {}
+    for token_id, info in list(live_entry_info.items()):
+        strategy = info.get("strategy")
+        if strategy not in (STRATEGY_FASTLOOP, STRATEGY_SNIPER):
+            continue
+        entry_price = info.get("entry_price")
+        if entry_price is None:
+            logging.info("LIVE_TPSL_SKIP_NO_ENTRY_PRICE token_id=%s", token_id)
+            continue
+        mark_price = get_token_mark_price(token_id)
+        if mark_price is None:
+            logging.info("LIVE_TPSL_SKIP_NO_MARK_PRICE token_id=%s", token_id)
+            continue
+        shares = inferred.get(token_id, 0.0)
+        if shares <= 0:
+            logging.warning("LIVE_SKIP_NEG_SHARES token_id=%s shares=%s", token_id, shares)
+            continue
+        held_seconds = max(0, now_ts - int(info.get("start_ts") or now_ts))
+        reason = live_tpsl_reason(strategy, entry_price, mark_price, held_seconds)
+        if not reason:
+            continue
+        logging.info(
+            "LIVE_TPSL_TRIGGER token_id=%s strategy=%s reason=%s entry=%s mark=%s held=%s",
+            token_id,
+            strategy,
+            reason,
+            entry_price,
+            mark_price,
+            held_seconds,
+        )
+        await close_live_position_ladder(
+            client,
+            token_id,
+            shares,
+            base_price=mark_price,
+            reason=f"TPSL_{reason}",
+        )
+        snapshot_after = get_live_positions_snapshot(client, log_snapshot=False)
+        remaining = snapshot_after["inferred_positions"].get(token_id, 0.0)
+        if abs(remaining) <= 0.01:
+            live_entry_info.pop(token_id, None)
+            logging.info("LIVE_TPSL_FLAT token_id=%s reason=%s", token_id, reason)
+        else:
+            logging.info("LIVE_TPSL_NOT_FLAT token_id=%s remaining=%s", token_id, remaining)
+
+
 async def close_live_position_ladder(
     client: ClobClient,
     token_id: str,
@@ -769,17 +828,17 @@ async def close_live_position_ladder(
                 success,
             )
 
-            await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
-            snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-            shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
-            if abs(shares_now) <= 0.01:
-                logging.info(
-                    "LIVE_EXIT_DONE token_id=%s remaining_shares=%s reason=%s",
-                    token_id,
-                    shares_now,
-                    reason,
-                )
-                return True
+        await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
+        snapshot = get_live_positions_snapshot(client, log_snapshot=False)
+        shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
+        if abs(shares_now) <= 0.01:
+            logging.info(
+                "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
+                token_id,
+                reason,
+                step,
+            )
+            return True
 
             _cancel_live_orders_for_token(client, token_id)
 
@@ -2922,6 +2981,14 @@ def submit_order(
         )
         delta = float(shares_q) if order_side_normalized == "BUY" else -float(shares_q)
         _record_live_position(token_id, delta)
+        now_ts = int(time())
+        if strategy_id:
+            live_entry_info[token_id] = {
+                "entry_price": float(price_q),
+                "start_ts": now_ts,
+                "strategy": strategy_id,
+                "side": side_label,
+            }
         consecutive_trade_errors = 0
         last_trade_error = None
         return True
@@ -3069,6 +3136,7 @@ async def heartbeat_loop(client: ClobClient | None):
             time_to_end is not None and time_to_end <= ENTRY_CUTOFF_SECONDS
         )
         process_paper_tpsl_positions(now_ts)
+        await evaluate_live_tpsl_positions(client, now_ts)
         force_exit_triggered = False
         force_exit_ok = 0
         force_exit_fail = 0
