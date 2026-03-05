@@ -2752,6 +2752,7 @@ def submit_order(
         trade_size,
     )
 
+    signed = None
     try:
         signed = client.create_order(order_args)
         resp = client.post_order(signed, OrderType.GTC)
@@ -2773,19 +2774,9 @@ def submit_order(
         last_trade_error = None
         return True
     except Exception as exc:
-        body_text = str(exc)
-        if hasattr(exc, "args") and exc.args:
-            arg0 = exc.args[0]
-            if isinstance(arg0, dict):
-                try:
-                    body_text = json.dumps(arg0, ensure_ascii=False)
-                except Exception:
-                    body_text = str(arg0)
-            else:
-                body_text = str(arg0)
-        err_lower = body_text.lower()
+        err_lower = str(exc).lower()
         if "not enough balance / allowance" in err_lower:
-            logging.warning("LIVE_SKIP_ALLOWANCE error=%s", body_text)
+            logging.warning("LIVE_SKIP_ALLOWANCE error=%s", exc)
             last_trade_error = str(exc)[:512]
             record_trade(
                 token_id,
@@ -2800,9 +2791,58 @@ def submit_order(
                 strategy_id=strategy_id,
             )
             return False
-        if "400" in body_text and not last_live_order_400_body:
-            logging.warning("LIVE_ORDER_400 body=%s", body_text)
-            last_live_order_400_body = body_text
+
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        resp_text = None
+        resp_json = None
+        if resp is not None:
+            try:
+                resp_text = resp.text
+            except Exception:
+                resp_text = str(resp)
+            if resp_text:
+                resp_text = resp_text[:500]
+            try:
+                resp_json = resp.json()
+            except Exception:
+                resp_json = None
+
+        signed_order = getattr(signed, "order", None)
+        payload_info = {
+            "token_id": token_id,
+            "order_side": order_side_normalized,
+            "price": float(price_q),
+            "shares": float(shares_q),
+        }
+        if isinstance(signed_order, dict):
+            payload_info.update(
+                {
+                    "negRisk": signed_order.get("negRisk"),
+                    "tickSize": signed_order.get("tickSize"),
+                    "orderType": signed_order.get("orderType"),
+                    "signature_type": signed_order.get("signature_type"),
+                }
+            )
+
+        if status is not None and status >= 400:
+            resp_json_str = (
+                json.dumps(resp_json, ensure_ascii=False) if resp_json else None
+            )
+            logging.warning(
+                "LIVE_ORDER_400 status=%s text=%s json=%s %s",
+                status,
+                resp_text,
+                resp_json_str,
+                " ".join(
+                    f"{k}={v}"
+                    for k, v in payload_info.items()
+                    if v is not None and v != ""
+                ),
+            )
+            if resp_text and not last_live_order_400_body:
+                last_live_order_400_body = resp_text
+
         consecutive_trade_errors += 1
         last_trade_error = str(exc)[:512]
         record_trade(
