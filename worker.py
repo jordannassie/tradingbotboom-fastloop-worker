@@ -421,15 +421,13 @@ def infer_positions_from_trades(client: ClobClient) -> dict[str, float]:
 def get_live_positions_truth(
     client: ClobClient | None, signer_address: str | None
 ) -> dict[str, float]:
+    positions = get_live_token_holdings_truth(client)
+    if positions:
+        return positions
     if signer_address:
-        positions = fetch_data_api_positions(signer_address)
-        if positions:
-            return positions
-    if client:
-        inferred = infer_positions_from_trades(client)
-        if inferred:
-            logging.info("LIVE_POSITIONS_SOURCE source=INFERRED_FALLBACK")
-            return inferred
+        api_positions = fetch_data_api_positions(signer_address)
+        if api_positions:
+            return api_positions
     logging.info("LIVE_POSITIONS_SOURCE source=EMPTY")
     return {}
 
@@ -712,6 +710,71 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
             "LIVE_POSITIONS_SOURCE source=DATA_API_FAILED error=no_positive_shares status=200"
         )
     return positions
+
+
+def get_live_token_holdings_truth(client: ClobClient | None) -> dict[str, float]:
+    if not client:
+        logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client")
+        return {}
+    endpoints = [
+        "https://clob.polymarket.com/positions",
+        "https://clob.polymarket.com/balances",
+        "https://clob.polymarket.com/balances?asset_type=COLLATERAL",
+        "https://clob.polymarket.com/data/positions",
+    ]
+    for url in endpoints:
+        logging.info("LIVE_HOLDINGS_ENDPOINT_TRY url=%s status=n/a", url)
+        try:
+            req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+            with request.urlopen(req, timeout=10) as resp:
+                status = getattr(resp, "status", None)
+                text = resp.read().decode(errors="ignore")
+                logging.info(
+                    "LIVE_HOLDINGS_ENDPOINT_OK url=%s status=%s body_preview=%s",
+                    url,
+                    status,
+                    text[:800],
+                )
+                data = json.loads(text)
+        except Exception as exc:
+            logging.info(
+                "LIVE_HOLDINGS_ENDPOINT_TRY url=%s status=err error=%s",
+                url,
+                exc,
+            )
+            continue
+        positions = {}
+        items = data if isinstance(data, list) else data.get("positions") or data.get("assets") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            token_id = next(
+                (
+                    str(item.get(k))
+                    for k in ("token_id", "tokenId", "token", "asset_id", "assetId")
+                    if item.get(k)
+                ),
+                None,
+            )
+            shares = None
+            for key in ("shares", "size", "amount", "balance", "position"):
+                value = item.get(key)
+                parsed = _safe_parse_float(value)
+                if parsed:
+                    shares = parsed
+                    break
+            if token_id and shares and shares > 0.01:
+                positions[token_id] = positions.get(token_id, 0.0) + shares
+        if positions:
+            tokens = list(positions.items())[:3]
+            logging.info(
+                "LIVE_POSITIONS_SOURCE source=CLOb_HOLDINGS count=%s example=%s",
+                len(positions),
+                [(token, round(shares,4)) for token, shares in tokens],
+            )
+            return positions
+    logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED")
+    return {}
 
 
 
@@ -1028,8 +1091,9 @@ async def close_live_position_ladder(
             )
 
         await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
-        current_holdings = get_live_holdings_snapshot(client)
-        shares_now = current_holdings.get(token_id, 0.0)
+        signer = live_signer_address or live_funder_address
+        positions_truth = get_live_positions_truth(client, signer)
+        shares_now = positions_truth.get(token_id, 0.0)
         if abs(shares_now) <= 0.01:
             logging.info(
                 "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
