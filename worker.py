@@ -71,22 +71,32 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
-ENTRY_CUTOFF_SECONDS = int(os.getenv("ENTRY_CUTOFF_SECONDS", "120"))
-FORCE_EXIT_SECONDS = int(os.getenv("FORCE_EXIT_SECONDS", "90"))
+ENTRY_CUTOFF_SECONDS = int(os.getenv("ENTRY_CUTOFF_SECONDS", "180"))
+FORCE_EXIT_SECONDS = int(os.getenv("FORCE_EXIT_SECONDS", "150"))
 EXIT_LADDER_MAX_STEPS = int(os.getenv("EXIT_LADDER_MAX_STEPS", "8"))
 EXIT_LADDER_STEP_SECONDS = int(os.getenv("EXIT_LADDER_STEP_SECONDS", "2"))
 EXIT_LADDER_PRICE_IMPROVE_CENTS = float(os.getenv("EXIT_LADDER_PRICE_IMPROVE_CENTS", "1.0"))
+FAST_TP_CENTS = float(os.getenv("FAST_TP_CENTS", "0.05"))
+FAST_SL_CENTS = float(os.getenv("FAST_SL_CENTS", "0.05"))
+FAST_MAX_HOLD_SECONDS = int(os.getenv("FAST_MAX_HOLD_SECONDS", "120"))
+SNIPE_TP_CENTS = float(os.getenv("SNIPE_TP_CENTS", "0.1"))
+SNIPE_SL_CENTS = float(os.getenv("SNIPE_SL_CENTS", "0.1"))
+SNIPE_MAX_HOLD_SECONDS = int(os.getenv("SNIPE_MAX_HOLD_SECONDS", "240"))
+LOW_FUNDS_SKIP_USD = float(os.getenv("LOW_FUNDS_SKIP_USD", "4.0"))
 LIVE_MIN_AVAILABLE_USD = float(os.getenv("LIVE_MIN_AVAILABLE_USD", "5.0"))
 PAPER_MIN_AVAILABLE_USD = float(os.getenv("PAPER_MIN_AVAILABLE_USD", "5.0"))
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
 logging.info(
-    "EXIT_CONFIG entry_cutoff=%s force_exit=%s ladder_steps=%s ladder_step_seconds=%s improve_cents=%s min_order_usd=%s",
+    "TP_SL_CONFIG fast_tp=%s fast_sl=%s fast_max_hold=%s snipe_tp=%s snipe_sl=%s snipe_max_hold=%s entry_cutoff=%s force_exit=%s low_funds_skip=%s",
+    FAST_TP_CENTS,
+    FAST_SL_CENTS,
+    FAST_MAX_HOLD_SECONDS,
+    SNIPE_TP_CENTS,
+    SNIPE_SL_CENTS,
+    SNIPE_MAX_HOLD_SECONDS,
     ENTRY_CUTOFF_SECONDS,
     FORCE_EXIT_SECONDS,
-    EXIT_LADDER_MAX_STEPS,
-    EXIT_LADDER_STEP_SECONDS,
-    EXIT_LADDER_PRICE_IMPROVE_CENTS,
-    MIN_ORDER_USD,
+    LOW_FUNDS_SKIP_USD,
 )
 logging.info(
     "BANKROLL_GUARD_CONFIG live_min=%s paper_min=%s",
@@ -290,6 +300,19 @@ def should_skip_new_entries(
             strategy_id,
             available_usd,
             min_usd,
+        )
+        return True
+    return False
+
+
+def should_skip_low_funds(available_usd: float | None) -> bool:
+    if available_usd is None:
+        return False
+    if available_usd < LOW_FUNDS_SKIP_USD:
+        logging.warning(
+            "LOW_FUNDS_SKIP available=%s required=%s",
+            available_usd,
+            LOW_FUNDS_SKIP_USD,
         )
         return True
     return False
@@ -508,6 +531,22 @@ def get_token_midprice(client: ClobClient, token_id: str) -> float | None:
             )
             if price:
                 return price
+    return None
+
+
+def get_token_mark_price(token_id: str) -> float | None:
+    if not token_id:
+        return None
+    side = ASSET_TO_SIDE.get(token_id)
+    if side in ("yes", "no"):
+        bid = best_quotes[side]["bid"]
+        ask = best_quotes[side]["ask"]
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2
+        if bid is not None:
+            return bid
+        if ask is not None:
+            return ask
     return None
 
 
