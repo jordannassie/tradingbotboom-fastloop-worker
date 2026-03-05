@@ -578,6 +578,55 @@ def get_token_mark_price(token_id: str) -> float | None:
     return None
 
 
+def get_live_holdings_snapshot(client: ClobClient | None) -> dict[str, float]:
+    holdings: dict[str, float] = {}
+    if not client:
+        logging.warning("LIVE_HOLDINGS_UNAVAILABLE reason=no_client")
+        return holdings
+    methods = [
+        "get_positions",
+        "getPositions",
+        "get_holdings",
+        "getHoldings",
+        "get_open_positions",
+        "getOpenPositions",
+        "get_active_positions",
+    ]
+    for method_name in methods:
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method()
+        except Exception as exc:
+            logging.warning("LIVE_HOLDINGS_SNAPSHOT_ERROR method=%s err=%s", method_name, exc)
+            continue
+        rows = _unwrap_list(result)
+        for row in rows:
+            token_id = _extract_token_id(row)
+            if not token_id:
+                continue
+            size = (
+                _safe_parse_float(row.get("size"))
+                or _safe_parse_float(row.get("shares"))
+                or _safe_parse_float(row.get("amount"))
+                or _safe_parse_float(row.get("filledSize"))
+                or _safe_parse_float(row.get("openVolume"))
+            )
+            if size and size > 0:
+                holdings[token_id] = holdings.get(token_id, 0.0) + size
+        if holdings:
+            tokens = list(holdings.items())[:3]
+            logging.info(
+                "LIVE_HOLDINGS_SNAPSHOT tokens=%s example=%s",
+                len(holdings),
+                tokens,
+            )
+            return holdings
+    logging.warning("LIVE_HOLDINGS_UNAVAILABLE reason=no_methods")
+    return holdings
+
+
 def _cancel_live_orders_for_token(client: ClobClient, token_id: str) -> None:
     snapshot = get_live_positions_snapshot(client, log_snapshot=False)
     for order in snapshot["open_orders"]:
@@ -704,8 +753,9 @@ async def evaluate_live_tpsl_positions(
 ) -> None:
     if not client:
         return
-    snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-    inferred = snapshot.get("inferred_positions") or {}
+    holdings = get_live_holdings_snapshot(client)
+    if not holdings:
+        return
     for token_id, info in list(live_entry_info.items()):
         strategy = info.get("strategy")
         if strategy not in (STRATEGY_FASTLOOP, STRATEGY_SNIPER):
@@ -718,7 +768,7 @@ async def evaluate_live_tpsl_positions(
         if mark_price is None:
             logging.info("LIVE_TPSL_SKIP_NO_MARK_PRICE token_id=%s", token_id)
             continue
-        shares = inferred.get(token_id, 0.0)
+        shares = holdings.get(token_id, 0.0)
         if shares <= 0:
             logging.warning("LIVE_SKIP_NEG_SHARES token_id=%s shares=%s", token_id, shares)
             continue
@@ -742,8 +792,8 @@ async def evaluate_live_tpsl_positions(
             base_price=mark_price,
             reason=f"TPSL_{reason}",
         )
-        snapshot_after = get_live_positions_snapshot(client, log_snapshot=False)
-        remaining = snapshot_after["inferred_positions"].get(token_id, 0.0)
+        holdings_after = get_live_holdings_snapshot(client)
+        remaining = holdings_after.get(token_id, 0.0)
         if abs(remaining) <= 0.01:
             live_entry_info.pop(token_id, None)
             logging.info("LIVE_TPSL_FLAT token_id=%s reason=%s", token_id, reason)
@@ -775,6 +825,9 @@ async def close_live_position_ladder(
         )
         return True
 
+    if shares <= 0:
+        logging.warning("LIVE_EXIT_INVALID_SIDE token_id=%s shares=%s", token_id, shares)
+        return False
     close_side = "SELL" if shares > 0 else "BUY"
     try:
         price_base = base_price or get_token_midprice(client, token_id)
@@ -2993,8 +3046,23 @@ def submit_order(
         last_trade_error = None
         return True
     except Exception as exc:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
         err_lower = str(exc).lower()
         if "not enough balance / allowance" in err_lower:
+            resp_payload = None
+            try:
+                resp_payload = resp.json() if resp else None
+            except Exception:
+                resp_payload = None
+            logging.warning(
+                "LIVE_CLOSE_REJECTED token_id=%s shares=%s price=%s side=%s json=%s",
+                token_id,
+                float(shares_q),
+                float(price_q),
+                order_side_normalized,
+                json.dumps(resp_payload) if resp_payload else None,
+            )
             logging.warning("LIVE_SKIP_ALLOWANCE error=%s", exc)
             last_trade_error = str(exc)[:512]
             record_trade(
@@ -3010,9 +3078,6 @@ def submit_order(
                 strategy_id=strategy_id,
             )
             return False
-
-        resp = getattr(exc, "response", None)
-        status = getattr(resp, "status_code", None)
         resp_text = None
         resp_json = None
         if resp is not None:
@@ -3147,45 +3212,51 @@ async def heartbeat_loop(client: ClobClient | None):
             and (sniper_settings["arm_live"] or fastloop_settings["arm_live"])
             and time_to_end is not None
         ):
-            if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
-                force_exit_triggered = True
-                logging.info(
-                    "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
-                    current_slug,
-                    time_to_end,
-                )
-                snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-                inferred = snapshot.get("inferred_positions") or {}
-                for token_id, shares in inferred.items():
-                    if abs(shares) < 0.01:
+                if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+                    force_exit_triggered = True
+                    logging.info(
+                        "LIVE_FORCE_EXIT_TRIGGER slug=%s time_to_end=%s",
+                        current_slug,
+                        time_to_end,
+                    )
+                    holdings = get_live_holdings_snapshot(client)
+                    if not holdings:
                         continue
-                    try:
-                        ok = await close_live_position_ladder(
-                            client,
-                            token_id,
-                            shares,
-                            base_price=best_quotes.get(
-                                ASSET_TO_SIDE.get(token_id, "yes"), {}
-                            ).get("bid"),
-                            reason="FORCE_EXIT",
-                        )
-                    except Exception as exc:
-                        logging.warning(
-                            "LIVE_EXIT_ERROR token_id=%s err=%s",
-                            token_id,
-                            exc,
-                        )
-                        ok = False
-                    if ok:
-                        force_exit_ok += 1
-                    else:
-                        force_exit_fail += 1
-                logging.info(
-                    "LIVE_FORCE_EXIT_RESULT slug=%s ok_count=%s fail_count=%s",
-                    current_slug,
-                    force_exit_ok,
-                    force_exit_fail,
-                )
+                    for token_id, shares in holdings.items():
+                        if shares <= 0.01:
+                            logging.info(
+                                "LIVE_FORCE_EXIT_SKIP_NO_HOLDINGS token_id=%s shares=%s",
+                                token_id,
+                                shares,
+                            )
+                            continue
+                        try:
+                            ok = await close_live_position_ladder(
+                                client,
+                                token_id,
+                                shares,
+                                base_price=best_quotes.get(
+                                    ASSET_TO_SIDE.get(token_id, "yes"), {}
+                                ).get("bid"),
+                                reason="FORCE_EXIT",
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "LIVE_EXIT_ERROR token_id=%s err=%s",
+                                token_id,
+                                exc,
+                            )
+                            ok = False
+                        if ok:
+                            force_exit_ok += 1
+                        else:
+                            force_exit_fail += 1
+                    logging.info(
+                        "LIVE_FORCE_EXIT_RESULT slug=%s ok_count=%s fail_count=%s",
+                        current_slug,
+                        force_exit_ok,
+                        force_exit_fail,
+                    )
 
         status = "ENABLED" if is_enabled_combined else "DISABLED"
         msg = (
