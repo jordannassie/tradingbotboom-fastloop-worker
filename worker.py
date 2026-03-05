@@ -421,14 +421,10 @@ def infer_positions_from_trades(client: ClobClient) -> dict[str, float]:
 def get_live_positions_truth(
     client: ClobClient | None, signer_address: str | None
 ) -> dict[str, float]:
-    positions = get_live_token_holdings_truth(client)
+    positions = get_live_token_holdings_truth(client, signer_address)
     if positions:
         return positions
-    if signer_address:
-        api_positions = fetch_data_api_positions(signer_address)
-        if api_positions:
-            return api_positions
-    logging.info("LIVE_POSITIONS_SOURCE source=EMPTY")
+    logging.info("LIVE_POSITIONS_SOURCE source=FILLS_EMPTY")
     return {}
 
 
@@ -712,17 +708,17 @@ def fetch_data_api_positions(user_address: str | None) -> dict[str, float]:
     return positions
 
 
-def get_live_token_holdings_truth(client: ClobClient | None) -> dict[str, float]:
-    if not client:
-        logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client")
+def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
+    if not client or not signer_address:
+        logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client_or_signer")
         return {}
-    endpoints = [
-        "https://clob.polymarket.com/positions",
-        "https://clob.polymarket.com/balances",
-        "https://clob.polymarket.com/balances?asset_type=COLLATERAL",
-        "https://clob.polymarket.com/data/positions",
-    ]
-    for url in endpoints:
+    url_base = "https://clob.polymarket.com/data/trades"
+    holdings: defaultdict[str, float] = defaultdict(float)
+    cursor: str | None = None
+    now_ts = int(time())
+    cutoff = now_ts - 86400
+    while True:
+        url = url_base if not cursor else f"{url_base}?next_cursor={parse.quote(cursor)}"
         logging.info("LIVE_HOLDINGS_ENDPOINT_TRY url=%s status=n/a", url)
         try:
             req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
@@ -735,46 +731,72 @@ def get_live_token_holdings_truth(client: ClobClient | None) -> dict[str, float]
                     status,
                     text[:800],
                 )
-                data = json.loads(text)
+                payload = json.loads(text)
         except Exception as exc:
             logging.info(
-                "LIVE_HOLDINGS_ENDPOINT_TRY url=%s status=err error=%s",
+                "LIVE_HOLDINGS_ENDPOINT_FAILED url=%s error=%s",
                 url,
                 exc,
             )
-            continue
-        positions = {}
-        items = data if isinstance(data, list) else data.get("positions") or data.get("assets") or []
-        for item in items:
-            if not isinstance(item, dict):
+            break
+        trades = payload.get("trades") or payload.get("data") or payload.get("items") or []
+        if not isinstance(trades, list):
+            break
+        for trade in trades:
+            if not isinstance(trade, dict):
                 continue
             token_id = next(
                 (
-                    str(item.get(k))
+                    str(trade.get(k))
                     for k in ("token_id", "tokenId", "token", "asset_id", "assetId")
-                    if item.get(k)
+                    if trade.get(k)
                 ),
                 None,
             )
+            if not token_id:
+                continue
+            timestamp = _safe_parse_float(trade.get("timestamp") or trade.get("createdAt") or trade.get("executedAt"))
+            if timestamp and timestamp < cutoff:
+                continue
+            maker = (trade.get("makerWallet") or trade.get("maker") or trade.get("makerAddress") or "").lower()
+            taker = (trade.get("takerWallet") or trade.get("taker") or trade.get("takerAddress") or "").lower()
+            signer = signer_address.lower()
+            role = None
+            if signer == maker:
+                role = "maker"
+            elif signer == taker:
+                role = "taker"
+            if not role:
+                continue
             shares = None
-            for key in ("shares", "size", "amount", "balance", "position"):
-                value = item.get(key)
+            for key in ("size", "shares", "amount", "fillSize", "filledSize"):
+                value = trade.get(key)
                 parsed = _safe_parse_float(value)
                 if parsed:
                     shares = parsed
                     break
-            if token_id and shares and shares > 0.01:
-                positions[token_id] = positions.get(token_id, 0.0) + shares
-        if positions:
-            tokens = list(positions.items())[:3]
-            logging.info(
-                "LIVE_POSITIONS_SOURCE source=CLOb_HOLDINGS count=%s example=%s",
-                len(positions),
-                [(token, round(shares,4)) for token, shares in tokens],
-            )
-            return positions
-    logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED")
-    return {}
+            if not shares:
+                continue
+            direction = (trade.get("side") or trade.get("type") or "").upper()
+            if direction == "SELL" or (role == "maker" and trade.get("makerSide", "").upper() == "SELL"):
+                holdings[token_id] -= shares
+            else:
+                holdings[token_id] += shares
+        next_cursor = payload.get("nextCursor") or payload.get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = next_cursor
+    positions = {token: shares for token, shares in holdings.items() if shares > 0.01}
+    if positions:
+        tokens = list(positions.items())[:3]
+        logging.info(
+            "LIVE_POSITIONS_SOURCE source=FILLS count=%s example=%s",
+            len(positions),
+            [(token, round(shares,4)) for token, shares in tokens],
+        )
+    else:
+        logging.info("LIVE_HOLDINGS_FROM_FILLS_EMPTY")
+    return positions
 
 
 
