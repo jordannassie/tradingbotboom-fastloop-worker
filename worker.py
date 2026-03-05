@@ -71,6 +71,7 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
+MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
 ENTRY_CUTOFF_SECONDS = int(os.getenv("ENTRY_CUTOFF_SECONDS", "180"))
 FORCE_EXIT_SECONDS = int(os.getenv("FORCE_EXIT_SECONDS", "150"))
 EXIT_LADDER_MAX_STEPS = int(os.getenv("EXIT_LADDER_MAX_STEPS", "8"))
@@ -3374,6 +3375,16 @@ def submit_order(
             shares_q,
             price_q,
             trade_size,
+        )
+        return False
+    if float(shares_q) < MIN_ORDER_SHARES:
+        logging.warning(
+            "MIN_SHARES_SKIP mode=LIVE strategy=%s price=%s size_usd=%s shares=%s min_shares=%s",
+            strategy_id or "unknown",
+            price_q,
+            trade_size,
+            shares_q,
+            MIN_ORDER_SHARES,
         )
         return False
 
