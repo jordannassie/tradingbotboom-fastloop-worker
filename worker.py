@@ -868,6 +868,8 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
     cutoff = now_ts - 86400
     global trades_sample_logged
     pages = 0
+    total_trades = 0
+    our_trades = 0
     while pages < 5:
         trades, next_cursor = fetch_authenticated_trades(client, cursor)
         if trades and not trades_sample_logged:
@@ -893,29 +895,42 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
         for trade in trades:
             if not isinstance(trade, dict):
                 continue
-            token_id, shares = extract_token_and_size(trade)
-            if not token_id or not shares:
+            total_trades += 1
+            if not is_our_trade(trade, signer_address):
                 continue
-            timestamp = _safe_parse_float(
-                trade.get("timestamp")
-                or trade.get("createdAt")
-                or trade.get("executedAt")
-            )
-            if timestamp and timestamp < cutoff:
-                continue
-            addresses = extract_any_address(trade)
-            if signer_address.lower() not in addresses:
+            our_trades += 1
+            token_id = extract_trade_token_id(trade)
+            if not token_id:
                 continue
             direction = extract_trade_side(trade)
+            if direction not in ("BUY", "SELL"):
+                continue
+            sz = extract_trade_size(trade)
+            if sz <= 0:
+                continue
             if direction == "SELL":
-                holdings[token_id] -= shares
+                holdings[token_id] -= sz
             elif direction == "BUY":
-                holdings[token_id] += shares
+                holdings[token_id] += sz
         if not next_cursor:
             break
         cursor = next_cursor
         pages += 1
     positions = {token: shares for token, shares in holdings.items() if shares > 0.01}
+    logging.info(
+        "LIVE_HOLDINGS_FROM_FILLS_COUNTS total=%s ours=%s tokens=%s",
+        total_trades,
+        our_trades,
+        len(positions),
+    )
+    if our_trades == 0:
+        sample = trades[0] if trades else {}
+        logging.info(
+            "LIVE_HOLDINGS_FROM_FILLS_NO_MATCH signer=%s hint=check LIVE_TRADES_SCHEMA_HINT fields sample_owner=%s sample_maker=%s",
+            signer_address,
+            sample.get("owner"),
+            sample.get("maker"),
+        )
     if positions:
         tokens = list(positions.items())[:3]
         logging.info(
