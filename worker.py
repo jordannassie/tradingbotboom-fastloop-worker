@@ -71,10 +71,23 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
+ENTRY_CUTOFF_SECONDS = int(os.getenv("ENTRY_CUTOFF_SECONDS", "120"))
+FORCE_EXIT_SECONDS = int(os.getenv("FORCE_EXIT_SECONDS", "90"))
+EXIT_LADDER_MAX_STEPS = int(os.getenv("EXIT_LADDER_MAX_STEPS", "8"))
+EXIT_LADDER_STEP_SECONDS = int(os.getenv("EXIT_LADDER_STEP_SECONDS", "2"))
+EXIT_LADDER_PRICE_IMPROVE_CENTS = float(os.getenv("EXIT_LADDER_PRICE_IMPROVE_CENTS", "1.0"))
 LIVE_MIN_AVAILABLE_USD = float(os.getenv("LIVE_MIN_AVAILABLE_USD", "5.0"))
 PAPER_MIN_AVAILABLE_USD = float(os.getenv("PAPER_MIN_AVAILABLE_USD", "5.0"))
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
-logging.info("MIN_ORDER_CONFIG min_order_usd=%s", MIN_ORDER_USD)
+logging.info(
+    "EXIT_CONFIG entry_cutoff=%s force_exit=%s ladder_steps=%s ladder_step_seconds=%s improve_cents=%s min_order_usd=%s",
+    ENTRY_CUTOFF_SECONDS,
+    FORCE_EXIT_SECONDS,
+    EXIT_LADDER_MAX_STEPS,
+    EXIT_LADDER_STEP_SECONDS,
+    EXIT_LADDER_PRICE_IMPROVE_CENTS,
+    MIN_ORDER_USD,
+)
 logging.info(
     "BANKROLL_GUARD_CONFIG live_min=%s paper_min=%s",
     LIVE_MIN_AVAILABLE_USD,
@@ -209,6 +222,7 @@ last_live_bankroll_refresh_ts = 0
 live_wallet_ok = False
 live_signer_address: str | None = None
 live_funder_address: str | None = None
+last_live_positions_snapshot_ts = 0
 live_positions: dict[str, float] = {}
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
@@ -292,13 +306,128 @@ def _record_live_position(token_id: str, delta_shares: float) -> None:
         live_positions[token_id] = updated
 
 
-def get_live_positions_snapshot() -> dict[str, float]:
-    snapshot = {token: shares for token, shares in live_positions.items() if shares > 0}
+def _safe_parse_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_token_id(payload: dict[str, object]) -> str | None:
+    for key in (
+        "token_id",
+        "tokenId",
+        "asset_id",
+        "assetId",
+        "asset",
+        "clobTokenId",
+        "clobTokenID",
+    ):
+        candidate = payload.get(key)
+        if candidate:
+            return str(candidate)
+    return None
+
+
+def _unwrap_list(result: object) -> list[dict[str, object]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("orders", "data", "items", "trades"):
+            candidate = result.get(key)
+            if isinstance(candidate, list):
+                return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def get_live_positions_snapshot(client: ClobClient | None = None) -> dict[str, object]:
+    inferred_initial = {
+        token: shares for token, shares in live_positions.items() if shares > 0
+    }
+    snapshot: dict[str, object] = {
+        "open_orders": [],
+        "recent_trades": [],
+        "inferred_positions": dict(inferred_initial),
+    }
+
+    if not client:
+        logging.info(
+            "LIVE_POSITIONS_SNAPSHOT open_orders=0 recent_trades=0 inferred_tokens=%s tokens=%s",
+            len(snapshot["inferred_positions"]),
+            list(snapshot["inferred_positions"].keys())[:3],
+        )
+        for token_id, shares in list(snapshot["inferred_positions"].items())[:5]:
+            logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
+        return snapshot
+
+    def _call_method(method_names: list[str]) -> list[dict[str, object]]:
+        for method_name in method_names:
+            method = getattr(client, method_name, None)
+            if callable(method):
+                try:
+                    result = method()
+                except Exception as exc:
+                    logging.warning(
+                        "LIVE_POSITIONS_SNAPSHOT_ERROR where=%s err=%s",
+                        method_name,
+                        exc,
+                    )
+                    continue
+                return _unwrap_list(result)
+        return []
+
+    snapshot["open_orders"] = _call_method(
+        ["get_open_orders", "get_openOrders", "get_orders"]
+    )[:5]
+    snapshot["recent_trades"] = _call_method(
+        ["get_trades", "get_trades_paginated", "getTrades", "getTradesPaginated"]
+    )[:10]
+
+    inferred_remote: defaultdict[str, float] = defaultdict(float)
+    for trade in snapshot["recent_trades"]:
+        token = _extract_token_id(trade) or "unknown"
+        side = str(trade.get("side") or trade.get("type") or "").upper()
+        size = (
+            _safe_parse_float(trade.get("size"))
+            or _safe_parse_float(trade.get("amount"))
+            or _safe_parse_float(trade.get("shares"))
+        )
+        if size is None:
+            continue
+        if "BUY" in side:
+            inferred_remote[token] += size
+        elif "SELL" in side:
+            inferred_remote[token] -= size
+
+    for token, shares in inferred_remote.items():
+        snapshot["inferred_positions"][token] = (
+            snapshot["inferred_positions"].get(token, 0.0) + shares
+        )
+
+    tokens = []
+    for order in snapshot["open_orders"][:3]:
+        token_id = _extract_token_id(order)
+        if token_id:
+            tokens.append(token_id[:6] + "..." if len(token_id) > 6 else token_id)
+
     logging.info(
-        "LIVE_POSITIONS_FETCH count=%s positions=%s",
-        len(snapshot),
-        {token: round(shares, 8) for token, shares in snapshot.items()},
+        "LIVE_POSITIONS_SNAPSHOT open_orders=%s recent_trades=%s inferred_tokens=%s tokens=%s",
+        len(snapshot["open_orders"]),
+        len(snapshot["recent_trades"]),
+        len(snapshot["inferred_positions"]),
+        tokens,
     )
+
+    inferred_sorted = sorted(
+        snapshot["inferred_positions"].items(),
+        key=lambda kv: abs(kv[1]),
+        reverse=True,
+    )
+    for token_id, shares in inferred_sorted[:5]:
+        logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
+
     return snapshot
 
 
@@ -2484,6 +2613,7 @@ def submit_order(
 
 async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
+    global last_live_positions_snapshot_ts
 
     while True:
         now_ts = int(time())
@@ -2510,6 +2640,15 @@ async def heartbeat_loop(client: ClobClient | None):
         is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"]
         mode = fastloop_settings["mode"]
         edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
+        arm_live_active = sniper_settings["arm_live"] or fastloop_settings["arm_live"]
+        if (
+            live_master_enabled
+            and arm_live_active
+            and client
+            and (now_ts - last_live_positions_snapshot_ts >= 60)
+        ):
+            last_live_positions_snapshot_ts = now_ts
+            get_live_positions_snapshot(client)
 
         ya = best_quotes["yes"]["ask"]
         na = best_quotes["no"]["ask"]
