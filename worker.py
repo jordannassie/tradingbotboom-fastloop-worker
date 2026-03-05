@@ -403,7 +403,7 @@ def _unwrap_list(result: object) -> list[dict[str, object]]:
 
 def get_live_positions_snapshot(
     client: ClobClient | None = None, log_snapshot: bool = True
- ) -> dict[str, object]:
+) -> dict[str, object]:
     inferred_initial = {
         token: shares for token, shares in live_positions.items() if shares > 0
     }
@@ -423,6 +423,23 @@ def get_live_positions_snapshot(
             for token_id, shares in list(snapshot["inferred_positions"].items())[:5]:
                 logging.info("LIVE_INFERRED_POS token_id=%s shares=%s", token_id, shares)
         return snapshot
+
+    signer = live_signer_address or live_funder_address
+    if signer:
+        positions = fetch_live_positions_data_api(signer)
+        if positions:
+            inferred_positions = {}
+            for pos in positions:
+                inferred_positions[pos["token_id"]] = inferred_positions.get(pos["token_id"], 0.0) + float(
+                    pos["shares"]
+                )
+            snapshot["inferred_positions"] = inferred_positions
+            if log_snapshot:
+                logging.info("LIVE_POSITIONS_SOURCE source=DATA_API")
+            return snapshot
+        else:
+            if log_snapshot:
+                logging.info("LIVE_POSITIONS_SOURCE source=DATA_API error=empty")
 
     def _call_method(method_names: list[str]) -> list[dict[str, object]]:
         for method_name in method_names:
@@ -482,6 +499,9 @@ def get_live_positions_snapshot(
             len(snapshot["inferred_positions"]),
             tokens,
         )
+
+    if log_snapshot:
+        logging.info("LIVE_POSITIONS_SOURCE source=INFERRED_FALLBACK")
 
     if log_snapshot:
         inferred_sorted = sorted(
@@ -625,6 +645,53 @@ def get_live_holdings_snapshot(client: ClobClient | None) -> dict[str, float]:
             return holdings
     logging.warning("LIVE_HOLDINGS_UNAVAILABLE reason=no_methods")
     return holdings
+
+
+def fetch_live_positions_data_api(user_address: str | None) -> list[dict[str, object]]:
+    if not user_address:
+        return []
+    base = "https://data-api.polymarket.com/positions"
+    url = f"{base}?user={parse.quote(user_address)}"
+    try:
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=10) as resp:
+            if getattr(resp, "status", 200) != 200:
+                logging.warning(
+                    "LIVE_POSITIONS_DATA_API err=status=%s", getattr(resp, "status", "n/a")
+                )
+                return []
+            data = json.loads(resp.read())
+    except Exception as exc:
+        logging.warning("LIVE_POSITIONS_DATA_API_FAILED err=%s", exc)
+        return []
+    positions: list[dict[str, object]] = []
+    items = data if isinstance(data, list) else data.get("positions") or data.get("assets") or []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        token_id = _extract_token_id(item)
+        shares = (
+            _safe_parse_float(item.get("size"))
+            or _safe_parse_float(item.get("shares"))
+            or _safe_parse_float(item.get("amount"))
+        )
+        if not token_id or not shares or shares <= 0:
+            continue
+        positions.append(
+            {
+                "token_id": token_id,
+                "shares": shares,
+                "side": item.get("side") or item.get("outcome"),
+                "market": item.get("market") or item.get("conditionId") or item.get("marketSlug"),
+            }
+        )
+    if positions:
+        logging.info(
+            "LIVE_POSITIONS_DATA_API count=%s tokens=%s",
+            len(positions),
+            [p["token_id"][:6] + "..." for p in positions[:3]],
+        )
+    return positions
 
 
 def _cancel_live_orders_for_token(client: ClobClient, token_id: str) -> None:
@@ -825,10 +892,17 @@ async def close_live_position_ladder(
         )
         return True
 
-    if shares <= 0:
-        logging.warning("LIVE_EXIT_INVALID_SIDE token_id=%s shares=%s", token_id, shares)
+    holdings = get_live_holdings_snapshot(client)
+    current_holdings = holdings.get(token_id, 0.0)
+    if current_holdings <= 0.01:
+        logging.info(
+            "LIVE_FORCE_EXIT_SKIP_NO_HOLDINGS token_id=%s holdings=%s",
+            token_id,
+            current_holdings,
+        )
         return False
-    close_side = "SELL" if shares > 0 else "BUY"
+    shares_to_close = min(shares, current_holdings)
+    close_side = "SELL"
     try:
         price_base = base_price or get_token_midprice(client, token_id)
         if not price_base:
@@ -847,7 +921,7 @@ async def close_live_position_ladder(
                     0.99, price_base + 0.01 + (step - 1) * improve
                 )
 
-            params = build_exit_order_params(token_id, shares_now, close_side, price)
+            params = build_exit_order_params(token_id, shares_to_close, close_side, price)
             if params["size_usd"] <= 0:
                 logging.warning(
                     "LIVE_EXIT_SKIP_ZERO_SIZE token_id=%s price=%s",
@@ -882,8 +956,8 @@ async def close_live_position_ladder(
             )
 
         await asyncio.sleep(EXIT_LADDER_STEP_SECONDS)
-        snapshot = get_live_positions_snapshot(client, log_snapshot=False)
-        shares_now = snapshot["inferred_positions"].get(token_id, 0.0)
+        current_holdings = get_live_holdings_snapshot(client)
+        shares_now = current_holdings.get(token_id, 0.0)
         if abs(shares_now) <= 0.01:
             logging.info(
                 "LIVE_EXIT_DONE token_id=%s reason=%s steps=%s",
