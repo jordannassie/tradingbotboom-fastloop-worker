@@ -71,8 +71,15 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
+LIVE_MIN_AVAILABLE_USD = float(os.getenv("LIVE_MIN_AVAILABLE_USD", "5.0"))
+PAPER_MIN_AVAILABLE_USD = float(os.getenv("PAPER_MIN_AVAILABLE_USD", "5.0"))
 logging.info("WORKER_BOOT build=LIVE_BANKROLL_V3")
 logging.info("MIN_ORDER_CONFIG min_order_usd=%s", MIN_ORDER_USD)
+logging.info(
+    "BANKROLL_GUARD_CONFIG live_min=%s paper_min=%s",
+    LIVE_MIN_AVAILABLE_USD,
+    PAPER_MIN_AVAILABLE_USD,
+)
 logging.info(
     "PM_ENV_CHECK access_key_present=%s privkey_present=%s",
     bool(PM_ACCESS_KEY),
@@ -254,6 +261,23 @@ def float_or_none(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def should_skip_new_entries(
+    mode: str, available_usd: float | None, min_usd: float, strategy_id: str
+) -> bool:
+    if available_usd is None:
+        return False
+    if available_usd < min_usd:
+        logging.warning(
+            "BANKROLL_GUARD_SKIP mode=%s strategy=%s available_usd=%s min_usd=%s",
+            mode,
+            strategy_id,
+            available_usd,
+            min_usd,
+        )
+        return True
+    return False
 
 
 def parse_strategy_settings_field(payload) -> dict[str, object]:
@@ -1010,6 +1034,8 @@ async def execute_strategy(
     mode = settings.get("mode", "PAPER").upper()
     size_usd = compute_strategy_size(settings, strategy_id, mode)
     shares = compute_shares_from_size(size_usd, entry_price)
+
+    paper_available = settings.get("paper_balance_usd")
     if size_usd <= 0:
         logging.warning(
             "Skipping %s: size_usd=%s price=%s shares=%s reason=size<=0",
@@ -1050,7 +1076,11 @@ async def execute_strategy(
         if new_allowance is not None:
             allowance = new_allowance
         logging.info("LIVE_BANKROLL_AFTER_REFRESH live_balance_usd=%s", live_balance)
-        if live_balance is None or live_balance <= 0:
+        if should_skip_new_entries(
+            "LIVE", live_balance, LIVE_MIN_AVAILABLE_USD, strategy_id
+        ):
+            route_live = False
+        elif live_balance is None or live_balance <= 0:
             logging.warning(
                 "LIVE_SKIP_NO_LIVE_BANKROLL strategy=%s live_balance_usd=%s",
                 strategy_id,
@@ -1113,31 +1143,35 @@ async def execute_strategy(
                         "available" if client else "missing",
                     )
     if not executed_live:
-        logging.info(
-            "PAPER_EXEC strategy=%s slug=%s size_usd=%s",
-            strategy_id,
-            current_slug,
-            size_usd,
+        skip_paper_entry = should_skip_new_entries(
+            "PAPER", paper_available, PAPER_MIN_AVAILABLE_USD, strategy_id
         )
-        if size_usd < MIN_ORDER_USD:
-            logging.warning(
-                "MIN_ORDER_SKIP mode=PAPER strategy=%s size_usd=%s min=%s",
+        if not skip_paper_entry:
+            logging.info(
+                "PAPER_EXEC strategy=%s slug=%s size_usd=%s",
                 strategy_id,
+                current_slug,
                 size_usd,
-                MIN_ORDER_USD,
             )
-        else:
-            await create_paper_strategy_position(
-            strategy_id,
-            action_label,
-            edge,
-            ya,
-            na,
-            total_ask,
-            size_usd,
-            shares,
-            settings["mode"],
-        )
+            if size_usd < MIN_ORDER_USD:
+                logging.warning(
+                    "MIN_ORDER_SKIP mode=PAPER strategy=%s size_usd=%s min=%s",
+                    strategy_id,
+                    size_usd,
+                    MIN_ORDER_USD,
+                )
+            else:
+                await create_paper_strategy_position(
+                    strategy_id,
+                    action_label,
+                    edge,
+                    ya,
+                    na,
+                    total_ask,
+                    size_usd,
+                    shares,
+                    settings["mode"],
+                )
 
     mark_strategy_trade_attempts(strategy_id, 2)
     return True
