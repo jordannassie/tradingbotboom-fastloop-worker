@@ -233,9 +233,8 @@ live_wallet_ok = False
 live_signer_address: str | None = None
 live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
-live_positions: dict[str, float] = {}
-live_entry_info: dict[str, dict[str, object]] = {}
 trades_auth_mode_logged = False
+trades_sample_logged = False
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -738,6 +737,65 @@ def fetch_authenticated_trades(
         return [], None
 
 
+def extract_any_address(trade: dict[str, object]) -> set[str]:
+    addresses: set[str] = set()
+    keys = [
+        "maker",
+        "taker",
+        "owner",
+        "user",
+        "address",
+        "maker_address",
+        "taker_address",
+        "user_address",
+        "owner_address",
+        "makerWallet",
+        "takerWallet",
+        "makerAddress",
+        "takerAddress",
+    ]
+    for key in keys:
+        value = trade.get(key)
+        if isinstance(value, str) and value:
+            addresses.add(value.lower())
+        elif isinstance(value, dict):
+            candidate = value.get("address") or value.get("wallet")
+            if isinstance(candidate, str) and candidate:
+                addresses.add(candidate.lower())
+    return addresses
+
+
+def extract_trade_side(trade: dict[str, object]) -> str | None:
+    for key in ("side", "taker_side", "maker_side", "regulator_side"):
+        value = trade.get(key)
+        if isinstance(value, str):
+            sval = value.upper()
+            if "BUY" in sval:
+                return "BUY"
+            if "SELL" in sval:
+                return "SELL"
+    return None
+
+
+def extract_token_and_size(trade: dict[str, object]) -> tuple[str | None, float | None]:
+    token = next(
+        (
+            str(trade.get(k))
+            for k in ("token_id", "tokenId", "token", "asset_id", "assetId")
+            if trade.get(k)
+        ),
+        None,
+    )
+    shares = None
+    for key in ("size", "shares", "amount", "filled_size", "filledSize", "fillSize"):
+        value = trade.get(key)
+        parsed = _safe_parse_float(value)
+        if parsed:
+            shares = parsed
+            break
+    return token, shares
+
+
 def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str | None) -> dict[str, float]:
     if not client or not signer_address:
         logging.info("LIVE_HOLDINGS_ENDPOINT_FAILED error=no_client_or_signer")
@@ -746,20 +804,25 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
     cursor: str | None = None
     now_ts = int(time())
     cutoff = now_ts - 86400
-    while True:
+    global trades_sample_logged
+    pages = 0
+    while pages < 5:
         trades, next_cursor = fetch_authenticated_trades(client, cursor)
+        if trades and not trades_sample_logged:
+            sample = trades[0]
+            logging.info(
+                "LIVE_TRADES_SAMPLE keys=%s preview=%s",
+                list(sample.keys()),
+                str(sample)[:200],
+            )
+            trades_sample_logged = True
         if not trades:
             break
         for trade in trades:
-            token_id = next(
-                (
-                    str(trade.get(k))
-                    for k in ("token_id", "tokenId", "token", "asset_id", "assetId")
-                    if trade.get(k)
-                ),
-                None,
-            )
-            if not token_id:
+            if not isinstance(trade, dict):
+                continue
+            token_id, shares = extract_token_and_size(trade)
+            if not token_id or not shares:
                 continue
             timestamp = _safe_parse_float(
                 trade.get("timestamp")
@@ -768,50 +831,23 @@ def get_live_token_holdings_truth(client: ClobClient | None, signer_address: str
             )
             if timestamp and timestamp < cutoff:
                 continue
-            maker = (
-                trade.get("makerWallet")
-                or trade.get("maker")
-                or trade.get("makerAddress")
-                or ""
-            ).lower()
-            taker = (
-                trade.get("takerWallet")
-                or trade.get("taker")
-                or trade.get("takerAddress")
-                or ""
-            ).lower()
-            signer = signer_address.lower()
-            role = None
-            if signer == maker:
-                role = "maker"
-            elif signer == taker:
-                role = "taker"
-            if not role:
+            addresses = extract_any_address(trade)
+            if signer_address.lower() not in addresses:
                 continue
-            shares = None
-            for key in ("size", "shares", "amount", "fillSize", "filledSize"):
-                value = trade.get(key)
-                parsed = _safe_parse_float(value)
-                if parsed:
-                    shares = parsed
-                    break
-            if not shares:
-                continue
-            direction = (trade.get("side") or trade.get("type") or "").upper()
-            if direction == "SELL" or (
-                role == "maker" and trade.get("makerSide", "").upper() == "SELL"
-            ):
+            direction = extract_trade_side(trade)
+            if direction == "SELL":
                 holdings[token_id] -= shares
-            else:
+            elif direction == "BUY":
                 holdings[token_id] += shares
         if not next_cursor:
             break
         cursor = next_cursor
+        pages += 1
     positions = {token: shares for token, shares in holdings.items() if shares > 0.01}
     if positions:
         tokens = list(positions.items())[:3]
         logging.info(
-            "LIVE_POSITIONS_SOURCE source=FILLS count=%s example=%s",
+            "LIVE_HOLDINGS_FROM_FILLS tokens=%s example=%s",
             len(positions),
             [(token, round(shares, 4)) for token, shares in tokens],
         )
