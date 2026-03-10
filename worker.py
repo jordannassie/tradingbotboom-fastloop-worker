@@ -124,6 +124,11 @@ logging.info(
     bool(PM_ED25519_PRIVATE_KEY_B64),
 )
 logging.info("WORKER_BOOT_FINGERPRINT step7_meta_fix=ON ts=%s", int(time()))
+logging.info(
+    "CANDLE_BIAS_BOOT_CHECK code_present=True strategy_id=%s bot_id=%s",
+    "CANDLE_BIAS",
+    "paper_candle_bias",
+)
 
 LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
 LIVE_BANKROLL_REFRESH_SECONDS = int(os.getenv("LIVE_BANKROLL_REFRESH_SECONDS", "30"))
