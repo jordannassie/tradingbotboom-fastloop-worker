@@ -51,29 +51,15 @@ WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
-STRATEGY_COPY = "COPY"
-STRATEGY_SCALPER = "SCALPER"
-SNIPER_SECONDS_THRESHOLD = 30
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
-COPY_SIZE_CAP_USD = float(os.getenv("COPY_SIZE_CAP_USD", "25"))
-
-STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
-STRATEGY_SNIPER_BOT_ID = "paper_sniper"
-STRATEGY_COPY_BOT_ID = "paper_copy"
-STRATEGY_SCALPER_BOT_ID = "paper_scalper"
 LIVE_MASTER_BOT_ID = "live"
 
 STRATEGY_TO_BOT_ID = {
     STRATEGY_FASTLOOP: STRATEGY_FASTLOOP_BOT_ID,
     STRATEGY_SNIPER: STRATEGY_SNIPER_BOT_ID,
-    STRATEGY_COPY: STRATEGY_COPY_BOT_ID,
-    STRATEGY_SCALPER: STRATEGY_SCALPER_BOT_ID,
 }
 
-COPY_TARGET_WALLET = os.getenv(
-    "COPY_TARGET_WALLET", "0xd0d6053c3c37e727402d84c14069780d360993aa"
-)
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 PAPER_BANKROLL_SHARED_ENABLED = os.getenv("PAPER_BANKROLL_SHARED", "false").strip().lower() in (
     "1",
@@ -129,12 +115,7 @@ logging.info(
     bool(PM_ACCESS_KEY),
     bool(PM_ED25519_PRIVATE_KEY_B64),
 )
-logging.info("COPY_WIRING_OK version=V1")
-logging.info("SCALPER_WIRING_OK version=V1")
 logging.info("WORKER_BOOT_FINGERPRINT step7_meta_fix=ON ts=%s", int(time()))
-logging.info("WORKER_BOOT_FINGERPRINT step8_copy_meta_scrub=ON ts=%s", int(time()))
-logging.info("COPY_BUILD_PROOF v=V1")
-logging.info("SCALPER_BUILD_PROOF v=V1")
 
 LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
 LIVE_BANKROLL_REFRESH_SECONDS = int(os.getenv("LIVE_BANKROLL_REFRESH_SECONDS", "30"))
@@ -165,7 +146,6 @@ rotating = False
 ws_task = None
 live_balance_task = None
 scan_task = None
-copy_watch_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -185,8 +165,6 @@ best_quotes = {
 }
 
 ASSET_TO_SIDE = {}
-copy_last_seen_trade_ids = deque()
-copy_seen_trade_id_set = set()
 shared_paper_balance_cache: float | None = None
 shared_paper_balance_ts: float = 0
 shared_paper_balance_error_logged = False
@@ -269,28 +247,11 @@ refresh_asset_map()
 strategy_trade_timestamps = {
     STRATEGY_SNIPER: deque(),
     STRATEGY_FASTLOOP: deque(),
-    STRATEGY_COPY: deque(),
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
 global_trade_mode_cache: str | None = None
-last_copy_schema_log_ts = 0
-last_copy_target_log_ts = 0
-last_copy_config_log_ts = 0
-last_scalper_config_log_ts = 0
 last_proof_tick_ts = 0
-scalper_open_by_slug: dict[str, dict[str, object]] = {}
-last_scalper_signal_ts: dict[str, int] = {}
-copy_insert_backoff_until = 0
-COPY_INSERT_BACKOFF_SECONDS = int(os.getenv("COPY_INSERT_BACKOFF_SECONDS", "60"))
-last_scalper_config_log_ts = 0
-copy_seen_trade_ids: deque[str] = deque()
-copy_seen_trade_id_set: set[str] = set()
-copy_insert_failed: set[str] = set()
-last_copy_proof_ts = 0
-last_scalper_proof_ts = 0
-last_scalper_eval_ts = 0
-schema_probe_last_ts = 0
 consecutive_trade_errors = 0
 last_trade_error = None
 paused_due_to_errors = False
@@ -1058,18 +1019,6 @@ def extract_any_address(trade: dict[str, object]) -> set[str]:
     return addresses
 
 
-def _register_copy_trade_id(trade_id: str) -> bool:
-    normalized = str(trade_id)
-    if normalized in copy_seen_trade_id_set:
-        return False
-    copy_seen_trade_id_set.add(normalized)
-    copy_seen_trade_ids.append(normalized)
-    if len(copy_seen_trade_ids) > 2000:
-        oldest = copy_seen_trade_ids.popleft()
-        copy_seen_trade_id_set.discard(oldest)
-    return True
-
-
 def extract_trade_side(trade: dict[str, object]) -> str | None:
     for key in ("side", "taker_side", "maker_side", "regulator_side"):
         value = trade.get(key)
@@ -1080,58 +1029,6 @@ def extract_trade_side(trade: dict[str, object]) -> str | None:
             if "SELL" in sval:
                 return "SELL"
     return None
-
-
-def _matches_copy_trade(
-    trade: dict[str, object],
-    target_wallet: str,
-    yes_token: str,
-    no_token: str,
-) -> bool:
-    asset_id = (
-        trade.get("asset_id")
-        or trade.get("assetId")
-        or trade.get("token_id")
-        or trade.get("tokenId")
-    )
-    if not asset_id or asset_id not in {yes_token, no_token}:
-        return False
-    trade_id = trade.get("id") or trade.get("tradeId") or trade.get("hash")
-    if not trade_id or trade_id in copy_seen_trade_id_set:
-        return False
-    wallet = target_wallet.lower() if target_wallet else ""
-    addresses = extract_any_address(trade)
-    return wallet in addresses
-
-
-def poll_copy_matches(
-    client: ClobClient | None,
-    target_wallet: str | None,
-    yes_token: str | None,
-    no_token: str | None,
-) -> list[dict[str, object]]:
-    if not client or not target_wallet or not yes_token or not no_token:
-        return []
-    wallet = target_wallet.lower()
-    matches: list[dict[str, object]] = []
-    cursor: str | None = None
-    attempts = 0
-    while len(matches) < 10 and attempts < 5:
-        trades, cursor = fetch_authenticated_trades(client, cursor)
-        if not trades:
-            break
-        for trade in trades:
-            if _matches_copy_trade(trade, wallet, yes_token, no_token):
-                trade_id = trade.get("id") or trade.get("tradeId") or trade.get("hash")
-                if not trade_id or not _register_copy_trade_id(trade_id):
-                    continue
-                matches.append(trade)
-                if len(matches) >= 10:
-                    break
-        if not cursor:
-            break
-        attempts += 1
-    return matches
 
 
 def extract_token_and_size(trade: dict[str, object]) -> tuple[str | None, float | None]:
@@ -1999,7 +1896,6 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         "max_trades_per_hour": MAX_TRADES_PER_HOUR,
         "paper_balance_usd": 0.0,
         "arm_live": False,
-        "copy_target_wallet": COPY_TARGET_WALLET,
     }
     columns = "is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour, paper_balance_usd, arm_live, strategy_settings"
     try:
@@ -2038,9 +1934,6 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "arm_live": bool(row.get("arm_live")),
             "strategy_settings": parsed_strategy,
         }
-        if bot_id == STRATEGY_COPY_BOT_ID:
-            settings["copy_target_wallet"] = parsed_strategy.get("copy_target_wallet") or COPY_TARGET_WALLET
-            settings["copy_mode"] = parsed_strategy.get("copy_mode") or "Mirror buys+sells"
         log_rate_limited(
             f"strategy_settings_{bot_id}",
             LOG_THROTTLE_SECONDS,
@@ -2268,16 +2161,6 @@ def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: s
             size = SNIPER_SIZE_CAP_USD
             cap_applied = True
             cap_value = SNIPER_SIZE_CAP_USD
-    if strategy_id == STRATEGY_COPY:
-        if size > COPY_SIZE_CAP_USD:
-            cap_applied = True
-            cap_value = COPY_SIZE_CAP_USD
-            logging.info(
-                "COPY_SIZE_CAP_APPLIED wanted=%s capped=%s",
-                size,
-                COPY_SIZE_CAP_USD,
-            )
-            size = COPY_SIZE_CAP_USD
     logging.info(
         "SIZE_COMPUTE strategy=%s mode=%s trade_size_input=%s base_balance=%s size_usd=%s is_percent=%s cap=%s",
         strategy_id,
@@ -2315,15 +2198,6 @@ def compute_live_size_usd(settings: dict[str, object], strategy_id: str, live_ba
         size = SNIPER_SIZE_CAP_USD
         cap_applied = True
         cap_value = SNIPER_SIZE_CAP_USD
-    if strategy_id == STRATEGY_COPY and size > COPY_SIZE_CAP_USD:
-        cap_applied = True
-        cap_value = COPY_SIZE_CAP_USD
-        logging.info(
-            "COPY_SIZE_CAP_APPLIED live wanted=%s capped=%s",
-            size,
-            COPY_SIZE_CAP_USD,
-        )
-        size = COPY_SIZE_CAP_USD
     logging.info(
         "LIVE_SIZE_COMPUTE strategy=%s trade_size_input=%s base_balance=%s size_usd=%s is_percent=%s cap=%s",
         strategy_id,
@@ -2345,177 +2219,6 @@ def compute_shares_from_size(size_usd: float, price: float) -> float:
     return floor(raw * 1e8) / 1e8
 
 
-async def create_copy_paper_position(
-    market_slug: str,
-    side: str,
-    entry_price: float,
-    size_usd: float,
-    shares: float,
-    meta: dict[str, object],
-) -> bool:
-    start_ts = slug_start_timestamp(market_slug)
-    if start_ts is None:
-        logging.warning("COPY_BUY_MIRROR skip slug=%s start_ts missing", market_slug)
-        return False
-
-    slug_prefixes = (
-        "btc-updown-5m-",
-        "eth-updown-5m-",
-        "sol-updown-5m-",
-        "xrp-updown-5m-",
-    )
-    if not any(market_slug.startswith(prefix) for prefix in slug_prefixes):
-        logging.info("COPY_SKIP reason=slug_not_allowed slug=%s", market_slug)
-        return False
-
-    src_trade_id = None
-    for key in ("target_trade_id", "target_trade", "trade_id", "id", "hash"):
-        candidate = meta.get(key)
-        if candidate:
-            src_trade_id = str(candidate)
-            break
-    if src_trade_id and src_trade_id in copy_insert_failed:
-        logging.info("COPY_INSERT_SKIP_ALREADY_FAILED src_trade=%s", src_trade_id)
-        return False
-
-    logging.info(
-        "COPY_ATTEMPT slug=%s side=%s price=%s size_usd=%s shares=%s",
-        market_slug,
-        side.upper(),
-        entry_price,
-        size_usd,
-        shares,
-    )
-    success, row_id, error = await insert_paper_position_row(
-        STRATEGY_COPY_BOT_ID,
-        STRATEGY_COPY,
-        market_slug,
-        side.lower(),
-        entry_price,
-        size_usd,
-        shares,
-        start_ts,
-    )
-    if not success:
-        if src_trade_id:
-            copy_insert_failed.add(src_trade_id)
-        logging.info(
-            "COPY_PAPER_OPEN_FAILED error=%s slug=%s",
-            error or "unknown",
-            market_slug,
-        )
-        logging.info("COPY_INSERT_FAILED error=%s", error or "unknown")
-        return False
-    logging.info(
-        "COPY_PAPER_OPEN ok=True id=%s slug=%s side=%s size_usd=%s entry=%s",
-        row_id or "unknown",
-        market_slug,
-        side.upper(),
-        size_usd,
-        entry_price,
-    )
-    return True
-
-
-async def scalper_enter_paper(
-    slug: str,
-    side_token: str,
-    entry_price: float,
-    scalper_settings: dict[str, object],
-    yes_ask: float | None,
-    no_ask: float | None,
-) -> None:
-    if not slug:
-        return
-    if slug in scalper_open_by_slug:
-        logging.info("SCALPER_SKIP reason=already_open slug=%s", slug)
-        return
-    size_usd = compute_strategy_size(scalper_settings, STRATEGY_SCALPER, "PAPER")
-    shares = compute_shares_from_size(size_usd, entry_price)
-    if size_usd <= 0 or shares <= 0:
-        logging.info(
-            "SCALPER_SKIP reason=invalid_size slug=%s size=%s shares=%s",
-            slug,
-            size_usd,
-            shares,
-        )
-        return
-    if side_token == "YES":
-        ya = entry_price
-        na = no_ask
-    else:
-        ya = yes_ask
-        na = entry_price
-    start_ts = slug_start_timestamp(slug) if slug and slug != "none" else None
-    if start_ts is None:
-        logging.info("SCALPER_SKIP reason=no_start_ts slug=%s", slug)
-        return
-    logging.info(
-        "SCALPER_EXEC slug=%s token=%s price=%s size_usd=%s shares=%s",
-        slug,
-        side_token,
-        entry_price,
-        size_usd,
-        shares,
-    )
-    success, row_id, error = await insert_paper_position_row(
-        STRATEGY_SCALPER_BOT_ID,
-        STRATEGY_SCALPER,
-        slug,
-        side_token.lower(),
-        entry_price,
-        size_usd,
-        shares,
-        start_ts,
-    )
-    if success:
-        scalper_open_by_slug[slug] = {
-            "token": side_token,
-            "token_id": current_yes_token if side_token == "YES" else current_no_token,
-            "entry_price": entry_price,
-            "start_ts": start_ts,
-            "shares": shares,
-            "size_usd": size_usd,
-            "row_id": row_id,
-        }
-        logging.info(
-            "SCALPER_PAPER_OPEN ok=True id=%s slug=%s side=%s price=%s size_usd=%s shares=%s",
-            row_id or "unknown",
-            slug,
-            side_token,
-            entry_price,
-            size_usd,
-            shares,
-        )
-    else:
-        logging.info(
-            "SCALPER_PAPER_OPEN ok=False error=%s slug=%s",
-            error or "unknown",
-            slug,
-        )
-
-
-def get_copy_open_position(market_slug: str, side: str):
-    try:
-        resp = (
-            supabase.table("paper_positions")
-            .select("id, shares, size_usd, entry_price, start_ts, market_slug, side")
-            .eq("bot_id", STRATEGY_COPY_BOT_ID)
-            .eq("strategy_id", STRATEGY_COPY)
-            .eq("status", "OPEN")
-            .eq("market_slug", market_slug)
-            .eq("side", side)
-            .order("start_ts", {"ascending": True})
-            .limit(1)
-            .execute()
-        )
-        rows = resp.data or []
-        return rows[0] if rows else None
-    except Exception:
-        logging.exception("Failed querying COPY open position slug=%s side=%s", market_slug, side)
-        return None
-
-
 def approx_mid_price():
     ya = best_quotes["yes"]["ask"]
     na = best_quotes["no"]["ask"]
@@ -2523,35 +2226,6 @@ def approx_mid_price():
         return None
     return (ya + na) / 2
 
-
-def close_copy_position(position, exit_price: float, approx: bool):
-    row_id = position.get("id")
-    shares = float_or_none(position.get("shares")) or 0.0
-    size_usd = float_or_none(position.get("size_usd")) or 0.0
-    if shares <= 0 or size_usd <= 0:
-        logging.warning("COPY_CLOSE skip invalid shares/size id=%s shares=%s size=%s", row_id, shares, size_usd)
-        return None
-    payout = shares * exit_price
-    pnl_usd = payout - size_usd
-    updates = {
-        "status": "CLOSED",
-        "end_price": exit_price,
-        "pnl_usd": pnl_usd,
-        "resolved_side": position.get("side"),
-        "closed_at": utc_now_iso(),
-    }
-    try:
-        supabase.table("paper_positions").update(updates).eq("id", row_id).execute()
-        logging.info(
-            "COPY_SELL_MIRROR slug=%s side=%s exit_price=%s pnl_usd=%s approx=%s",
-            position.get("market_slug"),
-            position.get("side"),
-            exit_price,
-            pnl_usd,
-            approx,
-        )
-    except Exception:
-        logging.exception("Failed closing COPY position id=%s", row_id)
 
 def interval_from_prefix(prefix: str) -> int:
     if "-15m" in prefix:
@@ -3023,265 +2697,6 @@ async def fetch_event_by_slug_async(slug):
     return await asyncio.to_thread(fetch_event_by_slug_sync, slug)
 
 
-def track_copy_trade_id(trade_id: str) -> bool:
-    if trade_id in copy_seen_trade_id_set:
-        return False
-    copy_last_seen_trade_ids.append(trade_id)
-    copy_seen_trade_id_set.add(trade_id)
-    if len(copy_last_seen_trade_ids) > 500:
-        old = copy_last_seen_trade_ids.popleft()
-        copy_seen_trade_id_set.discard(old)
-    return True
-
-
-def log_copy_schema_sample(raw: dict[str, object]) -> None:
-    global last_copy_schema_log_ts
-    now_ts = time()
-    if now_ts - last_copy_schema_log_ts < 60:
-        return
-    last_copy_schema_log_ts = now_ts
-    sample_keys = list(raw.keys())
-    sample = {}
-    for key in sample_keys[:5]:
-        value = raw.get(key)
-        sample[key] = str(value)[:120]
-    logging.info(
-        "COPY_FEED_SCHEMA sample_keys=%s sample_item=%s",
-        sample_keys,
-        json.dumps(sample, ensure_ascii=False),
-    )
-
-
-def normalize_copy_trade(raw: object) -> dict[str, object] | None:
-    if not isinstance(raw, dict):
-        logging.info(
-            "COPY_FEED_BAD_ITEM kind=%s value=%s",
-            type(raw).__name__,
-            str(raw)[:100],
-        )
-        return None
-    id_keys = ["id", "tradeId", "txHash", "transactionHash", "hash"]
-    action_keys = ["action", "type", "direction", "sideAction", "tradeType"]
-    side_keys = ["side", "outcome", "outcomeSide", "tokenSide", "betSide"]
-    price_keys = ["price", "avgPrice", "avg_price", "fillPrice", "executionPrice"]
-    size_keys = ["size", "sizeUsd", "amount", "notional", "usdAmount", "value"]
-    slug_keys = ["market_slug", "marketSlug", "slug", "market", "event", "eventSlug", "ticker", "conditionId", "condition_id"]
-    trade_id = next((raw.get(k) for k in id_keys if raw.get(k)), None)
-    action_val = next((raw.get(k) for k in action_keys if raw.get(k)), None)
-    slug = next((raw.get(k) for k in slug_keys if raw.get(k)), None)
-    price = next((float_or_none(raw.get(k)) for k in price_keys if raw.get(k)), None)
-    size = next((float_or_none(raw.get(k)) for k in size_keys if raw.get(k)), None)
-    side = next((raw.get(k) for k in side_keys if raw.get(k)), None)
-    condition_id = raw.get("conditionId") or raw.get("condition_id")
-    asset_val = raw.get("asset") or raw.get("assetId") or raw.get("asset_id")
-    if isinstance(side, str):
-        sval = side.strip().lower()
-        if sval in ("yes", "no"):
-            side = sval.upper()
-        elif "yes" in sval or "up" in sval:
-            side = "YES"
-        elif "no" in sval or "down" in sval:
-            side = "NO"
-        else:
-            side = side.upper()
-    action = (action_val or "").upper()
-    if not action:
-        if raw.get("isBuy"):
-            action = "BUY"
-        elif raw.get("isSell"):
-            action = "SELL"
-        else:
-            for key in ("tradeType", "activityType", "eventType"):
-                value = raw.get(key)
-                if value:
-                    action = str(value).upper()
-                    break
-            if not action:
-                maker_side = raw.get("makerSide")
-                taker_side = raw.get("takerSide")
-                if taker_side and maker_side:
-                    action = "BUY" if str(taker_side).upper() == "BUY" else "SELL"
-                elif maker_side:
-                    action = "BUY" if str(maker_side).upper() == "BUY" else "SELL"
-    if not action:
-        action = "BUY"
-    if not slug and condition_id:
-        slug = str(condition_id)
-        log_copy_schema_sample(raw)
-    if not slug and asset_val:
-        slug = str(asset_val)
-    if not trade_id:
-        components = []
-        if condition_id:
-            components.append(str(condition_id))
-        if asset_val:
-            components.append(str(asset_val))
-        if slug:
-            components.append(str(slug))
-        if side:
-            components.append(str(side))
-        if size is not None:
-            components.append(str(size))
-        proxy_wallet = raw.get("proxyWallet")
-        if proxy_wallet:
-            components.append(str(proxy_wallet))
-        ts = raw.get("timestamp") or raw.get("createdAt")
-        if ts:
-            components.append(str(ts))
-        trade_id = ":".join([c for c in components if c])
-    missing = []
-    if not trade_id:
-        missing.append("id")
-    if not action:
-        missing.append("action")
-    if not slug:
-        missing.append("slug")
-    if price is None:
-        missing.append("price")
-    if size is None:
-        missing.append("size")
-    if missing:
-        sample_keys = list(raw.keys())[:5]
-        logging.info(
-            "COPY_FEED_SKIP missing_fields=%s sample_keys=%s",
-            missing,
-            sample_keys,
-        )
-        return None
-    return {
-        "id": trade_id,
-        "action": action,
-        "side": (side or "").upper(),
-        "price": price,
-        "size": size,
-        "slug": slug,
-        **raw,
-    }
-
-
-def log_schema_probe(url: str, data: object) -> None:
-    global schema_probe_last_ts
-    now_ts = time()
-    if now_ts - schema_probe_last_ts < 60:
-        return
-    schema_probe_last_ts = now_ts
-    if isinstance(data, dict):
-        keys = list(data.keys())
-        logging.info("COPY_SCHEMA url=%s top_keys=%s type=dict", url, keys)
-        list_path: str | None = None
-        list_items: list | None = None
-        for key in ("trades", "data", "items", "activities", "events"):
-            value = data.get(key)
-            if isinstance(value, list):
-                list_path = key
-                list_items = value
-                break
-        if not list_path:
-            for key, value in data.items():
-                if isinstance(value, list):
-                    list_path = key
-                    list_items = value
-                    break
-        if list_path:
-            logging.info(
-                "COPY_SCHEMA items_path=%s items_count=%d",
-                list_path,
-                len(list_items or []),
-            )
-            sample = (list_items or [None])[0]
-            if isinstance(sample, dict):
-                logging.info(
-                    "COPY_SCHEMA sample_item_keys=%s sample_item_str=%s",
-                    list(sample.keys()),
-                    json.dumps(sample)[:500],
-                )
-        else:
-            logging.info("COPY_SCHEMA url=%s items_path=none", url)
-    elif isinstance(data, list):
-        logging.info("COPY_SCHEMA url=%s top_keys=[] type=list items_count=%d", url, len(data))
-        if data:
-            sample = data[0]
-            if isinstance(sample, dict):
-                logging.info(
-                    "COPY_SCHEMA sample_item_keys=%s sample_item_str=%s",
-                    list(sample.keys()),
-                    json.dumps(sample)[:500],
-                )
-            else:
-                logging.info(
-                    "COPY_FEED_BAD_ITEM kind=%s value=%s",
-                    type(sample).__name__,
-                    str(sample)[:100],
-                )
-    else:
-        logging.info("COPY_SCHEMA url=%s type=%s", url, type(data).__name__)
-
-
-def extract_trade_list(data: object) -> tuple[list[object], str | None]:
-    if isinstance(data, list):
-        return data, "root"
-    if isinstance(data, dict):
-        for key in ("trades", "data", "items", "activities", "events"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value, key
-        for key, value in data.items():
-            if isinstance(value, list):
-                return value, key
-    return [], None
-
-
-def fetch_copy_feed(wallet: str) -> list[dict]:
-    if not wallet:
-        return []
-    base = "https://data-api.polymarket.com"
-    candidates = [
-        f"{base}/trades?user={parse.quote(wallet)}&limit=50&takerOnly=false",
-        f"{base}/activity?user={parse.quote(wallet)}&limit=50&type=TRADE",
-        f"{base}/users/{parse.quote(wallet)}/trades?limit=50&offset=0",
-    ]
-    tried_urls = []
-    for url in candidates:
-        logging.info("COPY_FEED_TRY url=%s", url)
-        try:
-            req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
-            with request.urlopen(req, timeout=5) as resp:
-                status = getattr(resp, "status", None)
-                if status not in (None, 200):
-                    tried_urls.append(url)
-                    logging.warning("COPY_FEED_FAIL url=%s err=status=%s", url, status)
-                    continue
-                data = json.loads(resp.read())
-        except Exception as exc:
-            tried_urls.append(url)
-            logging.warning("COPY_FEED_FAIL url=%s err=%s", url, exc)
-            continue
-        log_schema_probe(url, data)
-        trades_raw, path = extract_trade_list(data)
-        if not trades_raw:
-            tried_urls.append(url)
-            logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
-            continue
-        normalized = []
-        for item in trades_raw:
-            entry = normalize_copy_trade(item)
-            if entry:
-                normalized.append(entry)
-        if not normalized:
-            tried_urls.append(url)
-            logging.warning("COPY_FEED_FAIL url=%s err=unexpected schema", url)
-            continue
-        logging.info(
-            "COPY_FEED_OK normalized=%d raw_items=%d path=%s",
-            len(normalized),
-            len(trades_raw),
-            path or "unknown",
-        )
-        return normalized
-    logging.warning("COPY_FEED_UNAVAILABLE tried=%d urls=%s", len(tried_urls), candidates)
-    return []
-
-
 def update_shared_paper_balance(pnl_usd: float, strategy_id: str) -> float:
     if not PAPER_BANKROLL_SHARED_ENABLED:
         return 0.0
@@ -3305,19 +2720,6 @@ def update_shared_paper_balance(pnl_usd: float, strategy_id: str) -> float:
     except Exception:
         logging.exception("Failed updating shared paper_balance_usd")
     return new_balance
-
-    trades = data
-    if isinstance(data, dict):
-        if "trades" in data and isinstance(data["trades"], list):
-            trades = data["trades"]
-        elif "data" in data and isinstance(data["data"], list):
-            trades = data["data"]
-        else:
-            trades = []
-    if not isinstance(trades, list):
-        return []
-    return trades
-
 
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
@@ -3402,134 +2804,6 @@ async def scan_loop():
         except Exception:
             logging.exception("Failed inserting SCAN bot_trades row")
         await asyncio.sleep(60)
-
-
-async def copy_watch_loop():
-    while True:
-        settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
-        if settings["is_enabled"]:
-            target_wallet = settings.get("copy_target_wallet") or COPY_TARGET_WALLET
-            now = int(time())
-            global last_copy_target_log_ts
-            if now - last_copy_target_log_ts >= 60:
-                logging.info("COPY_TARGET wallet=%s", target_wallet)
-                last_copy_target_log_ts = now
-            trades = fetch_copy_feed(target_wallet)
-            for trade in trades:
-                trade_id = trade.get("id") or trade.get("tradeId") or trade.get("hash")
-                if not trade_id:
-                    continue
-                if not track_copy_trade_id(trade_id):
-                    continue
-                market_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("market") or "none"
-                trade_side = (trade.get("outcome") or trade.get("side") or trade.get("symbol") or "").lower()
-                if trade_side not in {"yes", "no"}:
-                    trade_side = (trade.get("type") or "unknown").lower()
-                action = (trade.get("action") or trade.get("type") or trade.get("direction") or "unknown").upper()
-                size = float_or_none(trade.get("size") or trade.get("amount") or trade.get("sizeUsd") or 0.0)
-                price = float_or_none(trade.get("price") or trade.get("executionPrice"))
-                trade_slug = trade.get("slug") or trade.get("marketSlug") or trade.get("market")
-                if current_slug and trade_slug and trade_slug != current_slug:
-                    logging.info(
-                        "COPY_SKIP reason=slug_mismatch trade_slug=%s current_slug=%s",
-                        trade_slug,
-                        current_slug,
-                    )
-                    continue
-                trade_token_id = (
-                    trade.get("asset")
-                    or trade.get("asset_id")
-                    or trade.get("assetId")
-                    or trade.get("token_id")
-                    or trade.get("tokenId")
-                )
-                if trade_token_id not in {current_yes_token, current_no_token}:
-                    logging.info(
-                        "COPY_SKIP reason=token_mismatch trade_token_id=%s yes_token_id=%s no_token_id=%s",
-                        trade_token_id,
-                        current_yes_token,
-                        current_no_token,
-                    )
-                    continue
-                if action == "BUY":
-                    if not price or not market_slug:
-                        continue
-                    if not has_strategy_trade_capacity(
-                        STRATEGY_COPY, 2, settings["max_trades_per_hour"]
-                    ):
-                        logging.info(
-                            "Rate limit reached for COPY max_trades_per_hour=%s",
-                            settings["max_trades_per_hour"],
-                        )
-                        continue
-                    size_usd = compute_strategy_size(settings, STRATEGY_COPY, settings.get("mode", "PAPER").upper())
-                    shares = compute_shares_from_size(size_usd, price)
-                    if size_usd <= 0 or shares <= 0:
-                        logging.warning(
-                            "COPY_BUY_MIRROR skip trade_id=%s size_usd=%s shares=%s",
-                            trade_id,
-                            size_usd,
-                            shares,
-                        )
-                        continue
-                    now_ts_loop = int(time())
-                    if now_ts_loop < copy_insert_backoff_until:
-                        logging.warning(
-                            "COPY_BACKOFF_ACTIVE remaining_s=%s",
-                            copy_insert_backoff_until - now_ts_loop,
-                        )
-                        continue
-                    if not await create_copy_paper_position(
-                        market_slug,
-                        trade_side,
-                        price,
-                        size_usd,
-                        shares,
-                        {
-                            "target_wallet": COPY_TARGET_WALLET,
-                            "target_trade_id": trade_id,
-                            "target_price": price,
-                            "target_size": size,
-                        },
-                    ):
-                        continue
-                    mark_strategy_trade_attempts(STRATEGY_COPY, 2)
-                else:
-                    logging.info(
-                        "COPY_SKIP reason=not_buy action=%s slug=%s size=%s price=%s",
-                        action,
-                        market_slug,
-                        size,
-                        price,
-                    )
-                    logging.info(
-                        "COPY_SELL_SEEN trade_id=%s slug=%s side=%s price=%s size=%s",
-                        trade_id,
-                        market_slug,
-                        trade_side,
-                        price,
-                        size,
-                    )
-                    if market_slug:
-                        position = get_copy_open_position(market_slug, trade_side)
-                        if position:
-                            exit_price = price
-                            approx = False
-                            if exit_price is None:
-                                exit_price = approx_mid_price() or price or 0.0
-                                approx = True
-                            if exit_price and exit_price > 0:
-                                close_copy_position(position, exit_price, approx)
-                logging.info(
-                    "COPY_FEED trade_id=%s side=%s action=%s size=%s price=%s market_slug=%s",
-                    trade_id,
-                    trade_side,
-                    action,
-                    size,
-                    price,
-                    market_slug,
-                )
-        await asyncio.sleep(10)
 
 
 def get_paper_bot_id(strategy_id: str) -> str:
@@ -3707,81 +2981,6 @@ async def create_paper_strategy_position(
         shares,
         start_ts,
     )
-
-
-async def paper_copy_enter(
-    copy_settings: dict[str, object],
-    side_token: str,
-    price: float,
-    src_trade_id: str,
-) -> None:
-    slug = current_slug or "none"
-    size_usd = compute_strategy_size(copy_settings, STRATEGY_COPY, "PAPER")
-    if size_usd <= 0:
-        logging.info(
-            "COPY_SKIP reason=invalid_size slug=%s size=%s price=%s",
-            slug, size_usd, price,
-        )
-        logging.info(
-            "STRAT_DECISION strategy=COPY enabled=%s arm_live=%s mode=PAPER action=skip reason=invalid_size slug=%s",
-            copy_settings["is_enabled"], copy_settings["arm_live"], slug,
-        )
-        return
-    shares = compute_shares_from_size(size_usd, price)
-    if shares <= 0:
-        logging.info(
-            "COPY_SKIP reason=invalid_size slug=%s size=%s price=%s shares=%s",
-            slug, size_usd, price, shares,
-        )
-        logging.info(
-            "STRAT_DECISION strategy=COPY enabled=%s arm_live=%s mode=PAPER action=skip reason=invalid_size slug=%s",
-            copy_settings["is_enabled"], copy_settings["arm_live"], slug,
-        )
-        return
-    start_ts = slug_start_timestamp(current_slug) if current_slug else None
-    if start_ts is None:
-        logging.info("COPY_SKIP reason=no_start_ts slug=%s", slug)
-        return
-    slug_prefixes = ("btc-updown-5m-", "eth-updown-5m-", "sol-updown-5m-", "xrp-updown-5m-")
-    if current_slug and not any(current_slug.startswith(p) for p in slug_prefixes):
-        logging.info("COPY_SKIP reason=slug_not_allowed slug=%s", slug)
-        logging.info(
-            "STRAT_DECISION strategy=COPY enabled=%s arm_live=%s mode=PAPER action=skip reason=slug_not_allowed slug=%s",
-            copy_settings["is_enabled"], copy_settings["arm_live"], slug,
-        )
-        return
-    logging.info(
-        "COPY_ATTEMPT allowed=True reason=buy_matched slug=%s side=%s price=%s size_usd=%s shares=%s src_trade=%s",
-        slug, side_token, price, size_usd, shares, src_trade_id,
-    )
-    success, row_id, error = await insert_paper_position_row(
-        STRATEGY_COPY_BOT_ID,
-        STRATEGY_COPY,
-        current_slug or slug,
-        side_token.lower(),
-        price,
-        size_usd,
-        shares,
-        start_ts,
-    )
-    if success:
-        logging.info(
-            "COPY_PAPER_OPEN ok=True id=%s slug=%s side=%s price=%s size_usd=%s shares=%s",
-            row_id or "unknown", slug, side_token, price, size_usd, shares,
-        )
-        logging.info(
-            "STRAT_DECISION strategy=COPY enabled=%s arm_live=%s mode=PAPER action=trade reason=buy_matched slug=%s",
-            copy_settings["is_enabled"], copy_settings["arm_live"], slug,
-        )
-    else:
-        logging.info(
-            "COPY_PAPER_OPEN ok=False error=%s slug=%s",
-            error or "unknown", slug,
-        )
-        logging.info(
-            "STRAT_DECISION strategy=COPY enabled=%s arm_live=%s mode=PAPER action=skip reason=insert_failed slug=%s",
-            copy_settings["is_enabled"], copy_settings["arm_live"], slug,
-        )
 
 
 def fetch_bot_settings_row() -> dict[str, object] | None:
@@ -4417,75 +3616,13 @@ def submit_order(
 async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
     global last_live_positions_snapshot_ts, last_proof_tick_ts
-    global last_copy_config_log_ts, last_scalper_config_log_ts
-    global last_copy_proof_ts, last_scalper_proof_ts
-    logging.info("HEARTBEAT_LOOP_OK copy_config_log_ts=%s", last_copy_config_log_ts)
+    logging.info("HEARTBEAT_LOOP_OK")
 
     while True:
         now_ts = int(time())
         sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
         fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
-        copy_settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
-        scalper_settings = read_strategy_settings(STRATEGY_SCALPER_BOT_ID)
         trade_mode = current_global_trade_mode()
-        copy_settings = read_strategy_settings(STRATEGY_COPY_BOT_ID)
-        scalper_settings = read_strategy_settings(STRATEGY_SCALPER_BOT_ID)
-        log_rate_limited(
-            f"strategy_settings_{STRATEGY_COPY_BOT_ID}",
-            LOG_THROTTLE_SECONDS,
-            "Loaded strategy settings bot_id=%s is_enabled=%s arm_live=%s",
-            STRATEGY_COPY_BOT_ID,
-            copy_settings["is_enabled"],
-            copy_settings["arm_live"],
-            value=(copy_settings["is_enabled"], copy_settings["arm_live"]),
-        )
-        log_rate_limited(
-            f"strategy_settings_{STRATEGY_SCALPER_BOT_ID}",
-            LOG_THROTTLE_SECONDS,
-            "Loaded strategy settings bot_id=%s is_enabled=%s arm_live=%s",
-            STRATEGY_SCALPER_BOT_ID,
-            scalper_settings["is_enabled"],
-            scalper_settings["arm_live"],
-            value=(scalper_settings["is_enabled"], scalper_settings["arm_live"]),
-        )
-        if now_ts - last_copy_config_log_ts >= 60:
-            last_copy_config_log_ts = now_ts
-            logging.info(
-                "COPY_CONFIG enabled=%s arm_live=%s target=%s mode=%s max_trades_hr=%s trade_size=%s",
-                copy_settings["is_enabled"],
-                copy_settings["arm_live"],
-                copy_settings.get("copy_target_wallet") or "none",
-                copy_settings.get("copy_mode") or "Mirror buys+sells",
-                copy_settings["max_trades_per_hour"],
-                copy_settings["trade_size_usd"],
-            )
-        if now_ts - last_scalper_config_log_ts >= 60:
-            last_scalper_config_log_ts = now_ts
-            logging.info(
-                "SCALPER_CONFIG enabled=%s arm_live=%s entry<=%s tp=%s sl=%s hold=%s size=%s max_trades_hr=%s",
-                scalper_settings["is_enabled"],
-                scalper_settings["arm_live"],
-                scalper_settings.get("entry_cheap_price"),
-                scalper_settings.get("take_profit_delta"),
-                scalper_settings.get("stop_loss_delta"),
-                scalper_settings.get("max_hold_seconds"),
-                scalper_settings["trade_size_usd"],
-                scalper_settings["max_trades_per_hour"],
-            )
-        if now_ts - last_copy_proof_ts >= 30:
-            last_copy_proof_ts = now_ts
-            logging.info(
-                "COPY_PROOF enabled=%s arm_live=%s",
-                copy_settings["is_enabled"],
-                copy_settings["arm_live"],
-            )
-        if now_ts - last_scalper_proof_ts >= 30:
-            last_scalper_proof_ts = now_ts
-            logging.info(
-                "SCALPER_PROOF enabled=%s arm_live=%s",
-                scalper_settings["is_enabled"],
-                scalper_settings["arm_live"],
-            )
         live_master_enabled = read_live_master_enabled()
         is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"]
         mode = fastloop_settings["mode"]
@@ -4495,10 +3632,10 @@ async def heartbeat_loop(client: ClobClient | None):
         if now_ts - last_proof_tick_ts >= 60:
             last_proof_tick_ts = now_ts
             logging.info(
-                "PROOF_TICK slug=%s copy_enabled=%s scalper_enabled=%s",
+                "PROOF_TICK slug=%s sniper_enabled=%s fastloop_enabled=%s",
                 slug_field,
-                copy_settings["is_enabled"],
-                scalper_settings["is_enabled"],
+                sniper_settings["is_enabled"],
+                fastloop_settings["is_enabled"],
             )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
@@ -4518,70 +3655,6 @@ async def heartbeat_loop(client: ClobClient | None):
                 fastloop_settings["arm_live"],
                 slug_field,
             )
-        if not copy_settings["is_enabled"]:
-            logging.info(
-                "STRAT_DECISION strategy=COPY enabled=False arm_live=%s mode=PAPER action=skip reason=disabled slug=%s",
-                copy_settings["arm_live"], slug_field,
-            )
-        if client and copy_settings["is_enabled"]:
-            matches = poll_copy_matches(
-                client,
-                copy_settings.get("copy_target_wallet"),
-                current_yes_token,
-                current_no_token,
-            )
-            example_id = matches[0].get("id") if matches else "none"
-            logging.info(
-                "COPY_MATCH slug=%s n=%s example_id=%s",
-                slug_field,
-                len(matches),
-                example_id,
-            )
-            if not matches:
-                logging.info(
-                    "STRAT_DECISION strategy=COPY enabled=True arm_live=%s mode=PAPER action=skip reason=no_matches slug=%s",
-                    copy_settings["arm_live"], slug_field,
-                )
-            for trade in matches:
-                trade_side = extract_trade_side(trade)
-                if not trade_side or trade_side != "BUY":
-                    logging.info(
-                        "COPY_SKIP reason=not_buy id=%s",
-                        trade.get("id") or trade.get("tradeId") or "unknown",
-                    )
-                    continue
-                asset_id = (
-                    trade.get("asset_id")
-                    or trade.get("assetId")
-                    or trade.get("token_id")
-                    or trade.get("tokenId")
-                )
-                if asset_id == current_yes_token:
-                    side_token = "YES"
-                elif asset_id == current_no_token:
-                    side_token = "NO"
-                else:
-                    logging.info(
-                        "COPY_SKIP reason=no_match id=%s asset=%s",
-                        trade.get("id") or trade.get("tradeId") or "unknown",
-                        asset_id,
-                    )
-                    continue
-                price = _safe_parse_float(
-                    trade.get("price") or trade.get("executionPrice") or trade.get("execution_price")
-                )
-                if price is None:
-                    logging.info(
-                        "COPY_SKIP reason=no_price id=%s",
-                        trade.get("id") or trade.get("tradeId") or "unknown",
-                    )
-                    continue
-                await paper_copy_enter(
-                    copy_settings,
-                    side_token,
-                    price,
-                    trade.get("id") or trade.get("tradeId") or "unknown",
-                )
         if (
             live_master_enabled
             and arm_live_active
@@ -4628,110 +3701,6 @@ async def heartbeat_loop(client: ClobClient | None):
                 current_slug = forced_slug
                 continue
             logging.warning("STALE_SLUG_ROTATE_FAILED slug=%s", old_slug)
-        scalper_entry_threshold = float_or_none(scalper_settings.get("entry_cheap_price"))
-        if not scalper_settings["is_enabled"]:
-            logging.info(
-                "STRAT_DECISION strategy=SCALPER enabled=False arm_live=%s mode=PAPER action=skip reason=disabled slug=%s",
-                scalper_settings["arm_live"], slug_field,
-            )
-        elif scalper_entry_threshold is None:
-            logging.info(
-                "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=skip reason=missing_setting slug=%s",
-                scalper_settings["arm_live"], slug_field,
-            )
-            logging.info("SCALPER_SKIP reason=missing_setting slug=%s", slug_field)
-        elif current_slug:
-            yes_price = best_quotes["yes"]["ask"]
-            no_price = best_quotes["no"]["ask"]
-            logging.info(
-                "SCALPER_SIGNAL yes_ask=%s no_ask=%s entry_cheap_price=%s chosen=%s slug=%s",
-                fmt(yes_price),
-                fmt(no_price),
-                scalper_entry_threshold,
-                "YES" if (yes_price is not None and yes_price <= scalper_entry_threshold) else
-                "NO" if (no_price is not None and no_price <= scalper_entry_threshold) else "NONE",
-                slug_field,
-            )
-            if current_slug in scalper_open_by_slug:
-                logging.info("SCALPER_SKIP reason=already_open slug=%s", current_slug)
-                logging.info(
-                    "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=skip reason=already_open slug=%s",
-                    scalper_settings["arm_live"], slug_field,
-                )
-            else:
-                sc_entry_price = None
-                sc_side_token = None
-                if yes_price is not None and yes_price <= scalper_entry_threshold:
-                    sc_entry_price = yes_price
-                    sc_side_token = "YES"
-                elif no_price is not None and no_price <= scalper_entry_threshold:
-                    sc_entry_price = no_price
-                    sc_side_token = "NO"
-                if sc_entry_price is None:
-                    logging.info("SCALPER_SKIP reason=no_signal slug=%s", current_slug)
-                    logging.info(
-                        "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=skip reason=no_signal slug=%s",
-                        scalper_settings["arm_live"], slug_field,
-                    )
-                else:
-                    sc_size_usd = compute_strategy_size(
-                        scalper_settings,
-                        STRATEGY_SCALPER,
-                        scalper_settings.get("mode", "PAPER"),
-                    )
-                    sc_shares = compute_shares_from_size(sc_size_usd, sc_entry_price)
-                    if sc_size_usd <= 0 or sc_shares <= 0 or start_ts is None:
-                        logging.info(
-                            "SCALPER_SKIP reason=invalid_size slug=%s size=%s shares=%s",
-                            current_slug, sc_size_usd, sc_shares,
-                        )
-                        logging.info(
-                            "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=skip reason=invalid_size slug=%s",
-                            scalper_settings["arm_live"], slug_field,
-                        )
-                    else:
-                        logging.info(
-                            "SCALPER_EXEC slug=%s token=%s price=%s size_usd=%s shares=%s",
-                            current_slug, sc_side_token, sc_entry_price, sc_size_usd, sc_shares,
-                        )
-                        sc_ok, sc_row_id, sc_error = await insert_paper_position_row(
-                            STRATEGY_SCALPER_BOT_ID,
-                            STRATEGY_SCALPER,
-                            current_slug,
-                            (sc_side_token or "YES").lower(),
-                            sc_entry_price,
-                            sc_size_usd,
-                            sc_shares,
-                            start_ts,
-                        )
-                        if sc_ok:
-                            scalper_open_by_slug[current_slug] = {
-                                "token": sc_side_token,
-                                "token_id": current_yes_token if sc_side_token == "YES" else current_no_token,
-                                "entry_price": sc_entry_price,
-                                "start_ts": start_ts,
-                                "shares": sc_shares,
-                                "size_usd": sc_size_usd,
-                                "row_id": sc_row_id,
-                            }
-                            logging.info(
-                                "SCALPER_PAPER_OPEN ok=True id=%s slug=%s side=%s price=%s size_usd=%s shares=%s",
-                                sc_row_id or "unknown", current_slug, sc_side_token,
-                                sc_entry_price, sc_size_usd, sc_shares,
-                            )
-                            logging.info(
-                                "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=trade reason=signal slug=%s",
-                                scalper_settings["arm_live"], slug_field,
-                            )
-                        else:
-                            logging.info(
-                                "SCALPER_PAPER_OPEN ok=False error=%s slug=%s",
-                                sc_error or "unknown", current_slug,
-                            )
-                            logging.info(
-                                "STRAT_DECISION strategy=SCALPER enabled=True arm_live=%s mode=PAPER action=skip reason=insert_failed slug=%s",
-                                scalper_settings["arm_live"], slug_field,
-                            )
         entry_cutoff_active = (
             time_to_end is not None and time_to_end <= ENTRY_CUTOFF_SECONDS
         )
@@ -5036,8 +4005,6 @@ async def paper_settlement_loop():
                     [
                         STRATEGY_FASTLOOP_BOT_ID,
                         STRATEGY_SNIPER_BOT_ID,
-                        STRATEGY_COPY_BOT_ID,
-                        STRATEGY_SCALPER_BOT_ID,
                         BOT_ID,
                     ],
                 )
@@ -5051,13 +4018,14 @@ async def paper_settlement_loop():
             rows = []
 
             if rows:
-                counts = {bot_id: sum(1 for r in rows if r.get("bot_id") == bot_id) for bot_id in [
-                    STRATEGY_FASTLOOP_BOT_ID,
-                    STRATEGY_SNIPER_BOT_ID,
-                    STRATEGY_COPY_BOT_ID,
-                    STRATEGY_SCALPER_BOT_ID,
-                    BOT_ID,
-                ]}
+                counts = {
+                    bot_id: sum(1 for r in rows if r.get("bot_id") == bot_id)
+                    for bot_id in [
+                        STRATEGY_FASTLOOP_BOT_ID,
+                        STRATEGY_SNIPER_BOT_ID,
+                        BOT_ID,
+                    ]
+                }
                 logging.info(
                     "Found OPEN paper_positions %s total=%d",
                     ", ".join(f"{bot_id}={counts[bot_id]}" for bot_id in counts),
@@ -5172,7 +4140,6 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("paper_settlement_loop", paper_settlement_loop)))
     tasks.append(asyncio.create_task(_run_forever("live_balance_loop", live_balance_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
-    tasks.append(asyncio.create_task(_run_forever("copy_watch_loop", copy_watch_loop)))
     tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
     restart_ws_task()
     try:
