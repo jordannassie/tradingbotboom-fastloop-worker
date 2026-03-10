@@ -51,8 +51,10 @@ WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
+STRATEGY_CANDLE_BIAS = "CANDLE_BIAS"
 STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
 STRATEGY_SNIPER_BOT_ID = "paper_sniper"
+STRATEGY_CANDLE_BIAS_BOT_ID = "paper_candle_bias"
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
 LIVE_MASTER_BOT_ID = "live"
@@ -60,6 +62,7 @@ LIVE_MASTER_BOT_ID = "live"
 STRATEGY_TO_BOT_ID = {
     STRATEGY_FASTLOOP: STRATEGY_FASTLOOP_BOT_ID,
     STRATEGY_SNIPER: STRATEGY_SNIPER_BOT_ID,
+    STRATEGY_CANDLE_BIAS: STRATEGY_CANDLE_BIAS_BOT_ID,
 }
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -91,6 +94,9 @@ FAST_MAX_HOLD_SECONDS = int(os.getenv("FAST_MAX_HOLD_SECONDS", "120"))
 SNIPE_TP_CENTS = float(os.getenv("SNIPE_TP_CENTS", "0.1"))
 SNIPE_SL_CENTS = float(os.getenv("SNIPE_SL_CENTS", "0.1"))
 SNIPE_MAX_HOLD_SECONDS = int(os.getenv("SNIPE_MAX_HOLD_SECONDS", "240"))
+CANDLE_BIAS_TP_CENTS = float(os.getenv("CANDLE_BIAS_TP_CENTS", "0.07"))
+CANDLE_BIAS_SL_CENTS = float(os.getenv("CANDLE_BIAS_SL_CENTS", "0.07"))
+CANDLE_BIAS_MAX_HOLD_SECONDS = int(os.getenv("CANDLE_BIAS_MAX_HOLD_SECONDS", "180"))
 LOW_FUNDS_SKIP_USD = float(os.getenv("LOW_FUNDS_SKIP_USD", "4.0"))
 LIVE_MIN_AVAILABLE_USD = float(os.getenv("LIVE_MIN_AVAILABLE_USD", "5.0"))
 PAPER_MIN_AVAILABLE_USD = float(os.getenv("PAPER_MIN_AVAILABLE_USD", "5.0"))
@@ -249,6 +255,7 @@ refresh_asset_map()
 strategy_trade_timestamps = {
     STRATEGY_SNIPER: deque(),
     STRATEGY_FASTLOOP: deque(),
+    STRATEGY_CANDLE_BIAS: deque(),
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
@@ -552,6 +559,13 @@ def tpsl_reason(strategy: str, entry_price: float, mark_price: float, held_secon
         if -delta >= SNIPE_SL_CENTS:
             return "SL"
         if held_seconds >= SNIPE_MAX_HOLD_SECONDS:
+            return "MAX_HOLD"
+    if strategy == STRATEGY_CANDLE_BIAS:
+        if delta >= CANDLE_BIAS_TP_CENTS:
+            return "TP"
+        if -delta >= CANDLE_BIAS_SL_CENTS:
+            return "SL"
+        if held_seconds >= CANDLE_BIAS_MAX_HOLD_SECONDS:
             return "MAX_HOLD"
     return None
 
@@ -1911,6 +1925,9 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         bias_mode = (parsed_strategy.get("bias_mode") or "off").lower()
         if bias_mode not in ("off", "yes_only", "no_only"):
             bias_mode = "off"
+        bias_side = (parsed_strategy.get("bias_side") or "yes").lower()
+        if bias_side not in ("yes", "no"):
+            bias_side = "yes"
         settings = {
             "bot_id": bot_id,
             "is_enabled": bool(row.get("is_enabled")),
@@ -1923,6 +1940,7 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "strategy_settings": parsed_strategy,
             "direction_mode": direction_mode,
             "bias_mode": bias_mode,
+            "bias_side": bias_side,
         }
         log_rate_limited(
             f"strategy_settings_{bot_id}",
@@ -2380,14 +2398,17 @@ async def execute_strategy(
     client: ClobClient | None,
     live_master_enabled: bool,
     skip_live: bool = False,
+    side_override: str | None = None,
 ) -> bool:
     if not current_slug:
         logging.warning("Missing slug; skipping strategy %s", strategy_id)
         return False
-    normal_side = "yes" if ya <= na else "no"
-    direction_mode = settings.get("direction_mode", "normal").lower() if strategy_id == STRATEGY_SNIPER else "normal"
+    normal_side = side_override if side_override in ("yes", "no") else ("yes" if ya <= na else "no")
+    direction_mode = settings.get("direction_mode", "normal").lower() if strategy_id in (STRATEGY_SNIPER, STRATEGY_CANDLE_BIAS) else "normal"
     final_side = normal_side
     if strategy_id == STRATEGY_SNIPER and direction_mode == "reverse":
+        final_side = "no" if normal_side == "yes" else "yes"
+    if strategy_id == STRATEGY_CANDLE_BIAS and direction_mode == "reverse":
         final_side = "no" if normal_side == "yes" else "yes"
     slug_field = current_slug or "none"
     if strategy_id == STRATEGY_SNIPER:
@@ -2409,6 +2430,8 @@ async def execute_strategy(
         )
         if not allowed_by_bias:
             return False
+    if strategy_id == STRATEGY_CANDLE_BIAS:
+        log_candle_bias_direction(slug_field, settings.get("bias_side", "yes"), direction_mode, normal_side, final_side)
     entry_price = ya if final_side == "yes" else na
     if entry_price is None or entry_price <= 0:
         logging.warning("Invalid entry price for %s slug=%s", strategy_id, current_slug)
@@ -2554,6 +2577,7 @@ async def execute_strategy(
                     size_usd,
                     shares,
                     settings["mode"],
+                    side_override=final_side,
                 )
 
     mark_strategy_trade_attempts(strategy_id, 2)
@@ -2696,6 +2720,23 @@ def log_sniper_direction(
     logging.info(
         "SNIPER_DIRECTION slug=%s direction_mode=%s normal_side=%s final_side=%s",
         slug,
+        direction_mode,
+        normal_side,
+        final_side,
+    )
+
+
+def log_candle_bias_direction(
+    slug: str,
+    bias_side: str,
+    direction_mode: str,
+    normal_side: str,
+    final_side: str,
+):
+    logging.info(
+        "CANDLE_BIAS_DIRECTION slug=%s bias_side=%s direction_mode=%s normal_side=%s final_side=%s",
+        slug,
+        bias_side,
         direction_mode,
         normal_side,
         final_side,
@@ -3000,6 +3041,7 @@ async def create_paper_strategy_position(
     size_usd: float,
     shares: float,
     mode: str,
+    side_override: str | None = None,
 ) -> None:
     if not current_slug:
         logging.warning("Missing slug for strategy %s paper decision", strategy_id)
@@ -3017,7 +3059,7 @@ async def create_paper_strategy_position(
     if ya is None or na is None:
         return
 
-    paper_side = "yes" if ya <= na else "no"
+    paper_side = side_override if side_override in ("yes", "no") else ("yes" if ya <= na else "no")
     entry_price = ya if paper_side == "yes" else na
     start_ts = slug_start_timestamp(current_slug)
     if entry_price is None or entry_price <= 0 or start_ts is None:
@@ -3705,20 +3747,22 @@ async def heartbeat_loop(client: ClobClient | None):
         now_ts = int(time())
         sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
         fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
+        candle_bias_settings = read_strategy_settings(STRATEGY_CANDLE_BIAS_BOT_ID)
         trade_mode = current_global_trade_mode()
         live_master_enabled = read_live_master_enabled()
-        is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"]
+        is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"] or candle_bias_settings["is_enabled"]
         mode = fastloop_settings["mode"]
         edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
-        arm_live_active = sniper_settings["arm_live"] or fastloop_settings["arm_live"]
+        arm_live_active = sniper_settings["arm_live"] or fastloop_settings["arm_live"] or candle_bias_settings["arm_live"]
         slug_field = current_slug or "none"
         if now_ts - last_proof_tick_ts >= 60:
             last_proof_tick_ts = now_ts
             logging.info(
-                "PROOF_TICK slug=%s sniper_enabled=%s fastloop_enabled=%s",
+                "PROOF_TICK slug=%s sniper_enabled=%s fastloop_enabled=%s candle_bias_enabled=%s",
                 slug_field,
                 sniper_settings["is_enabled"],
                 fastloop_settings["is_enabled"],
+                candle_bias_settings["is_enabled"],
             )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
@@ -3770,7 +3814,7 @@ async def heartbeat_loop(client: ClobClient | None):
             live_master_enabled
             and client
             and current_slug
-            and (sniper_settings["arm_live"] or fastloop_settings["arm_live"])
+            and (sniper_settings["arm_live"] or fastloop_settings["arm_live"] or candle_bias_settings["arm_live"])
             and time_to_end is not None
         ):
             if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
@@ -3830,7 +3874,8 @@ async def heartbeat_loop(client: ClobClient | None):
         status = "ENABLED" if is_enabled_combined else "DISABLED"
         msg = (
             f"ya={fmt(ya)} na={fmt(na)} total={fmt(total_ask)} edge={fmt(edge)} "
-            f"sniper_enabled={sniper_settings['is_enabled']} fastloop_enabled={fastloop_settings['is_enabled']}"
+            f"sniper_enabled={sniper_settings['is_enabled']} fastloop_enabled={fastloop_settings['is_enabled']} "
+            f"candle_bias_enabled={candle_bias_settings['is_enabled']}"
         )
 
         if rotating:
@@ -3874,6 +3919,7 @@ async def heartbeat_loop(client: ClobClient | None):
             and (
                 (sniper_settings["mode"] == "PAPER")
                 or (fastloop_settings["mode"] == "PAPER")
+                or (candle_bias_settings["mode"] == "PAPER")
                 or KILL_SWITCH
             )
         )
@@ -4143,6 +4189,94 @@ async def heartbeat_loop(client: ClobClient | None):
                         live_master_enabled,
                         _reason_to_result(fastloop_reason),
                     )
+
+        # --- CANDLE_BIAS: independent of edge, fires when enabled + prices available ---
+        candle_bias_condition = (
+            candle_bias_settings["is_enabled"]
+            and ya is not None
+            and na is not None
+            and not paused_due_to_errors
+            and not paused_due_to_max_trades
+            and current_yes_token
+            and current_no_token
+            and not rotating
+            and not entry_cutoff_active
+        )
+        if candle_bias_condition:
+            candle_bias_capacity = has_strategy_trade_capacity(
+                STRATEGY_CANDLE_BIAS, 2, candle_bias_settings["max_trades_per_hour"]
+            )
+            if not candle_bias_capacity:
+                logging.info(
+                    "CANDLE_BIAS_SKIP strategy=%s reason=rate_limited slug=%s",
+                    STRATEGY_CANDLE_BIAS,
+                    slug_field,
+                )
+                log_market_decision(
+                    STRATEGY_CANDLE_BIAS,
+                    slug_field,
+                    ya,
+                    na,
+                    total_ask,
+                    edge,
+                    candle_bias_settings["is_enabled"],
+                    candle_bias_settings["arm_live"],
+                    live_master_enabled,
+                    "SKIP_RATE_LIMIT",
+                )
+            elif should_skip_low_funds(candle_bias_settings["paper_balance_usd"]):
+                logging.info(
+                    "CANDLE_BIAS_SKIP strategy=%s reason=low_funds slug=%s",
+                    STRATEGY_CANDLE_BIAS,
+                    slug_field,
+                )
+                log_market_decision(
+                    STRATEGY_CANDLE_BIAS,
+                    slug_field,
+                    ya,
+                    na,
+                    total_ask,
+                    edge,
+                    candle_bias_settings["is_enabled"],
+                    candle_bias_settings["arm_live"],
+                    live_master_enabled,
+                    "SKIP_LOW_FUNDS",
+                )
+            else:
+                cb_bias_side = candle_bias_settings.get("bias_side", "yes")
+                cb_direction_mode = candle_bias_settings.get("direction_mode", "normal")
+                cb_final_side = cb_bias_side
+                if cb_direction_mode == "reverse":
+                    cb_final_side = "no" if cb_bias_side == "yes" else "yes"
+                candle_bias_traded = await execute_strategy(
+                    STRATEGY_CANDLE_BIAS,
+                    "CANDLE_BIAS",
+                    candle_bias_settings,
+                    edge or 0.0,
+                    total_ask,
+                    ya,
+                    na,
+                    client,
+                    live_master_enabled,
+                    skip_live=force_exit_triggered,
+                    side_override=cb_final_side,
+                )
+                log_market_decision(
+                    STRATEGY_CANDLE_BIAS,
+                    slug_field,
+                    ya,
+                    na,
+                    total_ask,
+                    edge,
+                    candle_bias_settings["is_enabled"],
+                    candle_bias_settings["arm_live"],
+                    live_master_enabled,
+                    "ENTER_LIVE"
+                    if candle_bias_traded and live_master_enabled and candle_bias_settings["arm_live"]
+                    else "ENTER_PAPER" if candle_bias_traded
+                    else "SKIP_OTHER",
+                )
+
         await asyncio.sleep(5)
         if rotating:
             rotating = False
@@ -4162,6 +4296,7 @@ async def paper_settlement_loop():
                     [
                         STRATEGY_FASTLOOP_BOT_ID,
                         STRATEGY_SNIPER_BOT_ID,
+                        STRATEGY_CANDLE_BIAS_BOT_ID,
                         BOT_ID,
                     ],
                 )
@@ -4180,6 +4315,7 @@ async def paper_settlement_loop():
                     for bot_id in [
                         STRATEGY_FASTLOOP_BOT_ID,
                         STRATEGY_SNIPER_BOT_ID,
+                        STRATEGY_CANDLE_BIAS_BOT_ID,
                         BOT_ID,
                     ]
                 }
