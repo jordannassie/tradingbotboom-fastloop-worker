@@ -1908,6 +1908,9 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         direction_mode = (parsed_strategy.get("direction_mode") or "normal").lower()
         if direction_mode not in ("normal", "reverse"):
             direction_mode = "normal"
+        bias_mode = (parsed_strategy.get("bias_mode") or "off").lower()
+        if bias_mode not in ("off", "yes_only", "no_only"):
+            bias_mode = "off"
         settings = {
             "bot_id": bot_id,
             "is_enabled": bool(row.get("is_enabled")),
@@ -1919,6 +1922,7 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "arm_live": bool(row.get("arm_live")),
             "strategy_settings": parsed_strategy,
             "direction_mode": direction_mode,
+            "bias_mode": bias_mode,
         }
         log_rate_limited(
             f"strategy_settings_{bot_id}",
@@ -2385,8 +2389,26 @@ async def execute_strategy(
     final_side = normal_side
     if strategy_id == STRATEGY_SNIPER and direction_mode == "reverse":
         final_side = "no" if normal_side == "yes" else "yes"
+    slug_field = current_slug or "none"
     if strategy_id == STRATEGY_SNIPER:
-        log_sniper_direction(current_slug or "none", direction_mode, normal_side, final_side)
+        log_sniper_direction(slug_field, direction_mode, normal_side, final_side)
+        bias_mode = settings.get("bias_mode", "off").lower()
+        if bias_mode not in ("off", "yes_only", "no_only"):
+            bias_mode = "off"
+        allowed_by_bias = True
+        if bias_mode == "yes_only" and final_side != "yes":
+            allowed_by_bias = False
+        elif bias_mode == "no_only" and final_side != "no":
+            allowed_by_bias = False
+        log_sniper_bias(
+            slug_field,
+            direction_mode,
+            bias_mode,
+            final_side,
+            "ALLOW" if allowed_by_bias else "SKIP_BIAS_MODE",
+        )
+        if not allowed_by_bias:
+            return False
     entry_price = ya if final_side == "yes" else na
     if entry_price is None or entry_price <= 0:
         logging.warning("Invalid entry price for %s slug=%s", strategy_id, current_slug)
@@ -2644,6 +2666,23 @@ def log_market_decision(
         enabled,
         arm_live,
         live_master_enabled,
+        result,
+    )
+
+
+def log_sniper_bias(
+    slug: str,
+    direction_mode: str,
+    bias_mode: str,
+    final_side: str,
+    result: str,
+):
+    logging.info(
+        "SNIPER_BIAS slug=%s direction_mode=%s bias_mode=%s final_side=%s result=%s",
+        slug,
+        direction_mode,
+        bias_mode,
+        final_side,
         result,
     )
 
