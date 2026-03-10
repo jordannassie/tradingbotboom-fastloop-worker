@@ -263,7 +263,6 @@ live_allowance_cache: float | None = None
 last_live_bankroll_log_ts = 0
 last_live_order_400_body: str | None = None
 last_live_bankroll_refresh_ts = 0
-live_wallet_ok = False
 live_signer_address: str | None = None
 live_funder_address: str | None = None
 last_live_positions_snapshot_ts = 0
@@ -1715,31 +1714,20 @@ def log_clob_balance_allowance_response(resp, client: ClobClient | None):
 
 
 def derive_wallet_addresses(client: ClobClient | None) -> bool:
-    global live_wallet_ok, live_signer_address, live_funder_address
+    global live_signer_address, live_funder_address
     if not client:
         return False
     signer = client.get_address()
     funder_addr = FUNDER if FUNDER else signer
     live_signer_address = signer
     live_funder_address = funder_addr
-    expected = (LIVE_WALLET_ADDRESS_EXPECTED or "").lower()
-    match = False
-    if expected:
-        match = any(
-            addr and addr.lower() == expected
-            for addr in (live_signer_address, live_funder_address)
-        )
-    else:
-        match = True
     logging.info(
-        "LIVE_WALLET_CHECK expected=%s signer=%s funder=%s match=%s",
+        "LIVE_WALLET_CHECK expected=%s signer=%s funder=%s",
         LIVE_WALLET_ADDRESS_EXPECTED,
         live_signer_address,
         live_funder_address,
-        match,
     )
-    live_wallet_ok = match
-    return match
+    return True
 
 
 def refresh_live_bankroll_usd_if_needed(
@@ -1747,14 +1735,6 @@ def refresh_live_bankroll_usd_if_needed(
 ) -> tuple[float | None, float | None]:
     global last_live_bankroll_refresh_ts, live_balance_cache, live_allowance_cache
     now_ts = int(time())
-    if not live_wallet_ok:
-        logging.warning(
-            "LIVE_BLOCK_WALLET_MISMATCH expected=%s signer=%s funder=%s",
-            LIVE_WALLET_ADDRESS_EXPECTED,
-            live_signer_address,
-            live_funder_address,
-        )
-        return live_balance_cache, live_allowance_cache
     if not force and now_ts - last_live_bankroll_refresh_ts < LIVE_BANKROLL_REFRESH_SECONDS:
         return live_balance_cache, live_allowance_cache
     last_live_bankroll_refresh_ts = now_ts
