@@ -3597,7 +3597,7 @@ def submit_order(
 
 async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
-    global last_live_positions_snapshot_ts, last_proof_tick_ts, current_slug
+    global last_live_positions_snapshot_ts, last_proof_tick_ts
     logging.info("HEARTBEAT_LOOP_OK")
 
     while True:
@@ -3657,32 +3657,6 @@ async def heartbeat_loop(client: ClobClient | None):
         time_to_end = (
             (start_ts + current_interval_seconds) - now_ts if start_ts is not None else None
         )
-        if current_slug and start_ts is not None and time_to_end is not None and time_to_end < -60:
-            prefix = current_slug.rsplit("-", 1)[0] if "-" in current_slug else current_slug
-            interval = interval_from_prefix(prefix)
-            now_ts_inner = int(time())
-            fresh_start = (now_ts_inner // interval) * interval
-            if fresh_start <= start_ts:
-                fresh_start = start_ts + interval
-            logging.warning(
-                "STALE_SLUG_DETECTED slug=%s time_to_end=%s action=force_rotate",
-                current_slug,
-                time_to_end,
-            )
-            logging.warning(
-                "ROTATE_EXPIRED_SLUG slug=%s start_ts=%s time_to_end=%s forcing_start=%s",
-                current_slug,
-                start_ts,
-                time_to_end,
-                fresh_start,
-            )
-            old_slug = current_slug
-            forced_slug = await force_rotate_to_slug(prefix, fresh_start)
-            if forced_slug:
-                logging.info("STALE_SLUG_ROTATED old=%s new=%s", old_slug, forced_slug)
-                current_slug = forced_slug
-                continue
-            logging.warning("STALE_SLUG_ROTATE_FAILED slug=%s", old_slug)
         entry_cutoff_active = (
             time_to_end is not None and time_to_end <= ENTRY_CUTOFF_SECONDS
         )
