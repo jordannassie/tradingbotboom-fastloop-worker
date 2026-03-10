@@ -1905,6 +1905,9 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         elif isinstance(raw_strategy_settings, dict):
             parsed_strategy = raw_strategy_settings
 
+        direction_mode = (parsed_strategy.get("direction_mode") or "normal").lower()
+        if direction_mode not in ("normal", "reverse"):
+            direction_mode = "normal"
         settings = {
             "bot_id": bot_id,
             "is_enabled": bool(row.get("is_enabled")),
@@ -1915,6 +1918,7 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "paper_balance_usd": float_or_none(row.get("paper_balance_usd")) or 0.0,
             "arm_live": bool(row.get("arm_live")),
             "strategy_settings": parsed_strategy,
+            "direction_mode": direction_mode,
         }
         log_rate_limited(
             f"strategy_settings_{bot_id}",
@@ -2376,8 +2380,14 @@ async def execute_strategy(
     if not current_slug:
         logging.warning("Missing slug; skipping strategy %s", strategy_id)
         return False
-    paper_side = "yes" if ya <= na else "no"
-    entry_price = ya if paper_side == "yes" else na
+    normal_side = "yes" if ya <= na else "no"
+    direction_mode = settings.get("direction_mode", "normal").lower() if strategy_id == STRATEGY_SNIPER else "normal"
+    final_side = normal_side
+    if strategy_id == STRATEGY_SNIPER and direction_mode == "reverse":
+        final_side = "no" if normal_side == "yes" else "yes"
+    if strategy_id == STRATEGY_SNIPER:
+        log_sniper_direction(current_slug or "none", direction_mode, normal_side, final_side)
+    entry_price = ya if final_side == "yes" else na
     if entry_price is None or entry_price <= 0:
         logging.warning("Invalid entry price for %s slug=%s", strategy_id, current_slug)
         return False
@@ -2635,6 +2645,21 @@ def log_market_decision(
         arm_live,
         live_master_enabled,
         result,
+    )
+
+
+def log_sniper_direction(
+    slug: str,
+    direction_mode: str,
+    normal_side: str,
+    final_side: str,
+):
+    logging.info(
+        "SNIPER_DIRECTION slug=%s direction_mode=%s normal_side=%s final_side=%s",
+        slug,
+        direction_mode,
+        normal_side,
+        final_side,
     )
 
 
