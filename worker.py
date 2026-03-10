@@ -3764,6 +3764,14 @@ async def heartbeat_loop(client: ClobClient | None):
                 fastloop_settings["is_enabled"],
                 candle_bias_settings["is_enabled"],
             )
+            logging.info(
+                "CANDLE_BIAS_SETTINGS bot_id=%s is_enabled=%s arm_live=%s direction_mode=%s bias_side=%s",
+                STRATEGY_CANDLE_BIAS_BOT_ID,
+                candle_bias_settings["is_enabled"],
+                candle_bias_settings["arm_live"],
+                candle_bias_settings.get("direction_mode", "normal"),
+                candle_bias_settings.get("bias_side", "yes"),
+            )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
                 "STUCK_DETECTOR_LIVE no_live_orders_for_s=%s live_master_enabled=%s armed_sniper=%s armed_fastloop=%s slug=%s",
@@ -4203,6 +4211,13 @@ async def heartbeat_loop(client: ClobClient | None):
             and not entry_cutoff_active
         )
         if candle_bias_condition:
+            logging.info(
+                "CANDLE_BIAS_EVAL strategy=CANDLE_BIAS slug=%s bias_side=%s direction_mode=%s enabled=%s result=EVALUATING",
+                slug_field,
+                candle_bias_settings.get("bias_side", "yes"),
+                candle_bias_settings.get("direction_mode", "normal"),
+                candle_bias_settings["is_enabled"],
+            )
             candle_bias_capacity = has_strategy_trade_capacity(
                 STRATEGY_CANDLE_BIAS, 2, candle_bias_settings["max_trades_per_hour"]
             )
