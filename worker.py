@@ -3597,7 +3597,7 @@ def submit_order(
 
 async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
-    global last_live_positions_snapshot_ts, last_proof_tick_ts
+    global last_live_positions_snapshot_ts, last_proof_tick_ts, current_slug
     logging.info("HEARTBEAT_LOOP_OK")
 
     while True:
