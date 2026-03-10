@@ -2611,6 +2611,43 @@ def record_trade(
         logging.exception("Failed inserting bot_trades row")
 
 
+def log_market_decision(
+    strategy: str,
+    slug: str,
+    ya: float | None,
+    na: float | None,
+    total: float | None,
+    edge: float | None,
+    enabled: bool,
+    arm_live: bool,
+    live_master_enabled: bool,
+    result: str,
+):
+    logging.info(
+        "MARKET_DECISION strategy=%s slug=%s ya=%s na=%s total=%s edge=%s enabled=%s arm_live=%s live_master=%s result=%s",
+        strategy,
+        slug,
+        fmt(ya),
+        fmt(na),
+        fmt(total),
+        fmt(edge),
+        enabled,
+        arm_live,
+        live_master_enabled,
+        result,
+    )
+
+
+def _reason_to_result(reason: str) -> str:
+    if reason == "below_threshold":
+        return "SKIP_EDGE"
+    if reason == "rate_limited":
+        return "SKIP_RATE_LIMIT"
+    if reason == "other":
+        return "SKIP_OTHER"
+    return "SKIP_OTHER"
+
+
 def normalize_list_field(entry, key):
     value = entry.get(key)
     if isinstance(value, list):
@@ -3802,6 +3839,7 @@ async def heartbeat_loop(client: ClobClient | None):
                 logging.exception("Failed inserting PAPER_DECISION skip")
             last_paper_skip_ts = now_ts
 
+        slug_field = current_slug or "none"
         trading_condition = (
             is_enabled_combined
             and edge is not None
@@ -3837,6 +3875,18 @@ async def heartbeat_loop(client: ClobClient | None):
                         sniper_settings["is_enabled"],
                         "entry_cutoff",
                     )
+                    log_market_decision(
+                        STRATEGY_SNIPER,
+                        slug_field,
+                        ya,
+                        na,
+                        total_ask,
+                        edge,
+                        sniper_settings["is_enabled"],
+                        sniper_settings["arm_live"],
+                        live_master_enabled,
+                        "SKIP_EDGE",
+                    )
                 elif should_skip_low_funds(sniper_settings["paper_balance_usd"]):
                     log_paper_decision(
                         STRATEGY_SNIPER,
@@ -3846,6 +3896,18 @@ async def heartbeat_loop(client: ClobClient | None):
                         edge_threshold,
                         sniper_settings["is_enabled"],
                         "low_funds",
+                    )
+                    log_market_decision(
+                        STRATEGY_SNIPER,
+                        slug_field,
+                        ya,
+                        na,
+                        total_ask,
+                        edge,
+                        sniper_settings["is_enabled"],
+                        sniper_settings["arm_live"],
+                        live_master_enabled,
+                        "SKIP_LOW_FUNDS",
                     )
                     pass
                 else:
@@ -3861,6 +3923,20 @@ async def heartbeat_loop(client: ClobClient | None):
                         live_master_enabled,
                         skip_live=force_exit_triggered,
                     )
+                    log_market_decision(
+                        STRATEGY_SNIPER,
+                        slug_field,
+                        ya,
+                        na,
+                        total_ask,
+                        edge,
+                        sniper_settings["is_enabled"],
+                        sniper_settings["arm_live"],
+                        live_master_enabled,
+                        "ENTER_LIVE"
+                        if sniper_traded and live_master_enabled and sniper_settings["arm_live"]
+                        else "ENTER_PAPER",
+                    )
             else:
                 log_paper_decision(
                     STRATEGY_SNIPER,
@@ -3870,6 +3946,18 @@ async def heartbeat_loop(client: ClobClient | None):
                     edge_threshold,
                     sniper_settings["is_enabled"],
                     sniper_reason,
+                )
+                log_market_decision(
+                    STRATEGY_SNIPER,
+                    slug_field,
+                    ya,
+                    na,
+                    total_ask,
+                    edge,
+                    sniper_settings["is_enabled"],
+                    sniper_settings["arm_live"],
+                    live_master_enabled,
+                    _reason_to_result(sniper_reason),
                 )
             if sniper_traded and trade_mode == "ONE":
                 logging.info(
@@ -3908,6 +3996,18 @@ async def heartbeat_loop(client: ClobClient | None):
                             fastloop_settings["is_enabled"],
                             "entry_cutoff",
                         )
+                        log_market_decision(
+                            STRATEGY_FASTLOOP,
+                            slug_field,
+                            ya,
+                            na,
+                            total_ask,
+                            edge,
+                            fastloop_settings["is_enabled"],
+                            fastloop_settings["arm_live"],
+                            live_master_enabled,
+                            "SKIP_EDGE",
+                        )
                     elif should_skip_low_funds(fastloop_settings["paper_balance_usd"]):
                         log_paper_decision(
                             STRATEGY_FASTLOOP,
@@ -3918,9 +4018,20 @@ async def heartbeat_loop(client: ClobClient | None):
                             fastloop_settings["is_enabled"],
                             "low_funds",
                         )
-                        pass
+                        log_market_decision(
+                            STRATEGY_FASTLOOP,
+                            slug_field,
+                            ya,
+                            na,
+                            total_ask,
+                            edge,
+                            fastloop_settings["is_enabled"],
+                            fastloop_settings["arm_live"],
+                            live_master_enabled,
+                            "SKIP_LOW_FUNDS",
+                        )
                     else:
-                        await execute_strategy(
+                        fastloop_executed = await execute_strategy(
                             STRATEGY_FASTLOOP,
                             "BUY_BOTH",
                             fastloop_settings,
@@ -3932,6 +4043,20 @@ async def heartbeat_loop(client: ClobClient | None):
                             live_master_enabled,
                             skip_live=force_exit_triggered,
                         )
+                        log_market_decision(
+                            STRATEGY_FASTLOOP,
+                            slug_field,
+                            ya,
+                            na,
+                            total_ask,
+                            edge,
+                            fastloop_settings["is_enabled"],
+                            fastloop_settings["arm_live"],
+                            live_master_enabled,
+                            "ENTER_LIVE"
+                            if fastloop_executed and live_master_enabled and fastloop_settings["arm_live"]
+                            else "ENTER_PAPER",
+                        )
                 else:
                     log_paper_decision(
                         STRATEGY_FASTLOOP,
@@ -3941,6 +4066,18 @@ async def heartbeat_loop(client: ClobClient | None):
                         edge_threshold,
                         fastloop_settings["is_enabled"],
                         fastloop_reason,
+                    )
+                    log_market_decision(
+                        STRATEGY_FASTLOOP,
+                        slug_field,
+                        ya,
+                        na,
+                        total_ask,
+                        edge,
+                        fastloop_settings["is_enabled"],
+                        fastloop_settings["arm_live"],
+                        live_master_enabled,
+                        _reason_to_result(fastloop_reason),
                     )
         await asyncio.sleep(5)
         if rotating:
