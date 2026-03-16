@@ -4360,8 +4360,12 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
         mid_price = approx_mid_price()
-        candle_manager.observe(current_slug, mid_price, now_ts, current_interval_seconds)
-        candle_manager.log_status()
+        if current_slug:
+            logging.info("CANDLE_ACTIVE slug=%s", current_slug)
+            candle_manager.observe(current_slug, mid_price, now_ts, current_interval_seconds)
+            candle_manager.log_status()
+        else:
+            logging.info("CANDLE_SKIP reason=no_active_slug")
         start_ts = slug_start_timestamp(current_slug) if current_slug else None
         time_to_end = (
             (start_ts + current_interval_seconds) - now_ts if start_ts is not None else None
