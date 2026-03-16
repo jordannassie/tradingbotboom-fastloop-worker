@@ -375,45 +375,58 @@ class CandleEngine:
         return len(self.history)
 
 
+def asset_key_from_slug(slug: str | None) -> str | None:
+    if not slug:
+        return None
+    parts = slug.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return slug
+
+
 class CandleManager:
     def __init__(self) -> None:
         self.engines: dict[str, CandleEngine] = {}
 
-    def get_engine(self, slug: str | None) -> CandleEngine | None:
-        if not slug:
+    def get_engine(self, asset_key: str | None) -> CandleEngine | None:
+        if not asset_key:
             return None
-        if slug not in self.engines:
-            self.engines[slug] = CandleEngine()
-        return self.engines[slug]
+        if asset_key not in self.engines:
+            self.engines[asset_key] = CandleEngine()
+        return self.engines[asset_key]
 
     def observe(
         self,
+        asset_key: str | None,
         slug: str | None,
         price: float | None,
         now_ts: int,
         interval_seconds: int,
     ) -> None:
-        engine = self.get_engine(slug)
+        engine = self.get_engine(asset_key)
         if engine and price is not None:
+            logging.info("CANDLE_KEY asset_key=%s slug=%s", asset_key, slug)
             engine.observe(price, now_ts, interval_seconds)
 
-    def closed_history(self, slug: str | None) -> list[Candle]:
-        engine = self.get_engine(slug)
+    def closed_history(self, asset_key: str | None) -> list[Candle]:
+        engine = self.get_engine(asset_key)
         return engine.closed_history() if engine else []
 
-    def has_history(self, slug: str | None, minimum: int = CANDLE_HISTORY_MINIMUM) -> bool:
-        engine = self.get_engine(slug)
+    def has_history(
+        self, asset_key: str | None, minimum: int = CANDLE_HISTORY_MINIMUM
+    ) -> bool:
+        engine = self.get_engine(asset_key)
         return bool(engine and engine.has_history(minimum))
 
-    def closed_count(self, slug: str | None) -> int:
-        engine = self.engines.get(slug or "")
+    def closed_count(self, asset_key: str | None) -> int:
+        engine = self.get_engine(asset_key)
         return engine.closed_count() if engine else 0
 
     def log_status(self) -> None:
-        for slug, engine in self.engines.items():
+        for asset_key, engine in self.engines.items():
             logging.info(
-                "CANDLE_HISTORY_STATUS slug=%s closed_candles=%s",
-                slug,
+                "CANDLE_HISTORY_STATUS asset_key=%s closed_candles=%s",
+                asset_key,
                 engine.closed_count(),
             )
 
@@ -3061,11 +3074,13 @@ async def evaluate_candle_strategies(
     force_exit_triggered: bool,
     time_to_end: float | None,
     slug: str | None,
+    asset_key: str | None,
 ) -> None:
-    if not candle_manager.has_history(slug):
+    if not candle_manager.has_history(asset_key):
         return
     slug_field = slug or "none"
-    history = candle_manager.closed_history(slug)
+    asset_field = asset_key or "none"
+    history = candle_manager.closed_history(asset_key)
     for strategy_id in CANDLE_STRATEGY_IDS:
         settings = candle_strategy_settings.get(strategy_id)
         if not settings:
@@ -3086,9 +3101,10 @@ async def evaluate_candle_strategies(
         if not detector:
             continue
         logging.info(
-            "CANDLE_DETECTOR_EVALUATED strategy=%s slug=%s candles=%s",
+            "CANDLE_DETECTOR_EVALUATED strategy=%s slug=%s asset_key=%s candles=%s",
             strategy_id,
             slug_field,
+            asset_field,
             len(history),
         )
         signal_result = detector(history)
@@ -4364,9 +4380,16 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
         mid_price = approx_mid_price()
-        if current_slug:
-            logging.info("CANDLE_ACTIVE slug=%s", current_slug)
-            candle_manager.observe(current_slug, mid_price, now_ts, current_interval_seconds)
+        asset_key = asset_key_from_slug(current_slug) if current_slug else None
+        if asset_key and current_slug:
+            logging.info(
+                "CANDLE_ACTIVE slug=%s asset_key=%s",
+                current_slug,
+                asset_key,
+            )
+            candle_manager.observe(
+                asset_key, current_slug, mid_price, now_ts, current_interval_seconds
+            )
             candle_manager.log_status()
         else:
             logging.info("CANDLE_SKIP reason=no_active_slug")
@@ -4533,6 +4556,7 @@ async def heartbeat_loop(client: ClobClient | None):
         slug_field = current_slug or "none"
         candle_strategy_condition = (
             current_slug
+            and asset_key
             and candle_strategy_enabled
             and ya is not None
             and na is not None
@@ -4889,6 +4913,7 @@ async def heartbeat_loop(client: ClobClient | None):
             force_exit_triggered,
             time_to_end,
             current_slug,
+            asset_key,
         )
 
         await asyncio.sleep(5)
