@@ -2759,15 +2759,16 @@ async def execute_strategy(
                 route_live = False
             else:
                 executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, live_size_usd)
+                live_bot_id = STRATEGY_TO_BOT_ID.get(strategy_id, BOT_ID)
                 if executed_live:
                     logging.info(
-                        "LIVE_ENTRY_ATTEMPT strategy=%s slug=%s side=%s size=%s ok=True",
-                        strategy_id, current_slug, final_side, live_size_usd,
+                        "LIVE_ENTRY_ATTEMPT strategy=%s bot_id=%s slug=%s side=%s size=%s ok=True",
+                        strategy_id, live_bot_id, current_slug, final_side, live_size_usd,
                     )
                 else:
                     logging.info(
-                        "LIVE_ENTRY_ATTEMPT strategy=%s slug=%s side=%s size=%s ok=False reason=execute_failed",
-                        strategy_id, current_slug, final_side, live_size_usd,
+                        "LIVE_ENTRY_ATTEMPT strategy=%s bot_id=%s slug=%s side=%s size=%s ok=False reason=execute_failed",
+                        strategy_id, live_bot_id, current_slug, final_side, live_size_usd,
                     )
                     logging.info(
                         "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
@@ -2897,6 +2898,13 @@ def record_trade(
         supabase.table("bot_trades").insert(payload).execute()
         global last_any_order_ts
         last_any_order_ts = int(time())
+        logging.info(
+            "LIVE_ACTIVITY_WRITE strategy=%s bot_id=%s status=%s slug=%s",
+            strategy_id or "unknown",
+            trade_bot_id,
+            status,
+            current_slug or "none",
+        )
     except Exception:
         logging.exception("Failed inserting bot_trades row")
 
@@ -3716,6 +3724,7 @@ async def create_paper_strategy_position(
     paper_payload = {
         "bot_id": bot_id_override,
         "market": "FASTLOOP",
+        "market_slug": current_slug,
         "side": "BUY_BOTH",
         "price": total_ask,
         "size": size_usd,
@@ -4701,11 +4710,14 @@ async def heartbeat_loop(client: ClobClient | None):
             if rotating:
                 gate_reasons.append("rotating")
             logging.info(
-                "STRATEGY_GATE status=skip strategies=SNIPER,FASTLOOP,CANDLE_BIAS reason=%s",
+                "STRATEGY_GATE status=skip strategy=legacy reason=%s",
                 ",".join(gate_reasons) if gate_reasons else "unknown",
             )
 
         if trading_condition:
+            logging.info(
+                "STRATEGY_GATE status=pass strategy=legacy reason=ok",
+            )
             sniper_traded = False
             sniper_time_to_end = time_to_end or 0
             sniper_can_trade, sniper_reason = get_paper_trade_decision_reason(
@@ -5028,7 +5040,7 @@ async def heartbeat_loop(client: ClobClient | None):
 
         if candle_strategy_condition:
             logging.info(
-                "CANDLE_GATE status=pass slug=%s asset_key=%s closed_candles=%s",
+                "CANDLE_GATE status=pass strategy=candle_strategies slug=%s asset_key=%s closed_candles=%s",
                 current_slug or "none",
                 asset_key or "none",
                 candle_manager.closed_count(asset_key),
@@ -5066,7 +5078,7 @@ async def heartbeat_loop(client: ClobClient | None):
             if entry_cutoff_active:
                 skip_reasons.append("entry_cutoff")
             logging.info(
-                "CANDLE_GATE status=skip reason=%s slug=%s asset_key=%s",
+                "CANDLE_GATE status=skip strategy=candle_strategies reason=%s slug=%s asset_key=%s",
                 ",".join(skip_reasons) if skip_reasons else "unknown",
                 current_slug or "none",
                 asset_key or "none",
