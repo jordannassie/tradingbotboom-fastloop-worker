@@ -4422,6 +4422,7 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
         mid_price = approx_mid_price()
+        global last_asset_key
         if not current_slug and last_asset_key:
             candle_manager.force_close(last_asset_key)
             last_asset_key = None
