@@ -350,24 +350,10 @@ class CandleEngine:
     def __init__(self, history_size: int = MAX_CANDLE_HISTORY) -> None:
         self.history: deque[Candle] = deque(maxlen=history_size)
         self.current: Candle | None = None
-        self.slug: str | None = None
 
-    def reset(self, slug: str | None) -> None:
-        self.history.clear()
-        self.current = None
-        self.slug = slug
-
-    def observe(
-        self,
-        slug: str | None,
-        price: float | None,
-        now_ts: int,
-        interval_seconds: int,
-    ) -> None:
-        if not slug or price is None or interval_seconds <= 0:
+    def observe(self, price: float, now_ts: int, interval_seconds: int) -> None:
+        if price is None or interval_seconds <= 0:
             return
-        if self.slug != slug:
-            self.reset(slug)
         start_ts = floor(now_ts / interval_seconds) * interval_seconds
         if not self.current or self.current.start_ts != start_ts:
             if self.current:
@@ -385,8 +371,54 @@ class CandleEngine:
     def has_history(self, minimum: int = CANDLE_HISTORY_MINIMUM) -> bool:
         return len(self.history) >= minimum
 
+    def closed_count(self) -> int:
+        return len(self.history)
 
-candle_engine = CandleEngine()
+
+class CandleManager:
+    def __init__(self) -> None:
+        self.engines: dict[str, CandleEngine] = {}
+
+    def get_engine(self, slug: str | None) -> CandleEngine | None:
+        if not slug:
+            return None
+        if slug not in self.engines:
+            self.engines[slug] = CandleEngine()
+        return self.engines[slug]
+
+    def observe(
+        self,
+        slug: str | None,
+        price: float | None,
+        now_ts: int,
+        interval_seconds: int,
+    ) -> None:
+        engine = self.get_engine(slug)
+        if engine and price is not None:
+            engine.observe(price, now_ts, interval_seconds)
+
+    def closed_history(self, slug: str | None) -> list[Candle]:
+        engine = self.get_engine(slug)
+        return engine.closed_history() if engine else []
+
+    def has_history(self, slug: str | None, minimum: int = CANDLE_HISTORY_MINIMUM) -> bool:
+        engine = self.get_engine(slug)
+        return bool(engine and engine.has_history(minimum))
+
+    def closed_count(self, slug: str | None) -> int:
+        engine = self.engines.get(slug or "")
+        return engine.closed_count() if engine else 0
+
+    def log_status(self) -> None:
+        for slug, engine in self.engines.items():
+            logging.info(
+                "CANDLE_HISTORY_STATUS slug=%s closed_candles=%s",
+                slug,
+                engine.closed_count(),
+            )
+
+
+candle_manager = CandleManager()
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -3028,26 +3060,57 @@ async def evaluate_candle_strategies(
     entry_cutoff_active: bool,
     force_exit_triggered: bool,
     time_to_end: float | None,
+    slug: str | None,
 ) -> None:
-    if not candle_engine.has_history():
+    if not candle_manager.has_history(slug):
         return
-    slug_field = current_slug or "none"
-    history = candle_engine.closed_history()
+    slug_field = slug or "none"
+    history = candle_manager.closed_history(slug)
     for strategy_id in CANDLE_STRATEGY_IDS:
         settings = candle_strategy_settings.get(strategy_id)
         if not settings:
             continue
+        logging.info(
+            "CANDLE_STRATEGY_SETTINGS_LOADED strategy=%s slug=%s enabled=%s mode=%s trade_size=%s max_trades=%s arm_live=%s paper_balance=%s",
+            strategy_id,
+            slug_field,
+            settings["is_enabled"],
+            settings["mode"],
+            settings["trade_size_usd"],
+            settings["max_trades_per_hour"],
+            settings["arm_live"],
+            settings["paper_balance_usd"],
+        )
+
         detector = CANDLE_DETECTORS.get(strategy_id)
         if not detector:
             continue
+        logging.info(
+            "CANDLE_DETECTOR_EVALUATED strategy=%s slug=%s candles=%s",
+            strategy_id,
+            slug_field,
+            len(history),
+        )
         signal_result = detector(history)
         logging.info(
-            "CANDLE_RULE_RESULT strategy=%s signal=%s metadata=%s",
+            "CANDLE_RULE_RESULT strategy=%s slug=%s signal=%s metadata=%s",
             strategy_id,
+            slug_field,
             signal_result.signal,
             signal_result.metadata,
         )
+        def log_candle_decision(outcome: str, skip_reason: str | None = None) -> None:
+            logging.info(
+                "CANDLE_STRATEGY_DECISION strategy=%s slug=%s signal=%s metadata=%s outcome=%s skip_reason=%s",
+                strategy_id,
+                slug_field,
+                signal_result.signal,
+                signal_result.metadata,
+                outcome,
+                skip_reason or "none",
+            )
         if signal_result.signal not in ("YES", "NO"):
+            log_candle_decision("SKIPPED", "neutral_signal")
             log_market_decision(
                 strategy_id,
                 slug_field,
@@ -3062,6 +3125,7 @@ async def evaluate_candle_strategies(
             )
             continue
         if entry_cutoff_active:
+            log_candle_decision("SKIPPED", "entry_cutoff")
             log_paper_decision(
                 strategy_id,
                 current_slug,
@@ -3085,6 +3149,7 @@ async def evaluate_candle_strategies(
             )
             continue
         if not settings["is_enabled"]:
+            log_candle_decision("SKIPPED", "disabled")
             log_market_decision(
                 strategy_id,
                 slug_field,
@@ -3099,6 +3164,7 @@ async def evaluate_candle_strategies(
             )
             continue
         if settings["mode"] != "PAPER":
+            log_candle_decision("SKIPPED", "mode_not_paper")
             log_paper_decision(
                 strategy_id,
                 current_slug,
@@ -3122,6 +3188,7 @@ async def evaluate_candle_strategies(
             )
             continue
         if should_skip_low_funds(settings["paper_balance_usd"]):
+            log_candle_decision("SKIPPED", "low_funds")
             log_paper_decision(
                 strategy_id,
                 current_slug,
@@ -3147,6 +3214,7 @@ async def evaluate_candle_strategies(
         if not has_strategy_trade_capacity(
             strategy_id, 2, settings["max_trades_per_hour"]
         ):
+            log_candle_decision("SKIPPED", "rate_limited")
             log_paper_decision(
                 strategy_id,
                 current_slug,
@@ -3199,6 +3267,7 @@ async def evaluate_candle_strategies(
             if executed
             else "SKIP_OTHER",
         )
+        log_candle_decision("EXECUTED" if executed else "FAILED", None if executed else "execute_failed")
 
 
 def _reason_to_result(reason: str) -> str:
@@ -3564,6 +3633,15 @@ async def create_paper_strategy_position(
         shares,
         start_ts,
     )
+    if strategy_id in CANDLE_STRATEGY_IDS:
+        logging.info(
+            "CANDLE_PAPER_ENTRY strategy=%s slug=%s side=%s size=%s shares=%s",
+            strategy_id,
+            current_slug,
+            paper_side,
+            size_usd,
+            shares,
+        )
 
 
 def fetch_bot_settings_row() -> dict[str, object] | None:
@@ -3709,7 +3787,6 @@ async def rotate_loop():
         return
     global current_slug, current_yes_token, current_no_token, rotating, current_interval_seconds, current_prefix
     current_slug = None
-    candle_engine.reset(None)
     prefix_index = 0
     prefixes = MARKET_SLUG_PREFIXES
     while True:
@@ -3740,7 +3817,6 @@ async def rotate_loop():
         found = bool(market)
         if found and slug != current_slug:
             current_slug = slug
-            candle_engine.reset(current_slug)
             outcomes = [o.lower() for o in market["outcomes"]]
             clobs = market["clobTokenIds"]
             for name, token in zip(outcomes, clobs):
@@ -3782,7 +3858,6 @@ async def force_rotate_to_slug(prefix: str, target_start: int) -> str | None:
     current_interval_seconds = interval
     current_prefix = prefix
     current_slug = slug
-    candle_engine.reset(current_slug)
     outcomes = [o.lower() for o in market["outcomes"]]
     clobs = market["clobTokenIds"]
     for name, token in zip(outcomes, clobs):
@@ -4285,7 +4360,8 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
         mid_price = approx_mid_price()
-        candle_engine.observe(current_slug, mid_price, now_ts, current_interval_seconds)
+        candle_manager.observe(current_slug, mid_price, now_ts, current_interval_seconds)
+        candle_manager.log_status()
         start_ts = slug_start_timestamp(current_slug) if current_slug else None
         time_to_end = (
             (start_ts + current_interval_seconds) - now_ts if start_ts is not None else None
@@ -4447,6 +4523,17 @@ async def heartbeat_loop(client: ClobClient | None):
             last_paper_skip_ts = now_ts
 
         slug_field = current_slug or "none"
+        candle_strategy_condition = (
+            candle_strategy_enabled
+            and ya is not None
+            and na is not None
+            and not paused_due_to_errors
+            and not paused_due_to_max_trades
+            and current_yes_token
+            and current_no_token
+            and not rotating
+            and not entry_cutoff_active
+        )
         trading_condition = (
             is_enabled_combined
             and edge is not None
@@ -4781,6 +4868,7 @@ async def heartbeat_loop(client: ClobClient | None):
                     else "SKIP_OTHER",
                 )
 
+    if candle_strategy_condition:
         await evaluate_candle_strategies(
             candle_strategy_settings,
             total_ask,
@@ -4792,6 +4880,7 @@ async def heartbeat_loop(client: ClobClient | None):
             entry_cutoff_active,
             force_exit_triggered,
             time_to_end,
+            current_slug,
         )
 
         await asyncio.sleep(5)
@@ -4938,6 +5027,14 @@ async def paper_settlement_loop():
                     strategy_id,
                     market_slug,
                     pnl_usd,
+                )
+            if strategy_id in CANDLE_STRATEGY_IDS:
+                logging.info(
+                    "CANDLE_PAPER_SETTLEMENT strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
+                    strategy_id,
+                    market_slug,
+                    pnl_usd,
+                    resolved_side,
                 )
             except Exception:
                 logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
