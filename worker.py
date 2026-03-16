@@ -5028,14 +5028,14 @@ async def paper_settlement_loop():
                     market_slug,
                     pnl_usd,
                 )
-            if strategy_id in CANDLE_STRATEGY_IDS:
-                logging.info(
-                    "CANDLE_PAPER_SETTLEMENT strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
-                    strategy_id,
-                    market_slug,
-                    pnl_usd,
-                    resolved_side,
-                )
+                if strategy_id in CANDLE_STRATEGY_IDS:
+                    logging.info(
+                        "CANDLE_PAPER_SETTLEMENT strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
+                        strategy_id,
+                        market_slug,
+                        pnl_usd,
+                        resolved_side,
+                    )
             except Exception:
                 logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
 
