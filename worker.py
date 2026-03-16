@@ -317,6 +317,7 @@ last_any_order_ts = 0
 live_positions: dict[str, float] = {}
 MAX_CANDLE_HISTORY = 32
 CANDLE_HISTORY_MINIMUM = 2
+last_asset_key: str | None = None
 
 
 @dataclass
@@ -389,6 +390,18 @@ class CandleEngine:
             self.current.low = min(self.current.low, price)
             self.current.close = price
 
+    def force_close(self, asset_key: str | None = None) -> None:
+        if not self.current:
+            return
+        self.history.append(self.current)
+        logging.info(
+            "CANDLE_CLOSE asset_key=%s closed_candles=%s bucket=%s",
+            asset_key or "none",
+            len(self.history),
+            self.current.start_ts,
+        )
+        self.current = None
+
     def closed_history(self) -> list[Candle]:
         return list(self.history)
 
@@ -453,6 +466,11 @@ class CandleManager:
                 asset_key,
                 engine.closed_count(),
             )
+
+    def force_close(self, asset_key: str | None) -> None:
+        engine = self.get_engine(asset_key)
+        if engine:
+            engine.force_close(asset_key)
 
 
 candle_manager = CandleManager()
@@ -4404,7 +4422,13 @@ async def heartbeat_loop(client: ClobClient | None):
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
         mid_price = approx_mid_price()
+        if not current_slug and last_asset_key:
+            candle_manager.force_close(last_asset_key)
+            last_asset_key = None
         asset_key = asset_key_from_slug(current_slug) if current_slug else None
+        if asset_key and last_asset_key and asset_key != last_asset_key:
+            candle_manager.force_close(last_asset_key)
+        last_asset_key = asset_key
         if asset_key and current_slug:
             logging.info(
                 "CANDLE_ACTIVE slug=%s asset_key=%s",
