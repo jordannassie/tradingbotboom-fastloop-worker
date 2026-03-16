@@ -4279,6 +4279,10 @@ async def heartbeat_loop(client: ClobClient | None):
     global last_live_positions_snapshot_ts, last_proof_tick_ts
     logging.info("HEARTBEAT_LOOP_OK")
 
+    while current_slug is None:
+        logging.info("CANDLE_SKIP reason=no_active_slug")
+        await asyncio.sleep(1)
+
     while True:
         now_ts = int(time())
         sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
