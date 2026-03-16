@@ -4524,7 +4524,8 @@ async def heartbeat_loop(client: ClobClient | None):
 
         slug_field = current_slug or "none"
         candle_strategy_condition = (
-            candle_strategy_enabled
+            current_slug
+            and candle_strategy_enabled
             and ya is not None
             and na is not None
             and not paused_due_to_errors
