@@ -4540,7 +4540,6 @@ async def heartbeat_loop(client: ClobClient | None):
             and not paused_due_to_max_trades
             and current_yes_token
             and current_no_token
-            and not rotating
             and not entry_cutoff_active
         )
         trading_condition = (
