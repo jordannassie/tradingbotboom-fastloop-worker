@@ -316,7 +316,7 @@ last_live_order_ts = 0
 last_any_order_ts = 0
 live_positions: dict[str, float] = {}
 MAX_CANDLE_HISTORY = 32
-CANDLE_HISTORY_MINIMUM = 2
+CANDLE_HISTORY_MINIMUM = 1
 last_asset_key: str | None = None
 
 
@@ -2081,7 +2081,7 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
         "edge_threshold": EDGE_THRESHOLD,
         "trade_size_usd": TRADE_SIZE,
         "max_trades_per_hour": MAX_TRADES_PER_HOUR,
-        "paper_balance_usd": 0.0,
+        "paper_balance_usd": DEFAULT_PAPER_START_BALANCE,
         "arm_live": False,
     }
     columns = "is_enabled, mode, edge_threshold, trade_size_usd, max_trades_per_hour, paper_balance_usd, arm_live, strategy_settings"
@@ -2126,7 +2126,7 @@ def read_strategy_settings(bot_id: str) -> dict[str, object]:
             "edge_threshold": float_or_none(row.get("edge_threshold")) or EDGE_THRESHOLD,
             "trade_size_usd": float_or_none(row.get("trade_size_usd")) or TRADE_SIZE,
             "max_trades_per_hour": int(row.get("max_trades_per_hour") or MAX_TRADES_PER_HOUR),
-            "paper_balance_usd": float_or_none(row.get("paper_balance_usd")) or 0.0,
+            "paper_balance_usd": float_or_none(row.get("paper_balance_usd")) or DEFAULT_PAPER_START_BALANCE,
             "arm_live": bool(row.get("arm_live")),
             "strategy_settings": parsed_strategy,
             "direction_mode": direction_mode,
@@ -2794,6 +2794,10 @@ async def execute_strategy(
                     MIN_ORDER_USD,
                 )
             else:
+                logging.info(
+                    "PAPER_ENTRY_ATTEMPT strategy=%s bot_id=%s slug=%s side=%s size=%s shares=%s",
+                    strategy_id, get_paper_bot_id(strategy_id), current_slug, final_side, size_usd, shares,
+                )
                 await create_paper_strategy_position(
                     strategy_id,
                     action_label,
@@ -2877,9 +2881,12 @@ def record_trade(
     if strategy_id:
         meta["strategy_id"] = strategy_id
 
+    trade_bot_id = STRATEGY_TO_BOT_ID.get(strategy_id, BOT_ID) if strategy_id else BOT_ID
     payload = {
-        "bot_id": BOT_ID,
+        "bot_id": trade_bot_id,
         "market": "FASTLOOP",
+        "market_slug": current_slug,
+        "strategy_id": strategy_id,
         "side": side_label,
         "price": price,
         "size": trade_size,
@@ -4474,6 +4481,8 @@ async def heartbeat_loop(client: ClobClient | None):
         asset_key = asset_key_from_slug(current_slug) if current_slug else None
         if asset_key and last_asset_key and asset_key != last_asset_key:
             candle_manager.force_close(last_asset_key)
+        if rotating and asset_key:
+            candle_manager.force_close(asset_key)
         last_asset_key = asset_key
         if asset_key and current_slug:
             logging.info(
@@ -4672,6 +4681,29 @@ async def heartbeat_loop(client: ClobClient | None):
             and current_no_token
             and not rotating
         )
+
+        if not trading_condition:
+            gate_reasons = []
+            if not is_enabled_combined:
+                gate_reasons.append("all_disabled")
+            if edge is None:
+                gate_reasons.append("no_edge")
+            elif edge < edge_threshold:
+                gate_reasons.append("edge_below_threshold")
+            if ya is None or na is None:
+                gate_reasons.append("quotes_missing")
+            if paused_due_to_errors:
+                gate_reasons.append("paused_errors")
+            if paused_due_to_max_trades:
+                gate_reasons.append("paused_max_trades")
+            if not current_yes_token or not current_no_token:
+                gate_reasons.append("no_tokens")
+            if rotating:
+                gate_reasons.append("rotating")
+            logging.info(
+                "STRATEGY_GATE status=skip strategies=SNIPER,FASTLOOP,CANDLE_BIAS reason=%s",
+                ",".join(gate_reasons) if gate_reasons else "unknown",
+            )
 
         if trading_condition:
             sniper_traded = False
@@ -4995,6 +5027,12 @@ async def heartbeat_loop(client: ClobClient | None):
                 )
 
         if candle_strategy_condition:
+            logging.info(
+                "CANDLE_GATE status=pass slug=%s asset_key=%s closed_candles=%s",
+                current_slug or "none",
+                asset_key or "none",
+                candle_manager.closed_count(asset_key),
+            )
             await evaluate_candle_strategies(
                 candle_strategy_settings,
                 total_ask,
@@ -5028,7 +5066,7 @@ async def heartbeat_loop(client: ClobClient | None):
             if entry_cutoff_active:
                 skip_reasons.append("entry_cutoff")
             logging.info(
-                "CANDLE_SKIP reason=%s slug=%s asset_key=%s",
+                "CANDLE_GATE status=skip reason=%s slug=%s asset_key=%s",
                 ",".join(skip_reasons) if skip_reasons else "unknown",
                 current_slug or "none",
                 asset_key or "none",
@@ -5071,21 +5109,11 @@ async def paper_settlement_loop():
             logging.exception("Failed querying OPEN paper_positions")
             rows = []
 
-            if rows:
-                counts = {
-                    bot_id: sum(1 for r in rows if r.get("bot_id") == bot_id)
-                    for bot_id in [
-                        STRATEGY_FASTLOOP_BOT_ID,
-                        STRATEGY_SNIPER_BOT_ID,
-                        STRATEGY_CANDLE_BIAS_BOT_ID,
-                        BOT_ID,
-                    ]
-                }
-                logging.info(
-                    "Found OPEN paper_positions %s total=%d",
-                    ", ".join(f"{bot_id}={counts[bot_id]}" for bot_id in counts),
-                    len(rows),
-                )
+        if rows:
+            logging.info(
+                "SETTLEMENT_PENDING open_positions=%d",
+                len(rows),
+            )
 
         for row in rows:
             row_id = row.get("id")
@@ -5145,7 +5173,7 @@ async def paper_settlement_loop():
                 update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
             trade_payload = {
-                "bot_id": BOT_ID,
+                "bot_id": bot_id,
                 "market": "FASTLOOP",
                 "market_slug": market_slug,
                 "strategy_id": strategy_id,
