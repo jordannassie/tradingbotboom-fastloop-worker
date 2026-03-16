@@ -371,12 +371,17 @@ class CandleEngine:
         )
         if not self.current or self.current.start_ts != start_ts:
             if self.current:
-                self.history.append(self.current)
+                closed = self.current
+                self.history.append(closed)
                 logging.info(
-                    "CANDLE_CLOSE asset_key=%s closed_candles=%s bucket=%s",
+                    "CANDLE_CLOSE asset_key=%s closed_candles=%s closed_ts=%s o=%s h=%s l=%s c=%s",
                     asset_key or "none",
                     len(self.history),
-                    start_ts,
+                    closed.start_ts,
+                    closed.open,
+                    closed.high,
+                    closed.low,
+                    closed.close,
                 )
             self.current = Candle(start_ts, price, price, price, price)
             logging.info(
@@ -2482,15 +2487,21 @@ def execute_live_strategy(
     )
     trade_triggers += 1
     try:
-        if live_size_usd is not None:
-            if ya is not None and not _should_skip_min_shares(
+        if size_usd is not None and size_usd > 0:
+            yes_shares = compute_shares_from_size(size_usd, ya) if ya else 0
+            no_shares = compute_shares_from_size(size_usd, na) if na else 0
+            if ya is not None and yes_shares > 0 and not _should_skip_min_shares(
                 client,
                 current_yes_token,
-                shares,
+                yes_shares,
                 ya,
-                live_size_usd,
+                size_usd,
                 "BUY",
             ):
+                logging.info(
+                    "LIVE_ORDER_SUBMIT strategy=%s side=yes slug=%s price=%s size=%s shares=%s",
+                    strategy_id, current_slug, ya, size_usd, yes_shares,
+                )
                 submit_order(
                     client,
                     current_yes_token,
@@ -2502,14 +2513,18 @@ def execute_live_strategy(
                     size_usd,
                     strategy_id=strategy_id,
                 )
-            if na is not None and not _should_skip_min_shares(
+            if na is not None and no_shares > 0 and not _should_skip_min_shares(
                 client,
                 current_no_token,
-                shares,
+                no_shares,
                 na,
-                live_size_usd,
+                size_usd,
                 "BUY",
             ):
+                logging.info(
+                    "LIVE_ORDER_SUBMIT strategy=%s side=no slug=%s price=%s size=%s shares=%s",
+                    strategy_id, current_slug, na, size_usd, no_shares,
+                )
                 submit_order(
                     client,
                     current_no_token,
@@ -2656,12 +2671,23 @@ async def execute_strategy(
     route_live = live_master_enabled and settings["arm_live"] and not skip_live
     executed_live = False
     live_size_usd = None
+    if not route_live:
+        if not live_master_enabled:
+            live_skip_reason = "live_master_disabled"
+        elif not settings["arm_live"]:
+            live_skip_reason = "arm_live_off"
+        elif skip_live:
+            live_skip_reason = "force_exit_active"
+        else:
+            live_skip_reason = "unknown"
+        logging.info(
+            "LIVE_STRATEGY_SKIP strategy=%s reason=%s slug=%s",
+            strategy_id, live_skip_reason, current_slug,
+        )
     if route_live:
         logging.info(
-            "Live gating requested for strategy=%s arm_live=%s live_master_enabled=%s",
-            strategy_id,
-            settings["arm_live"],
-            live_master_enabled,
+            "LIVE_STRATEGY_EVALUATED strategy=%s slug=%s arm_live=%s live_master=%s",
+            strategy_id, current_slug, settings["arm_live"], live_master_enabled,
         )
         derive_wallet_addresses(client)
         live_balance = get_live_balance_value()
@@ -2733,7 +2759,16 @@ async def execute_strategy(
                 route_live = False
             else:
                 executed_live = execute_live_strategy(client, strategy_id, edge, ya, na, live_size_usd)
-                if not executed_live:
+                if executed_live:
+                    logging.info(
+                        "LIVE_ENTRY_ATTEMPT strategy=%s slug=%s side=%s size=%s ok=True",
+                        strategy_id, current_slug, final_side, live_size_usd,
+                    )
+                else:
+                    logging.info(
+                        "LIVE_ENTRY_ATTEMPT strategy=%s slug=%s side=%s size=%s ok=False reason=execute_failed",
+                        strategy_id, current_slug, final_side, live_size_usd,
+                    )
                     logging.info(
                         "Falling back to PAPER for strategy=%s live_master_enabled=%s client=%s",
                         strategy_id,
@@ -3119,6 +3154,12 @@ async def evaluate_candle_strategies(
     asset_key: str | None,
 ) -> None:
     if not candle_manager.has_history(asset_key):
+        logging.info(
+            "CANDLE_SKIP reason=insufficient_history asset_key=%s closed_candles=%s minimum=%s",
+            asset_key or "none",
+            candle_manager.closed_count(asset_key),
+            CANDLE_HISTORY_MINIMUM,
+        )
         return
     slug_field = slug or "none"
     asset_field = asset_key or "none"
@@ -3678,6 +3719,10 @@ async def create_paper_strategy_position(
 
     try:
         supabase.table("bot_trades").insert(paper_payload).execute()
+        logging.info(
+            "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_DECISION slug=%s side=%s size=%s",
+            strategy_id, bot_id_override, current_slug, paper_side, size_usd,
+        )
     except Exception:
         logging.exception("Failed inserting PAPER_DECISION for strategy %s", strategy_id)
 
@@ -4949,21 +4994,45 @@ async def heartbeat_loop(client: ClobClient | None):
                     else "SKIP_OTHER",
                 )
 
-    if candle_strategy_condition:
-        await evaluate_candle_strategies(
-            candle_strategy_settings,
-            total_ask,
-            edge,
-            ya,
-            na,
-            client,
-            live_master_enabled,
-            entry_cutoff_active,
-            force_exit_triggered,
-            time_to_end,
-            current_slug,
-            asset_key,
-        )
+        if candle_strategy_condition:
+            await evaluate_candle_strategies(
+                candle_strategy_settings,
+                total_ask,
+                edge,
+                ya,
+                na,
+                client,
+                live_master_enabled,
+                entry_cutoff_active,
+                force_exit_triggered,
+                time_to_end,
+                current_slug,
+                asset_key,
+            )
+        else:
+            skip_reasons = []
+            if not current_slug:
+                skip_reasons.append("no_slug")
+            if not asset_key:
+                skip_reasons.append("no_asset_key")
+            if not candle_strategy_enabled:
+                skip_reasons.append("all_candle_strategies_disabled")
+            if ya is None or na is None:
+                skip_reasons.append("quotes_missing")
+            if paused_due_to_errors:
+                skip_reasons.append("paused_errors")
+            if paused_due_to_max_trades:
+                skip_reasons.append("paused_max_trades")
+            if not current_yes_token or not current_no_token:
+                skip_reasons.append("no_tokens")
+            if entry_cutoff_active:
+                skip_reasons.append("entry_cutoff")
+            logging.info(
+                "CANDLE_SKIP reason=%s slug=%s asset_key=%s",
+                ",".join(skip_reasons) if skip_reasons else "unknown",
+                current_slug or "none",
+                asset_key or "none",
+            )
 
         await asyncio.sleep(5)
         if rotating:
@@ -5109,6 +5178,10 @@ async def paper_settlement_loop():
                     strategy_id,
                     market_slug,
                     pnl_usd,
+                )
+                logging.info(
+                    "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_CLOSED slug=%s pnl=%s",
+                    strategy_id, bot_id, market_slug, pnl_usd,
                 )
                 if strategy_id in CANDLE_STRATEGY_IDS:
                     logging.info(
