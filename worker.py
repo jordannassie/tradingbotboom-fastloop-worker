@@ -2987,13 +2987,13 @@ def log_candle_bias_direction(
 
 def detect_sweep_reclaim(history: list[Candle]) -> CandleSignal:
     if len(history) < 3:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "need_3_candles"})
     baseline = history[-3]
     sweep = history[-2]
     reclaim = history[-1]
     sweep_range = sweep.range()
     if sweep_range <= 0:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "sweep_range_zero"})
     if (
         sweep.is_bullish()
         and sweep.high > baseline.high
@@ -3024,19 +3024,24 @@ def detect_sweep_reclaim(history: list[Candle]) -> CandleSignal:
                 "reclaim_close": reclaim.close,
             },
         )
-    return CandleSignal("NEUTRAL")
+    return CandleSignal("NEUTRAL", {"reason": "sweep_reclaim_no_match"})
 
 
 def detect_breakout_close(history: list[Candle]) -> CandleSignal:
     if not history:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "no_history"})
     last = history[-1]
     candle_range = last.range()
-    if candle_range <= 0:
-        return CandleSignal("NEUTRAL")
     body = last.body()
-    min_body = candle_range * 0.35
-    threshold = candle_range * 0.15
+    if candle_range <= 0:
+        if body > 0.0005:
+            if last.is_bullish():
+                return CandleSignal("YES", {"reason": "bullish_flat", "body": body})
+            if last.is_bearish():
+                return CandleSignal("NO", {"reason": "bearish_flat", "body": body})
+        return CandleSignal("NEUTRAL", {"reason": "range_zero"})
+    min_body = candle_range * 0.25
+    threshold = candle_range * 0.25
     if last.is_bullish() and (last.high - last.close) <= threshold and body >= min_body:
         return CandleSignal(
             "YES", {"reason": "bullish_breakout_close", "body": body, "range": candle_range}
@@ -3045,20 +3050,25 @@ def detect_breakout_close(history: list[Candle]) -> CandleSignal:
         return CandleSignal(
             "NO", {"reason": "bearish_breakdown_close", "body": body, "range": candle_range}
         )
-    return CandleSignal("NEUTRAL")
+    if candle_range < 0.008 and body > 0.0005:
+        if last.is_bullish():
+            return CandleSignal("YES", {"reason": "bullish_tight_range", "body": body, "range": candle_range})
+        if last.is_bearish():
+            return CandleSignal("NO", {"reason": "bearish_tight_range", "body": body, "range": candle_range})
+    return CandleSignal("NEUTRAL", {"reason": "breakout_close_no_match", "body": body, "range": candle_range})
 
 
 def detect_engulfing_level(history: list[Candle]) -> CandleSignal:
     if len(history) < 2:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "need_2_candles"})
     prev = history[-2]
     last = history[-1]
     last_body = last.body()
     prev_body = prev.body()
     if last.high < prev.high or last.low > prev.low or prev_body <= 0:
-        return CandleSignal("NEUTRAL")
-    if last_body < prev_body * 0.8:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "no_engulf"})
+    if last_body < prev_body * 0.6:
+        return CandleSignal("NEUTRAL", {"reason": "body_too_small"})
     if last.is_bullish() and prev.is_bearish():
         return CandleSignal(
             "YES",
@@ -3077,20 +3087,20 @@ def detect_engulfing_level(history: list[Candle]) -> CandleSignal:
                 "last_close": last.close,
             },
         )
-    return CandleSignal("NEUTRAL")
+    return CandleSignal("NEUTRAL", {"reason": "engulf_no_match"})
 
 
 def detect_rejection_wick(history: list[Candle]) -> CandleSignal:
     if not history:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "no_history"})
     last = history[-1]
     candle_range = last.range()
     body = last.body()
     if candle_range <= 0 or body <= 0:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "range_or_body_zero"})
     lower_wick = min(last.open, last.close) - last.low
     upper_wick = last.high - max(last.open, last.close)
-    wick_threshold = max(body * 2.0, candle_range * 0.4)
+    wick_threshold = max(body * 1.5, candle_range * 0.3)
     if lower_wick >= wick_threshold:
         return CandleSignal(
             "YES",
@@ -3109,21 +3119,21 @@ def detect_rejection_wick(history: list[Candle]) -> CandleSignal:
                 "upper_wick": upper_wick,
             },
         )
-    return CandleSignal("NEUTRAL")
+    return CandleSignal("NEUTRAL", {"reason": "rejection_wick_no_match", "lower_wick": lower_wick, "upper_wick": upper_wick})
 
 
 def detect_follow_through(history: list[Candle]) -> CandleSignal:
     if len(history) < 2:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "need_2_candles"})
     prev = history[-2]
     last = history[-1]
     last_body = last.body()
     prev_range = prev.range()
     if prev_range <= 0 or last_body <= 0:
-        return CandleSignal("NEUTRAL")
+        return CandleSignal("NEUTRAL", {"reason": "prev_range_or_last_body_zero"})
     prev_body = prev.body()
-    if prev_body <= 0 or last_body < prev_body * 0.4:
-        return CandleSignal("NEUTRAL")
+    if prev_body <= 0 or last_body < prev_body * 0.3:
+        return CandleSignal("NEUTRAL", {"reason": "continuation_too_weak"})
     if prev.is_bullish() and last.is_bullish() and last.close > prev.close:
         return CandleSignal(
             "YES",
@@ -3134,7 +3144,7 @@ def detect_follow_through(history: list[Candle]) -> CandleSignal:
             "NO",
             {"reason": "bear_follow_through", "prev_body": prev_body, "last_body": last_body},
         )
-    return CandleSignal("NEUTRAL")
+    return CandleSignal("NEUTRAL", {"reason": "follow_through_no_match"})
 
 
 CANDLE_STRATEGY_IDS = [
@@ -3179,6 +3189,16 @@ async def evaluate_candle_strategies(
     slug_field = slug or "none"
     asset_field = asset_key or "none"
     history = candle_manager.closed_history(asset_key)
+    last_n = history[-5:] if len(history) >= 5 else history
+    candles_repr = [
+        {"o": c.open, "h": c.high, "l": c.low, "c": c.close}
+        for c in last_n
+    ]
+    logging.info(
+        "CANDLE_INPUT strategy=candle_strategies asset_key=%s candles=%s",
+        asset_field,
+        candles_repr,
+    )
     for strategy_id in CANDLE_STRATEGY_IDS:
         settings = candle_strategy_settings.get(strategy_id)
         if not settings:
@@ -3213,6 +3233,13 @@ async def evaluate_candle_strategies(
             signal_result.signal,
             signal_result.metadata,
         )
+        if signal_result.signal == "NEUTRAL":
+            neutral_reason = (signal_result.metadata or {}).get("reason", "no_pattern")
+            logging.info(
+                "CANDLE_NEUTRAL_REASON strategy=%s reason=%s",
+                strategy_id,
+                neutral_reason,
+            )
         def log_candle_decision(outcome: str, skip_reason: str | None = None) -> None:
             logging.info(
                 "CANDLE_STRATEGY_DECISION strategy=%s slug=%s signal=%s metadata=%s outcome=%s skip_reason=%s",
