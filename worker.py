@@ -3741,6 +3741,11 @@ async def create_paper_strategy_position(
         )
     except Exception:
         logging.exception("Failed inserting PAPER_DECISION for strategy %s", strategy_id)
+        logging.info(
+            "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_DECISION_FAILED slug=%s",
+            strategy_id, bot_id_override, current_slug,
+        )
+        return
 
     await insert_paper_position_row(
         bot_id_override,
@@ -5233,6 +5238,10 @@ async def paper_settlement_loop():
                     )
             except Exception:
                 logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
+                logging.info(
+                    "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_CLOSED_FAILED slug=%s pnl=%s",
+                    strategy_id, bot_id, market_slug, pnl_usd,
+                )
 
         if rows:
             update_paper_settings_from_positions()
