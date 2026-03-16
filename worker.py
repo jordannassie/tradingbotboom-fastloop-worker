@@ -24,7 +24,9 @@ import json
 import logging
 import os
 from collections import deque, defaultdict
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from math import floor
@@ -52,9 +54,19 @@ COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 STRATEGY_FASTLOOP = "FASTLOOP"
 STRATEGY_SNIPER = "SNIPER"
 STRATEGY_CANDLE_BIAS = "CANDLE_BIAS"
+STRATEGY_SWEEP_RECLAIM = "SWEEP_RECLAIM"
+STRATEGY_BREAKOUT_CLOSE = "BREAKOUT_CLOSE"
+STRATEGY_ENGULFING_LEVEL = "ENGULFING_LEVEL"
+STRATEGY_REJECTION_WICK = "REJECTION_WICK"
+STRATEGY_FOLLOW_THROUGH = "FOLLOW_THROUGH"
 STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
 STRATEGY_SNIPER_BOT_ID = "paper_sniper"
 STRATEGY_CANDLE_BIAS_BOT_ID = "paper_candle_bias"
+STRATEGY_SWEEP_RECLAIM_BOT_ID = "paper_sweep_reclaim"
+STRATEGY_BREAKOUT_CLOSE_BOT_ID = "paper_breakout_close"
+STRATEGY_ENGULFING_LEVEL_BOT_ID = "paper_engulfing_level"
+STRATEGY_REJECTION_WICK_BOT_ID = "paper_rejection_wick"
+STRATEGY_FOLLOW_THROUGH_BOT_ID = "paper_follow_through"
 DEFAULT_PAPER_START_BALANCE = 1000.0
 SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
 LIVE_MASTER_BOT_ID = "live"
@@ -63,6 +75,11 @@ STRATEGY_TO_BOT_ID = {
     STRATEGY_FASTLOOP: STRATEGY_FASTLOOP_BOT_ID,
     STRATEGY_SNIPER: STRATEGY_SNIPER_BOT_ID,
     STRATEGY_CANDLE_BIAS: STRATEGY_CANDLE_BIAS_BOT_ID,
+    STRATEGY_SWEEP_RECLAIM: STRATEGY_SWEEP_RECLAIM_BOT_ID,
+    STRATEGY_BREAKOUT_CLOSE: STRATEGY_BREAKOUT_CLOSE_BOT_ID,
+    STRATEGY_ENGULFING_LEVEL: STRATEGY_ENGULFING_LEVEL_BOT_ID,
+    STRATEGY_REJECTION_WICK: STRATEGY_REJECTION_WICK_BOT_ID,
+    STRATEGY_FOLLOW_THROUGH: STRATEGY_FOLLOW_THROUGH_BOT_ID,
 }
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -261,6 +278,11 @@ strategy_trade_timestamps = {
     STRATEGY_SNIPER: deque(),
     STRATEGY_FASTLOOP: deque(),
     STRATEGY_CANDLE_BIAS: deque(),
+    STRATEGY_SWEEP_RECLAIM: deque(),
+    STRATEGY_BREAKOUT_CLOSE: deque(),
+    STRATEGY_ENGULFING_LEVEL: deque(),
+    STRATEGY_REJECTION_WICK: deque(),
+    STRATEGY_FOLLOW_THROUGH: deque(),
 }
 strategy_missing_rows: set[str] = set()
 live_master_warned = False
@@ -293,6 +315,78 @@ log_throttle_state: dict[str, tuple[int, object | None]] = {}
 last_live_order_ts = 0
 last_any_order_ts = 0
 live_positions: dict[str, float] = {}
+MAX_CANDLE_HISTORY = 32
+CANDLE_HISTORY_MINIMUM = 2
+
+
+@dataclass
+class Candle:
+    start_ts: int
+    open: float
+    high: float
+    low: float
+    close: float
+
+    def range(self) -> float:
+        return max(self.high - self.low, 0.0)
+
+    def body(self) -> float:
+        return abs(self.close - self.open)
+
+    def is_bullish(self) -> bool:
+        return self.close >= self.open
+
+    def is_bearish(self) -> bool:
+        return self.close < self.open
+
+
+@dataclass
+class CandleSignal:
+    signal: str
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+class CandleEngine:
+    def __init__(self, history_size: int = MAX_CANDLE_HISTORY) -> None:
+        self.history: deque[Candle] = deque(maxlen=history_size)
+        self.current: Candle | None = None
+        self.slug: str | None = None
+
+    def reset(self, slug: str | None) -> None:
+        self.history.clear()
+        self.current = None
+        self.slug = slug
+
+    def observe(
+        self,
+        slug: str | None,
+        price: float | None,
+        now_ts: int,
+        interval_seconds: int,
+    ) -> None:
+        if not slug or price is None or interval_seconds <= 0:
+            return
+        if self.slug != slug:
+            self.reset(slug)
+        start_ts = floor(now_ts / interval_seconds) * interval_seconds
+        if not self.current or self.current.start_ts != start_ts:
+            if self.current:
+                self.history.append(self.current)
+            self.current = Candle(start_ts, price, price, price, price)
+        else:
+            assert self.current
+            self.current.high = max(self.current.high, price)
+            self.current.low = min(self.current.low, price)
+            self.current.close = price
+
+    def closed_history(self) -> list[Candle]:
+        return list(self.history)
+
+    def has_history(self, minimum: int = CANDLE_HISTORY_MINIMUM) -> bool:
+        return len(self.history) >= minimum
+
+
+candle_engine = CandleEngine()
 
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
@@ -2149,7 +2243,15 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
 
 
 def compute_strategy_size(settings: dict[str, object], strategy_id: str, mode: str) -> float:
-    base_size = max(settings["trade_size_usd"], 0.0)
+    trade_size_input = settings["trade_size_usd"]
+    if trade_size_input < 0:
+        logging.warning(
+            "NEGATIVE_TRADE_SIZE strategy=%s trade_size_usd=%s forcing_zero",
+            strategy_id,
+            trade_size_input,
+        )
+        trade_size_input = 0.0
+    base_size = max(trade_size_input, 0.0)
     balance_base = "n/a"
     live_balance_val = None
     if base_size <= 1:
@@ -2412,8 +2514,6 @@ async def execute_strategy(
     direction_mode = settings.get("direction_mode", "normal").lower() if strategy_id in (STRATEGY_SNIPER, STRATEGY_CANDLE_BIAS) else "normal"
     final_side = normal_side
     if strategy_id == STRATEGY_SNIPER and direction_mode == "reverse":
-        final_side = "no" if normal_side == "yes" else "yes"
-    if strategy_id == STRATEGY_CANDLE_BIAS and direction_mode == "reverse":
         final_side = "no" if normal_side == "yes" else "yes"
     slug_field = current_slug or "none"
     if strategy_id == STRATEGY_SNIPER:
@@ -2746,6 +2846,359 @@ def log_candle_bias_direction(
         normal_side,
         final_side,
     )
+
+
+def detect_sweep_reclaim(history: list[Candle]) -> CandleSignal:
+    if len(history) < 3:
+        return CandleSignal("NEUTRAL")
+    baseline = history[-3]
+    sweep = history[-2]
+    reclaim = history[-1]
+    sweep_range = sweep.range()
+    if sweep_range <= 0:
+        return CandleSignal("NEUTRAL")
+    if (
+        sweep.is_bullish()
+        and sweep.high > baseline.high
+        and sweep.close > baseline.high
+        and reclaim.close < sweep.high - sweep_range * 0.35
+        and reclaim.close > baseline.high
+    ):
+        return CandleSignal(
+            "NO",
+            {
+                "reason": "bull_sweep_reclaim",
+                "sweep_close": sweep.close,
+                "reclaim_close": reclaim.close,
+            },
+        )
+    if (
+        sweep.is_bearish()
+        and sweep.low < baseline.low
+        and sweep.close < baseline.low
+        and reclaim.close > sweep.low + sweep_range * 0.35
+        and reclaim.close < baseline.low
+    ):
+        return CandleSignal(
+            "YES",
+            {
+                "reason": "bear_sweep_reclaim",
+                "sweep_close": sweep.close,
+                "reclaim_close": reclaim.close,
+            },
+        )
+    return CandleSignal("NEUTRAL")
+
+
+def detect_breakout_close(history: list[Candle]) -> CandleSignal:
+    if not history:
+        return CandleSignal("NEUTRAL")
+    last = history[-1]
+    candle_range = last.range()
+    if candle_range <= 0:
+        return CandleSignal("NEUTRAL")
+    body = last.body()
+    min_body = candle_range * 0.35
+    threshold = candle_range * 0.15
+    if last.is_bullish() and (last.high - last.close) <= threshold and body >= min_body:
+        return CandleSignal(
+            "YES", {"reason": "bullish_breakout_close", "body": body, "range": candle_range}
+        )
+    if last.is_bearish() and (last.close - last.low) <= threshold and body >= min_body:
+        return CandleSignal(
+            "NO", {"reason": "bearish_breakdown_close", "body": body, "range": candle_range}
+        )
+    return CandleSignal("NEUTRAL")
+
+
+def detect_engulfing_level(history: list[Candle]) -> CandleSignal:
+    if len(history) < 2:
+        return CandleSignal("NEUTRAL")
+    prev = history[-2]
+    last = history[-1]
+    last_body = last.body()
+    prev_body = prev.body()
+    if last.high < prev.high or last.low > prev.low or prev_body <= 0:
+        return CandleSignal("NEUTRAL")
+    if last_body < prev_body * 0.8:
+        return CandleSignal("NEUTRAL")
+    if last.is_bullish() and prev.is_bearish():
+        return CandleSignal(
+            "YES",
+            {
+                "reason": "bullish_engulf",
+                "prev_close": prev.close,
+                "last_close": last.close,
+            },
+        )
+    if last.is_bearish() and prev.is_bullish():
+        return CandleSignal(
+            "NO",
+            {
+                "reason": "bearish_engulf",
+                "prev_close": prev.close,
+                "last_close": last.close,
+            },
+        )
+    return CandleSignal("NEUTRAL")
+
+
+def detect_rejection_wick(history: list[Candle]) -> CandleSignal:
+    if not history:
+        return CandleSignal("NEUTRAL")
+    last = history[-1]
+    candle_range = last.range()
+    body = last.body()
+    if candle_range <= 0 or body <= 0:
+        return CandleSignal("NEUTRAL")
+    lower_wick = min(last.open, last.close) - last.low
+    upper_wick = last.high - max(last.open, last.close)
+    wick_threshold = max(body * 2.0, candle_range * 0.4)
+    if lower_wick >= wick_threshold:
+        return CandleSignal(
+            "YES",
+            {
+                "reason": "lower_wick_rejection",
+                "lower_wick": lower_wick,
+                "upper_wick": upper_wick,
+            },
+        )
+    if upper_wick >= wick_threshold:
+        return CandleSignal(
+            "NO",
+            {
+                "reason": "upper_wick_rejection",
+                "lower_wick": lower_wick,
+                "upper_wick": upper_wick,
+            },
+        )
+    return CandleSignal("NEUTRAL")
+
+
+def detect_follow_through(history: list[Candle]) -> CandleSignal:
+    if len(history) < 2:
+        return CandleSignal("NEUTRAL")
+    prev = history[-2]
+    last = history[-1]
+    last_body = last.body()
+    prev_range = prev.range()
+    if prev_range <= 0 or last_body <= 0:
+        return CandleSignal("NEUTRAL")
+    prev_body = prev.body()
+    if prev_body <= 0 or last_body < prev_body * 0.4:
+        return CandleSignal("NEUTRAL")
+    if prev.is_bullish() and last.is_bullish() and last.close > prev.close:
+        return CandleSignal(
+            "YES",
+            {"reason": "bull_follow_through", "prev_body": prev_body, "last_body": last_body},
+        )
+    if prev.is_bearish() and last.is_bearish() and last.close < prev.close:
+        return CandleSignal(
+            "NO",
+            {"reason": "bear_follow_through", "prev_body": prev_body, "last_body": last_body},
+        )
+    return CandleSignal("NEUTRAL")
+
+
+CANDLE_STRATEGY_IDS = [
+    STRATEGY_SWEEP_RECLAIM,
+    STRATEGY_BREAKOUT_CLOSE,
+    STRATEGY_ENGULFING_LEVEL,
+    STRATEGY_REJECTION_WICK,
+    STRATEGY_FOLLOW_THROUGH,
+]
+
+CANDLE_DETECTORS: dict[str, Callable[[list[Candle]], CandleSignal]] = {
+    STRATEGY_SWEEP_RECLAIM: detect_sweep_reclaim,
+    STRATEGY_BREAKOUT_CLOSE: detect_breakout_close,
+    STRATEGY_ENGULFING_LEVEL: detect_engulfing_level,
+    STRATEGY_REJECTION_WICK: detect_rejection_wick,
+    STRATEGY_FOLLOW_THROUGH: detect_follow_through,
+}
+
+
+async def evaluate_candle_strategies(
+    candle_strategy_settings: dict[str, dict[str, object]],
+    total_ask: float | None,
+    edge: float | None,
+    ya: float | None,
+    na: float | None,
+    client: ClobClient | None,
+    live_master_enabled: bool,
+    entry_cutoff_active: bool,
+    force_exit_triggered: bool,
+    time_to_end: float | None,
+) -> None:
+    if not candle_engine.has_history():
+        return
+    slug_field = current_slug or "none"
+    history = candle_engine.closed_history()
+    for strategy_id in CANDLE_STRATEGY_IDS:
+        settings = candle_strategy_settings.get(strategy_id)
+        if not settings:
+            continue
+        detector = CANDLE_DETECTORS.get(strategy_id)
+        if not detector:
+            continue
+        signal_result = detector(history)
+        logging.info(
+            "CANDLE_RULE_RESULT strategy=%s signal=%s metadata=%s",
+            strategy_id,
+            signal_result.signal,
+            signal_result.metadata,
+        )
+        if signal_result.signal not in ("YES", "NO"):
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                settings["is_enabled"],
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_NEUTRAL",
+            )
+            continue
+        if entry_cutoff_active:
+            log_paper_decision(
+                strategy_id,
+                current_slug,
+                time_to_end,
+                edge,
+                settings["edge_threshold"],
+                settings["is_enabled"],
+                "entry_cutoff",
+            )
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                settings["is_enabled"],
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_ENTRY_CUTOFF",
+            )
+            continue
+        if not settings["is_enabled"]:
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                False,
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_DISABLED",
+            )
+            continue
+        if settings["mode"] != "PAPER":
+            log_paper_decision(
+                strategy_id,
+                current_slug,
+                time_to_end,
+                edge,
+                settings["edge_threshold"],
+                settings["is_enabled"],
+                "other",
+            )
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                settings["is_enabled"],
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_OTHER",
+            )
+            continue
+        if should_skip_low_funds(settings["paper_balance_usd"]):
+            log_paper_decision(
+                strategy_id,
+                current_slug,
+                time_to_end,
+                edge,
+                settings["edge_threshold"],
+                settings["is_enabled"],
+                "low_funds",
+            )
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                settings["is_enabled"],
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_LOW_FUNDS",
+            )
+            continue
+        if not has_strategy_trade_capacity(
+            strategy_id, 2, settings["max_trades_per_hour"]
+        ):
+            log_paper_decision(
+                strategy_id,
+                current_slug,
+                time_to_end,
+                edge,
+                settings["edge_threshold"],
+                settings["is_enabled"],
+                "rate_limited",
+            )
+            log_market_decision(
+                strategy_id,
+                slug_field,
+                ya,
+                na,
+                total_ask,
+                edge,
+                settings["is_enabled"],
+                settings["arm_live"],
+                live_master_enabled,
+                "SKIP_RATE_LIMIT",
+            )
+            continue
+        side_override = signal_result.signal.lower()
+        executed = await execute_strategy(
+            strategy_id,
+            strategy_id,
+            settings,
+            edge or 0.0,
+            total_ask,
+            ya,
+            na,
+            client,
+            live_master_enabled,
+            skip_live=force_exit_triggered,
+            side_override=side_override,
+        )
+        log_market_decision(
+            strategy_id,
+            slug_field,
+            ya,
+            na,
+            total_ask,
+            edge,
+            settings["is_enabled"],
+            settings["arm_live"],
+            live_master_enabled,
+            "ENTER_LIVE"
+            if executed and live_master_enabled and settings["arm_live"]
+            else "ENTER_PAPER"
+            if executed
+            else "SKIP_OTHER",
+        )
 
 
 def _reason_to_result(reason: str) -> str:
@@ -3256,6 +3709,7 @@ async def rotate_loop():
         return
     global current_slug, current_yes_token, current_no_token, rotating, current_interval_seconds, current_prefix
     current_slug = None
+    candle_engine.reset(None)
     prefix_index = 0
     prefixes = MARKET_SLUG_PREFIXES
     while True:
@@ -3286,6 +3740,7 @@ async def rotate_loop():
         found = bool(market)
         if found and slug != current_slug:
             current_slug = slug
+            candle_engine.reset(current_slug)
             outcomes = [o.lower() for o in market["outcomes"]]
             clobs = market["clobTokenIds"]
             for name, token in zip(outcomes, clobs):
@@ -3327,6 +3782,7 @@ async def force_rotate_to_slug(prefix: str, target_start: int) -> str | None:
     current_interval_seconds = interval
     current_prefix = prefix
     current_slug = slug
+    candle_engine.reset(current_slug)
     outcomes = [o.lower() for o in market["outcomes"]]
     clobs = market["clobTokenIds"]
     for name, token in zip(outcomes, clobs):
@@ -3753,12 +4209,29 @@ async def heartbeat_loop(client: ClobClient | None):
         sniper_settings = read_strategy_settings(STRATEGY_SNIPER_BOT_ID)
         fastloop_settings = read_strategy_settings(STRATEGY_FASTLOOP_BOT_ID)
         candle_bias_settings = read_strategy_settings(STRATEGY_CANDLE_BIAS_BOT_ID)
+        candle_strategy_settings = {
+            strategy_id: read_strategy_settings(STRATEGY_TO_BOT_ID[strategy_id])
+            for strategy_id in CANDLE_STRATEGY_IDS
+        }
         trade_mode = current_global_trade_mode()
         live_master_enabled = read_live_master_enabled()
-        is_enabled_combined = sniper_settings["is_enabled"] or fastloop_settings["is_enabled"] or candle_bias_settings["is_enabled"]
+        candle_strategy_enabled = any(
+            settings["is_enabled"] for settings in candle_strategy_settings.values()
+        )
+        is_enabled_combined = (
+            sniper_settings["is_enabled"]
+            or fastloop_settings["is_enabled"]
+            or candle_bias_settings["is_enabled"]
+            or candle_strategy_enabled
+        )
         mode = fastloop_settings["mode"]
         edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
-        arm_live_active = sniper_settings["arm_live"] or fastloop_settings["arm_live"] or candle_bias_settings["arm_live"]
+        arm_live_active = (
+            sniper_settings["arm_live"]
+            or fastloop_settings["arm_live"]
+            or candle_bias_settings["arm_live"]
+            or any(settings["arm_live"] for settings in candle_strategy_settings.values())
+        )
         slug_field = current_slug or "none"
         if now_ts - last_proof_tick_ts >= 60:
             last_proof_tick_ts = now_ts
@@ -3811,6 +4284,8 @@ async def heartbeat_loop(client: ClobClient | None):
 
         total_ask = (ya + na) if (ya is not None and na is not None) else None
         edge = (1.0 - total_ask) if (total_ask is not None) else None
+        mid_price = approx_mid_price()
+        candle_engine.observe(current_slug, mid_price, now_ts, current_interval_seconds)
         start_ts = slug_start_timestamp(current_slug) if current_slug else None
         time_to_end = (
             (start_ts + current_interval_seconds) - now_ts if start_ts is not None else None
@@ -3827,7 +4302,12 @@ async def heartbeat_loop(client: ClobClient | None):
             live_master_enabled
             and client
             and current_slug
-            and (sniper_settings["arm_live"] or fastloop_settings["arm_live"] or candle_bias_settings["arm_live"])
+            and (
+                sniper_settings["arm_live"]
+                or fastloop_settings["arm_live"]
+                or candle_bias_settings["arm_live"]
+                or any(settings["arm_live"] for settings in candle_strategy_settings.values())
+            )
             and time_to_end is not None
         ):
             if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
@@ -3933,6 +4413,10 @@ async def heartbeat_loop(client: ClobClient | None):
                 (sniper_settings["mode"] == "PAPER")
                 or (fastloop_settings["mode"] == "PAPER")
                 or (candle_bias_settings["mode"] == "PAPER")
+                or any(
+                    settings["mode"] == "PAPER"
+                    for settings in candle_strategy_settings.values()
+                )
                 or KILL_SWITCH
             )
         )
@@ -4203,7 +4687,7 @@ async def heartbeat_loop(client: ClobClient | None):
                         _reason_to_result(fastloop_reason),
                     )
 
-        # --- CANDLE_BIAS: independent of edge, fires when enabled + prices available ---
+        # --- CANDLE_BIAS: legacy forced-side logic (no candle/OHLCV analysis) ---
         candle_bias_condition = (
             candle_bias_settings["is_enabled"]
             and ya is not None
@@ -4297,6 +4781,19 @@ async def heartbeat_loop(client: ClobClient | None):
                     else "SKIP_OTHER",
                 )
 
+        await evaluate_candle_strategies(
+            candle_strategy_settings,
+            total_ask,
+            edge,
+            ya,
+            na,
+            client,
+            live_master_enabled,
+            entry_cutoff_active,
+            force_exit_triggered,
+            time_to_end,
+        )
+
         await asyncio.sleep(5)
         if rotating:
             rotating = False
@@ -4317,6 +4814,11 @@ async def paper_settlement_loop():
                         STRATEGY_FASTLOOP_BOT_ID,
                         STRATEGY_SNIPER_BOT_ID,
                         STRATEGY_CANDLE_BIAS_BOT_ID,
+                        STRATEGY_SWEEP_RECLAIM_BOT_ID,
+                        STRATEGY_BREAKOUT_CLOSE_BOT_ID,
+                        STRATEGY_ENGULFING_LEVEL_BOT_ID,
+                        STRATEGY_REJECTION_WICK_BOT_ID,
+                        STRATEGY_FOLLOW_THROUGH_BOT_ID,
                         BOT_ID,
                     ],
                 )
