@@ -351,14 +351,38 @@ class CandleEngine:
         self.history: deque[Candle] = deque(maxlen=history_size)
         self.current: Candle | None = None
 
-    def observe(self, price: float, now_ts: int, interval_seconds: int) -> None:
+    def observe(
+        self,
+        price: float,
+        now_ts: int,
+        interval_seconds: int,
+        asset_key: str | None = None,
+    ) -> None:
         if price is None or interval_seconds <= 0:
             return
         start_ts = floor(now_ts / interval_seconds) * interval_seconds
+        logging.info(
+            "CANDLE_OBSERVE asset_key=%s ts=%s bucket=%s price=%s",
+            asset_key or "none",
+            now_ts,
+            start_ts,
+            price,
+        )
         if not self.current or self.current.start_ts != start_ts:
             if self.current:
                 self.history.append(self.current)
+                logging.info(
+                    "CANDLE_CLOSE asset_key=%s closed_candles=%s bucket=%s",
+                    asset_key or "none",
+                    len(self.history),
+                    start_ts,
+                )
             self.current = Candle(start_ts, price, price, price, price)
+            logging.info(
+                "CANDLE_NEW_CURRENT asset_key=%s bucket=%s",
+                asset_key or "none",
+                start_ts,
+            )
         else:
             assert self.current
             self.current.high = max(self.current.high, price)
@@ -406,7 +430,7 @@ class CandleManager:
         engine = self.get_engine(asset_key)
         if engine and price is not None:
             logging.info("CANDLE_KEY asset_key=%s slug=%s", asset_key, slug)
-            engine.observe(price, now_ts, interval_seconds)
+            engine.observe(price, now_ts, interval_seconds, asset_key)
 
     def closed_history(self, asset_key: str | None) -> list[Candle]:
         engine = self.get_engine(asset_key)
