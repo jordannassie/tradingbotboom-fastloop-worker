@@ -316,3 +316,10 @@ COPY_TRADE_LOOP_INTERVAL = int(os.getenv("COPY_TRADE_LOOP_INTERVAL", "60"))
 COPY_WALLET_TRADE_FETCH_LIMIT = int(os.getenv("COPY_WALLET_TRADE_FETCH_LIMIT", "50"))
 COPY_TRADE_LOOKBACK_HOURS = int(os.getenv("COPY_TRADE_LOOKBACK_HOURS", "24"))
 COPY_DATA_API_BASE = "https://data-api.polymarket.com"
+
+# COPY_SETTLEMENT_LOOP_INTERVAL: seconds between settlement passes.
+#   Default 90s — balances Gamma API politeness with position freshness.
+# COPY_SETTLEMENT_BATCH_SIZE: max open positions checked per tick.
+#   Prevents large position backlogs from stalling the loop.
+COPY_SETTLEMENT_LOOP_INTERVAL = int(os.getenv("COPY_SETTLEMENT_LOOP_INTERVAL", "90"))
+COPY_SETTLEMENT_BATCH_SIZE = int(os.getenv("COPY_SETTLEMENT_BATCH_SIZE", "100"))

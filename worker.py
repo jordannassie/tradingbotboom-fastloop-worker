@@ -5918,40 +5918,62 @@ def open_copied_position(
 
 def update_wallet_metrics_for_address(wallet_address: str) -> None:
     """
-    Upsert wallet_metrics for a tracked wallet using wallet_trades data.
+    Upsert wallet_metrics for a tracked wallet.
 
-    Currently computes: trade_count, volume, last_trade_at.
-    PnL, win_rate, avg_hold_minutes, max_drawdown, copy_score are initialized
-    to 0 as placeholders — a proper settlement/resolution pass is needed to
-    compute these accurately once market resolution data is available.
+    Computed fields (live):
+      trade_count   — rows in wallet_trades for this wallet
+      volume        — sum of notional across all wallet_trades
+      last_trade_at — most recent traded_at in wallet_trades
+      pnl_all       — sum of pnl across all CLOSED copied_positions (any bot)
+      win_rate      — closed positions with pnl > 0 / total closed (0–1 scale)
+
+    Placeholder fields (set to 0 until a proper pass is built):
+      pnl_7d / pnl_30d  — require time-windowed query on settled positions
+      avg_hold_minutes  — require (closed_at - opened_at) diff per position
+      max_drawdown      — requires equity curve sequence analysis
+      copy_score        — requires a composite ranking formula
     """
     try:
-        resp = (
+        # ── Wallet trades: count + volume + last_trade_at ─────────────────
+        wt_resp = (
             supabase.table("wallet_trades")
             .select("notional, traded_at")
             .eq("wallet_address", wallet_address)
             .execute()
         )
-        trades = resp.data or []
+        trades = wt_resp.data or []
         trade_count = len(trades)
         volume = round(sum(float(t.get("notional") or 0) for t in trades), 4)
-
         last_trade_at: str | None = None
         if trades:
             dates = [str(t["traded_at"]) for t in trades if t.get("traded_at")]
             if dates:
                 last_trade_at = max(dates)
 
+        # ── Closed copied_positions: real pnl_all + win_rate ──────────────
+        cp_resp = (
+            supabase.table("copied_positions")
+            .select("pnl")
+            .eq("wallet_address", wallet_address)
+            .eq("status", "CLOSED")
+            .execute()
+        )
+        closed_pos = cp_resp.data or []
+        pnl_values = [float(p.get("pnl") or 0) for p in closed_pos]
+        pnl_all = round(sum(pnl_values), 4)
+        wins = sum(1 for v in pnl_values if v > 0)
+        win_rate = round(wins / len(pnl_values), 4) if pnl_values else 0.0
+
         metrics = {
             "wallet_address": wallet_address,
             "trade_count": trade_count,
             "volume": volume,
             "last_trade_at": last_trade_at,
-            # Placeholder fields — requires market resolution data to compute:
+            "pnl_all": pnl_all,
+            "win_rate": win_rate,
+            # Placeholder — build these once settlement data matures:
             "pnl_7d": 0,
             "pnl_30d": 0,
-            "pnl_all": 0,
-            "win_rate": 0,
             "avg_hold_minutes": 0,
             "max_drawdown": 0,
             "copy_score": 0,
@@ -6292,6 +6314,513 @@ async def copy_trade_loop() -> None:
 
 
 # =============================================================================
+# COPY-TRADING SETTLEMENT — PAPER POSITION CLOSE LOGIC
+# =============================================================================
+#
+# copy_settlement_loop resolves open copied_positions by fetching market
+# resolution status from the Polymarket Gamma API.
+#
+# ISOLATION: Only reads/writes copied_positions, market_cache, wallet_metrics.
+#            No BTC tables, no live orders, no existing BTC loops touched.
+#
+# ASSUMPTION (this pass): All positions are treated as long BUY entries.
+#   A YES position wins if the market resolves "Yes" → exit_price = 1.0
+#   A NO  position wins if the market resolves "No"  → exit_price = 1.0
+#   The losing side exits at 0.0.
+#   SELL-shaped source trades are not settled here — left as future work.
+#
+# PnL FORMULA:
+#   shares = size / entry_price          (size is USD paper stake)
+#   pnl    = (exit_price - entry_price) * shares
+#           = size * (exit_price - entry_price) / entry_price
+#   Win:  pnl = size * (1.0 - entry_price) / entry_price   (profit)
+#   Loss: pnl = -size                                        (full loss)
+#
+# MARKET RESOLUTION LOOKUP ORDER (per position):
+#   1. Gamma API: /markets?condition_id={condition_id}
+#   2. Gamma API: /events?slug={market_slug}  (fallback)
+#   3. Gamma API: /markets?clob_token_ids={token_id}  (last resort)
+#
+# Per-tick, each unique market key is fetched at most ONCE regardless of how
+# many open positions reference it (in-memory dedup cache per tick).
+# =============================================================================
+
+
+# ── Settlement helpers ────────────────────────────────────────────────────────
+
+def load_open_copied_positions(limit: int = 100) -> list[dict]:
+    """
+    Load open copied_positions from Supabase, oldest first.
+    Bounded by limit to avoid overloading the settlement pass.
+    """
+    try:
+        resp = (
+            supabase.table("copied_positions")
+            .select("*")
+            .eq("status", "OPEN")
+            .order("opened_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        logging.exception("COPY_SETTLE_LOAD_OPEN_POSITIONS_FAIL")
+        return []
+
+
+def _parse_resolution_from_gamma_market(market: dict) -> dict | None:
+    """
+    Extract settlement information from a single Gamma API market object.
+
+    Returns a resolution dict or None if the market data is unusable.
+
+    Resolution dict fields:
+      resolved           — bool: True when the market has settled
+      resolution_outcome — "YES" | "NO" | None (None = inconclusive/N_A)
+      active             — bool: whether the market is still trading
+      end_date           — ISO str or None
+      closed_time        — ISO str or None (when market stopped trading)
+      yes_token_id       — CLOB token ID for the YES outcome, if known
+      no_token_id        — CLOB token ID for the NO outcome, if known
+      raw                — the original Gamma market dict (for market_cache)
+
+    Handles two quirks of the Gamma API:
+      - outcomes / outcomePrices are sometimes JSON-encoded strings
+      - resolution can be "N/A" (treated as inconclusive, not a win/loss)
+    """
+    if not market or not isinstance(market, dict):
+        return None
+
+    resolved = bool(market.get("resolved") or market.get("isResolved"))
+    active = bool(market.get("active", True))
+
+    resolution_raw = str(
+        market.get("resolution") or market.get("resolutionValue") or ""
+    ).strip()
+    resolution_outcome: str | None = None
+    if resolution_raw:
+        r = resolution_raw.upper()
+        if r in ("YES", "Y", "1", "TRUE", "UP"):
+            resolution_outcome = "YES"
+        elif r in ("NO", "N", "0", "FALSE", "DOWN"):
+            resolution_outcome = "NO"
+        # "N/A", "CANCELLED", "INVALID" → keep None (inconclusive)
+
+    # Parse clobTokenIds / outcomes (may be JSON strings or lists)
+    def _parse_list(raw) -> list:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw.replace("'", '"'))
+            except Exception:
+                pass
+        return []
+
+    clob_ids = _parse_list(market.get("clobTokenIds") or market.get("clob_token_ids"))
+    outcomes = _parse_list(market.get("outcomes"))
+
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
+    for outcome_str, token_id in zip(outcomes, clob_ids):
+        norm = _normalize_outcome(str(outcome_str))
+        if norm == "YES" and token_id:
+            yes_token_id = str(token_id)
+        elif norm == "NO" and token_id:
+            no_token_id = str(token_id)
+
+    return {
+        "resolved": resolved,
+        "resolution_outcome": resolution_outcome,
+        "active": active,
+        "end_date": market.get("endDate") or market.get("end_date_iso"),
+        "closed_time": market.get("closedTime") or market.get("closed_time"),
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
+        "raw": market,
+    }
+
+
+def _fetch_gamma_market_data_sync(
+    condition_id: str | None,
+    market_slug: str | None,
+    token_id: str | None,
+) -> dict | None:
+    """
+    Fetch market resolution metadata from the Polymarket Gamma API.
+
+    Tries three approaches in order:
+      1. /markets?condition_id={condition_id}    — most direct
+      2. /events?slug={slug}                     — slug-based fallback
+      3. /markets?clob_token_ids={token_id}      — token-based last resort
+
+    Returns a parsed resolution dict (from _parse_resolution_from_gamma_market)
+    or None if no usable data could be retrieved.
+    """
+    headers = {"User-Agent": "FastLoopWorker/1.0"}
+
+    # ── Attempt 1: markets?condition_id ──────────────────────────────────
+    if condition_id:
+        url = f"{GAMMA_API_BASE}/markets?condition_id={parse.quote(str(condition_id))}"
+        try:
+            req = request.Request(url, headers=headers)
+            with request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for m in markets:
+                result = _parse_resolution_from_gamma_market(m)
+                if result is not None:
+                    return result
+        except Exception as exc:
+            logging.debug(
+                "COPY_SETTLE_GAMMA_CONDID_FAIL cid=%s err=%s",
+                str(condition_id)[:16],
+                exc,
+            )
+
+    # ── Attempt 2: events?slug / events/slug/{slug} ───────────────────────
+    if market_slug:
+        slug_urls = [
+            f"{GAMMA_API_BASE}/events?slug={parse.quote(market_slug)}",
+            f"{GAMMA_API_BASE}/events/slug/{parse.quote(market_slug)}",
+        ]
+        for url in slug_urls:
+            try:
+                req = request.Request(url, headers=headers)
+                with request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read())
+                events = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+                for event in events:
+                    if not event:
+                        continue
+                    # Try each market nested inside the event
+                    nested = event.get("markets") or []
+                    for m in (nested if isinstance(nested, list) else []):
+                        result = _parse_resolution_from_gamma_market(m)
+                        if result is not None:
+                            return result
+                    # Some single-market events have resolution fields at the event level
+                    result = _parse_resolution_from_gamma_market(event)
+                    if result is not None:
+                        return result
+            except Exception:
+                continue
+
+    # ── Attempt 3: markets?clob_token_ids ────────────────────────────────
+    if token_id:
+        url = f"{GAMMA_API_BASE}/markets?clob_token_ids={parse.quote(str(token_id))}"
+        try:
+            req = request.Request(url, headers=headers)
+            with request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for m in markets:
+                result = _parse_resolution_from_gamma_market(m)
+                if result is not None:
+                    return result
+        except Exception as exc:
+            logging.debug(
+                "COPY_SETTLE_GAMMA_TOKEN_FAIL token=%s err=%s",
+                str(token_id)[:16],
+                exc,
+            )
+
+    return None
+
+
+def _update_market_cache_from_resolution(
+    market_slug: str | None,
+    resolution_data: dict,
+) -> None:
+    """
+    Update market_cache with resolution metadata fetched from the Gamma API.
+
+    Enriches: active, end_date, last_event_at, yes_token_id, no_token_id, raw_json.
+    Uses upsert on market_slug so a missing row is created if needed.
+    """
+    if not market_slug:
+        return
+    payload: dict = {
+        "market_slug": market_slug,
+        "active": resolution_data.get("active", True),
+        "raw_json": resolution_data.get("raw") or {},
+    }
+    if resolution_data.get("end_date"):
+        payload["end_date"] = resolution_data["end_date"]
+    if resolution_data.get("closed_time"):
+        payload["last_event_at"] = resolution_data["closed_time"]
+    if resolution_data.get("yes_token_id"):
+        payload["yes_token_id"] = resolution_data["yes_token_id"]
+    if resolution_data.get("no_token_id"):
+        payload["no_token_id"] = resolution_data["no_token_id"]
+    try:
+        supabase.table("market_cache").upsert(payload, on_conflict="market_slug").execute()
+    except Exception as exc:
+        logging.warning(
+            "COPY_SETTLE_UPDATE_MARKET_CACHE_FAIL slug=%s err=%s", market_slug, exc
+        )
+
+
+def compute_settlement_exit_price(pos: dict, resolution_data: dict) -> float | None:
+    """
+    Determine the paper exit price (1.0 = win, 0.0 = loss) for a copied position.
+
+    Logic:
+      - pos.outcome  = what the copied trade held ("YES" or "NO")
+      - resolution_outcome = what the market resolved to ("YES" or "NO")
+      - If they match → exit_price = 1.0  (the token pays out $1/share)
+      - If they differ → exit_price = 0.0  (the token pays out $0/share)
+      - If either is unknown → return None (cannot settle safely)
+
+    Token ID fallback:
+      If pos.outcome is missing, we try to infer it by matching pos.token_id
+      against yes_token_id / no_token_id from the Gamma resolution data.
+
+    Assumption: Only long BUY positions are handled in this pass.
+    SELL-shaped source trades remain OPEN and are flagged in the log.
+    """
+    pos_outcome = _normalize_outcome(pos.get("outcome"))
+
+    # Infer outcome from token_id if missing
+    if not pos_outcome and pos.get("token_id"):
+        yes_tkn = resolution_data.get("yes_token_id")
+        no_tkn = resolution_data.get("no_token_id")
+        if yes_tkn and pos["token_id"] == yes_tkn:
+            pos_outcome = "YES"
+        elif no_tkn and pos["token_id"] == no_tkn:
+            pos_outcome = "NO"
+
+    resolution_outcome = resolution_data.get("resolution_outcome")  # "YES" | "NO" | None
+
+    if not pos_outcome or not resolution_outcome:
+        return None  # insufficient data to settle
+
+    # Note: SELL positions would need inverse logic — not handled here.
+    if str(pos.get("side") or "BUY").upper() == "SELL":
+        logging.info(
+            "COPY_SETTLE_SKIP_SELL_POSITION pos=%s slug=%s — SELL settlement not yet implemented",
+            str(pos.get("id"))[:8],
+            pos.get("market_slug") or "?",
+        )
+        return None
+
+    return 1.0 if pos_outcome == resolution_outcome else 0.0
+
+
+def close_copied_position(
+    pos: dict,
+    exit_price: float,
+    resolution_data: dict,
+) -> None:
+    """
+    Update a copied_positions row to CLOSED with computed PnL.
+
+    PnL formula (long paper positions):
+      shares = size / entry_price
+      pnl    = (exit_price - entry_price) * shares
+             = size * (exit_price - entry_price) / entry_price
+
+    Examples (size=$10, entry_price=0.65):
+      Win  (exit=1.0): pnl = 10 * (1.0 - 0.65) / 0.65 = +$5.38
+      Loss (exit=0.0): pnl = 10 * (0.0 - 0.65) / 0.65 = -$10.00
+
+    The original raw_json is preserved and a 'settlement' sub-object is added.
+    closed_at uses the Gamma-reported closedTime when available, else utc_now_iso().
+    """
+    pos_id = str(pos.get("id") or "")
+    entry_price = float_or_none(pos.get("entry_price")) or 0.0
+    size = float_or_none(pos.get("size")) or 0.0
+
+    if entry_price > 0:
+        pnl = round(size * (exit_price - entry_price) / entry_price, 6)
+    else:
+        pnl = 0.0
+
+    closed_at = resolution_data.get("closed_time") or utc_now_iso()
+
+    updates = {
+        "status": "CLOSED",
+        "exit_price": exit_price,
+        "pnl": pnl,
+        "closed_at": closed_at,
+        "raw_json": {
+            **(pos.get("raw_json") or {}),
+            "settlement": {
+                "resolved": resolution_data.get("resolved"),
+                "resolution_outcome": resolution_data.get("resolution_outcome"),
+                "exit_price": exit_price,
+                "pnl": pnl,
+                "settled_by": "copy_settlement_loop",
+                "settled_at": utc_now_iso(),
+            },
+        },
+    }
+    try:
+        supabase.table("copied_positions").update(updates).eq("id", pos_id).execute()
+        logging.info(
+            "COPY_POSITION_CLOSED pos=%s slug=%s outcome=%s resolution=%s "
+            "exit_price=%s entry_price=%s size=%s pnl=%s",
+            pos_id[:8],
+            pos.get("market_slug") or "?",
+            pos.get("outcome"),
+            resolution_data.get("resolution_outcome"),
+            exit_price,
+            entry_price,
+            size,
+            pnl,
+        )
+    except Exception:
+        logging.exception("COPY_SETTLE_CLOSE_POSITION_FAIL pos=%s", pos_id)
+
+
+# ── Settlement loop ───────────────────────────────────────────────────────────
+
+async def copy_settlement_loop() -> None:
+    """
+    PAPER copy-trading settlement loop.
+
+    Runs every COPY_SETTLEMENT_LOOP_INTERVAL seconds alongside copy_trade_loop.
+    Closes OPEN copied_positions when their source market resolves.
+
+    Per-tick flow:
+      1. Load up to COPY_SETTLEMENT_BATCH_SIZE OPEN copied_positions (oldest first)
+      2. Deduplicate markets — build a {market_key → resolution_data} cache so
+         each unique market is fetched from the Gamma API at most once per tick
+      3. For each position:
+           a. Look up resolution_data for its market
+           b. If not resolved → skip (keep OPEN)
+           c. Compute exit_price (1.0 win / 0.0 loss)
+           d. Close position: update copied_positions (status, exit_price, pnl, closed_at)
+           e. Update market_cache with fresh Gamma metadata
+      4. For each wallet that had at least one position settled: refresh wallet_metrics
+         (triggers pnl_all + win_rate recompute from closed positions)
+      5. Log settlement summary
+
+    Market lookup key priority: condition_id > market_slug > token_id
+    All three Gamma API approaches are tried before giving up on a market.
+    """
+    if not COPY_TRADE_ENABLED:
+        logging.info("COPY_SETTLEMENT_LOOP disabled via COPY_TRADE_ENABLED=false — exiting task")
+        return
+
+    logging.info(
+        "COPY_SETTLEMENT_LOOP_BOOT interval=%ss batch=%s",
+        COPY_SETTLEMENT_LOOP_INTERVAL,
+        COPY_SETTLEMENT_BATCH_SIZE,
+    )
+
+    while True:
+        open_positions = load_open_copied_positions(COPY_SETTLEMENT_BATCH_SIZE)
+
+        settled = 0
+        skipped_unresolved = 0
+        skipped_no_data = 0
+        skipped_sell = 0
+        errors = 0
+        settled_wallets: set[str] = set()
+
+        # Per-tick market resolution cache: market_key → resolution_data | None
+        # Avoids duplicate Gamma API calls for positions on the same market.
+        market_resolution_cache: dict[str, dict | None] = {}
+
+        logging.info(
+            "COPY_SETTLEMENT_TICK_START open_positions=%s",
+            len(open_positions),
+        )
+
+        for pos in open_positions:
+            pos_id = str(pos.get("id") or "")
+            wallet_address = pos.get("wallet_address") or ""
+
+            try:
+                # ── Step 1: Build market lookup key ───────────────────────
+                condition_id = pos.get("condition_id")
+                market_slug = pos.get("market_slug")
+                token_id = pos.get("token_id")
+
+                market_key = condition_id or market_slug or token_id
+                if not market_key:
+                    logging.info(
+                        "COPY_SETTLE_NO_MARKET_KEY pos=%s — no condition_id/slug/token_id",
+                        pos_id[:8],
+                    )
+                    skipped_no_data += 1
+                    continue
+
+                # ── Step 2: Fetch resolution (deduplicated per market) ─────
+                if market_key not in market_resolution_cache:
+                    resolution_data = await asyncio.to_thread(
+                        _fetch_gamma_market_data_sync,
+                        condition_id,
+                        market_slug,
+                        token_id,
+                    )
+                    market_resolution_cache[market_key] = resolution_data
+
+                    # Enrich market_cache with whatever we learned
+                    if resolution_data and market_slug:
+                        _update_market_cache_from_resolution(market_slug, resolution_data)
+
+                resolution_data = market_resolution_cache[market_key]
+
+                if not resolution_data:
+                    logging.debug(
+                        "COPY_SETTLE_NO_RESOLUTION_DATA pos=%s slug=%s",
+                        pos_id[:8],
+                        market_slug or "?",
+                    )
+                    skipped_no_data += 1
+                    continue
+
+                # ── Step 3: Check whether market has resolved ─────────────
+                if not resolution_data.get("resolved"):
+                    skipped_unresolved += 1
+                    continue
+
+                # ── Step 4: Compute exit price ────────────────────────────
+                exit_price = compute_settlement_exit_price(pos, resolution_data)
+                if exit_price is None:
+                    # Could be SELL position or missing outcome data
+                    if str(pos.get("side") or "BUY").upper() == "SELL":
+                        skipped_sell += 1
+                    else:
+                        skipped_no_data += 1
+                    continue
+
+                # ── Step 5: Close the position ────────────────────────────
+                close_copied_position(pos, exit_price, resolution_data)
+                settled += 1
+                if wallet_address:
+                    settled_wallets.add(wallet_address)
+
+            except Exception:
+                logging.exception("COPY_SETTLE_POSITION_FAIL pos=%s", pos_id)
+                errors += 1
+
+        # ── Step 6: Refresh wallet_metrics for wallets with new closures ──
+        for wallet_address in settled_wallets:
+            try:
+                update_wallet_metrics_for_address(wallet_address)
+            except Exception:
+                logging.exception(
+                    "COPY_SETTLE_METRICS_FAIL wallet=%s", wallet_address[:10]
+                )
+
+        logging.info(
+            "COPY_SETTLEMENT_TICK_DONE scanned=%s settled=%s "
+            "skipped_unresolved=%s skipped_no_data=%s skipped_sell=%s errors=%s",
+            len(open_positions),
+            settled,
+            skipped_unresolved,
+            skipped_no_data,
+            skipped_sell,
+            errors,
+        )
+
+        await asyncio.sleep(COPY_SETTLEMENT_LOOP_INTERVAL)
+
+
+# =============================================================================
 # STARTUP — MAIN ENTRY POINT (REUSABLE SKELETON)
 # =============================================================================
 # main() builds the ClobClient and launches all long-running asyncio tasks.
@@ -6311,10 +6840,11 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("live_balance_loop", live_balance_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
     tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
-    # ── Copy-trading task (additive — isolated from BTC strategy tasks) ───────
-    # Controlled by COPY_TRADE_ENABLED env var. Safe to disable without
-    # affecting any BTC strategy behavior.
+    # ── Copy-trading tasks (additive — isolated from BTC strategy tasks) ──────
+    # Both loops are controlled by COPY_TRADE_ENABLED env var.
+    # Safe to disable either without affecting any BTC strategy behavior.
     tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop)))
+    tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)
