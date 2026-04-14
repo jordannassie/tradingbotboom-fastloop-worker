@@ -5916,71 +5916,249 @@ def open_copied_position(
         )
 
 
+def _parse_ts(s) -> "datetime | None":
+    """
+    Parse an ISO-8601 timestamp string (or datetime) into a timezone-aware datetime.
+    Returns None on any failure — callers should treat None as "unknown".
+    Handles both 'Z' suffix and '+00:00' offset styles.
+    """
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _compute_copy_score(
+    pnl_30d: float,
+    win_rate: float,
+    trade_count: int,
+    max_drawdown: float,
+    last_trade_at: "str | None",
+) -> float:
+    """
+    Compute a composite copy_score in the range 0–100.
+
+    Component weights and normalisation:
+
+      pnl_score      (30 pts) — clamped linear: -$50 → 0, $0 → 0.33, +$100 → 1.0
+                                Formula: clamp((pnl_30d + 50) / 150, 0, 1)
+                                Rationale: rewards recent profitability; neutral at $0.
+
+      win_rate_score (25 pts) — raw win_rate (0.0–1.0)
+                                Rationale: direct measure of hit rate.
+
+      activity_score (15 pts) — clamp(trade_count / 100, 0, 1)
+                                Rationale: rewards active, higher-conviction wallets.
+
+      drawdown_score (20 pts) — clamp(1 - max_drawdown / 100, 0, 1)
+                                max_drawdown is stored as % (0–100).
+                                Rationale: penalises high drawdown / volatile equity.
+
+      recency_score  (10 pts) — clamp(1 - days_since_last_trade / 30, 0, 1)
+                                Rationale: wallets inactive >30d get 0 on this component.
+
+    Wallets with no closed positions score ~33 on pnl + 0 on win_rate + varies on
+    activity/recency. This is intentionally conservative: unproven wallets rank lower.
+    """
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    pnl_score = _clamp((pnl_30d + 50.0) / 150.0, 0.0, 1.0)
+    win_rate_score = _clamp(win_rate, 0.0, 1.0)
+    activity_score = _clamp(trade_count / 100.0, 0.0, 1.0)
+    drawdown_score = _clamp(1.0 - max_drawdown / 100.0, 0.0, 1.0)
+
+    recency_score = 0.0
+    if last_trade_at:
+        last_dt = _parse_ts(last_trade_at)
+        if last_dt:
+            days_ago = (datetime.now(timezone.utc) - last_dt).total_seconds() / 86400
+            recency_score = _clamp(1.0 - days_ago / 30.0, 0.0, 1.0)
+
+    raw = (
+        pnl_score      * 30.0
+        + win_rate_score * 25.0
+        + activity_score * 15.0
+        + drawdown_score * 20.0
+        + recency_score  * 10.0
+    )
+    return round(raw, 2)
+
+
 def update_wallet_metrics_for_address(wallet_address: str) -> None:
     """
-    Upsert wallet_metrics for a tracked wallet.
+    Upsert wallet_metrics with fully computed performance fields.
 
-    Computed fields (live):
-      trade_count   — rows in wallet_trades for this wallet
-      volume        — sum of notional across all wallet_trades
-      last_trade_at — most recent traded_at in wallet_trades
-      pnl_all       — sum of pnl across all CLOSED copied_positions (any bot)
-      win_rate      — closed positions with pnl > 0 / total closed (0–1 scale)
+    DATA SOURCES
+    ─────────────────────────────────────────────────────────────────────────────
+    • wallet_trades   → trade_count, volume, last_trade_at, category_focus
+    • copied_positions (CLOSED) → pnl_all, pnl_7d, pnl_30d, win_rate,
+                                   avg_hold_minutes, max_drawdown
 
-    Placeholder fields (set to 0 until a proper pass is built):
-      pnl_7d / pnl_30d  — require time-windowed query on settled positions
-      avg_hold_minutes  — require (closed_at - opened_at) diff per position
-      max_drawdown      — requires equity curve sequence analysis
-      copy_score        — requires a composite ranking formula
+    APPROXIMATIONS (documented)
+    ─────────────────────────────────────────────────────────────────────────────
+    • pnl_7d / pnl_30d    — PnL of OUR paper copy positions settled in that window,
+                             not the source wallet's realised PnL. Best proxy
+                             available until we can track the source wallet's own
+                             exit prices from raw CLOB data.
+    • avg_hold_minutes    — Duration our copy positions were held (opened_at →
+                             closed_at), which reflects market resolution speed
+                             rather than the source wallet's actual exit timing.
+    • max_drawdown        — Peak-to-trough of cumulative paper PnL, expressed as
+                             a percentage of the equity peak. 0 if no peak yet.
+    • category_focus      — Modal market category from market_cache for markets
+                             this wallet has traded. None if market_cache has no
+                             category data for those markets.
+
+    FULLY LIVE FIELDS
+    ─────────────────────────────────────────────────────────────────────────────
+    trade_count, volume, last_trade_at, pnl_all, win_rate, copy_score, updated_at
     """
     try:
-        # ── Wallet trades: count + volume + last_trade_at ─────────────────
+        now_utc = datetime.now(timezone.utc)
+        cutoff_7d  = now_utc - timedelta(days=7)
+        cutoff_30d = now_utc - timedelta(days=30)
+
+        # ── Query 1: wallet_trades ────────────────────────────────────────
         wt_resp = (
             supabase.table("wallet_trades")
-            .select("notional, traded_at")
+            .select("notional, traded_at, market_slug")
             .eq("wallet_address", wallet_address)
             .execute()
         )
         trades = wt_resp.data or []
         trade_count = len(trades)
         volume = round(sum(float(t.get("notional") or 0) for t in trades), 4)
+
         last_trade_at: str | None = None
         if trades:
-            dates = [str(t["traded_at"]) for t in trades if t.get("traded_at")]
-            if dates:
-                last_trade_at = max(dates)
+            ts_strs = [str(t["traded_at"]) for t in trades if t.get("traded_at")]
+            if ts_strs:
+                last_trade_at = max(ts_strs)
 
-        # ── Closed copied_positions: real pnl_all + win_rate ──────────────
+        # ── Query 2: closed copied_positions ──────────────────────────────
         cp_resp = (
             supabase.table("copied_positions")
-            .select("pnl")
+            .select("pnl, opened_at, closed_at")
             .eq("wallet_address", wallet_address)
             .eq("status", "CLOSED")
+            .order("closed_at", desc=False)
             .execute()
         )
         closed_pos = cp_resp.data or []
-        pnl_values = [float(p.get("pnl") or 0) for p in closed_pos]
-        pnl_all = round(sum(pnl_values), 4)
-        wins = sum(1 for v in pnl_values if v > 0)
-        win_rate = round(wins / len(pnl_values), 4) if pnl_values else 0.0
 
-        metrics = {
-            "wallet_address": wallet_address,
-            "trade_count": trade_count,
-            "volume": volume,
-            "last_trade_at": last_trade_at,
-            "pnl_all": pnl_all,
-            "win_rate": win_rate,
-            # Placeholder — build these once settlement data matures:
-            "pnl_7d": 0,
-            "pnl_30d": 0,
-            "avg_hold_minutes": 0,
-            "max_drawdown": 0,
-            "copy_score": 0,
+        # pnl_all, pnl_7d, pnl_30d
+        pnl_all_vals: list[float] = []
+        pnl_7d_vals:  list[float] = []
+        pnl_30d_vals: list[float] = []
+        for p in closed_pos:
+            v = float(p.get("pnl") or 0)
+            pnl_all_vals.append(v)
+            closed_dt = _parse_ts(p.get("closed_at"))
+            if closed_dt:
+                if closed_dt >= cutoff_7d:
+                    pnl_7d_vals.append(v)
+                if closed_dt >= cutoff_30d:
+                    pnl_30d_vals.append(v)
+
+        pnl_all  = round(sum(pnl_all_vals),  4)
+        pnl_7d   = round(sum(pnl_7d_vals),   4)
+        pnl_30d  = round(sum(pnl_30d_vals),  4)
+
+        # win_rate (0.0–1.0)
+        wins = sum(1 for v in pnl_all_vals if v > 0)
+        win_rate = round(wins / len(pnl_all_vals), 4) if pnl_all_vals else 0.0
+
+        # avg_hold_minutes — from opened_at/closed_at diffs
+        hold_mins: list[float] = []
+        for p in closed_pos:
+            opened_dt = _parse_ts(p.get("opened_at"))
+            closed_dt = _parse_ts(p.get("closed_at"))
+            if opened_dt and closed_dt and closed_dt > opened_dt:
+                hold_mins.append((closed_dt - opened_dt).total_seconds() / 60.0)
+        avg_hold_minutes = round(sum(hold_mins) / len(hold_mins), 2) if hold_mins else 0.0
+
+        # max_drawdown (%) — peak-to-trough of cumulative PnL curve
+        max_drawdown = 0.0
+        if pnl_all_vals:
+            equity = 0.0
+            peak   = 0.0
+            max_dd = 0.0
+            for v in pnl_all_vals:   # already ordered by closed_at asc
+                equity += v
+                if equity > peak:
+                    peak = equity
+                dd = peak - equity
+                if dd > max_dd:
+                    max_dd = dd
+            if peak > 0:
+                max_drawdown = round(max_dd / peak * 100.0, 2)
+
+        # ── Query 3: category_focus (optional, fail-safe) ─────────────────
+        category_focus: str | None = None
+        market_slugs = list({t.get("market_slug") for t in trades if t.get("market_slug")})
+        if market_slugs:
+            try:
+                mc_resp = (
+                    supabase.table("market_cache")
+                    .select("category")
+                    .in_("market_slug", market_slugs[:50])
+                    .execute()
+                )
+                cats = [r["category"] for r in (mc_resp.data or []) if r.get("category")]
+                if cats:
+                    from collections import Counter
+                    category_focus = Counter(cats).most_common(1)[0][0]
+            except Exception:
+                pass  # category_focus stays None — non-critical
+
+        # ── copy_score (0–100 composite) ──────────────────────────────────
+        copy_score = _compute_copy_score(
+            pnl_30d=pnl_30d,
+            win_rate=win_rate,
+            trade_count=trade_count,
+            max_drawdown=max_drawdown,
+            last_trade_at=last_trade_at,
+        )
+
+        # ── Upsert wallet_metrics ─────────────────────────────────────────
+        metrics: dict = {
+            "wallet_address":   wallet_address,
+            "trade_count":      trade_count,
+            "volume":           volume,
+            "last_trade_at":    last_trade_at,
+            "pnl_all":          pnl_all,
+            "pnl_7d":           pnl_7d,
+            "pnl_30d":          pnl_30d,
+            "win_rate":         win_rate,
+            "avg_hold_minutes": avg_hold_minutes,
+            "max_drawdown":     max_drawdown,
+            "copy_score":       copy_score,
+            "category_focus":   category_focus,
+            "updated_at":       now_utc.isoformat(),
         }
         supabase.table("wallet_metrics").upsert(
             metrics, on_conflict="wallet_address"
         ).execute()
+
+        logging.info(
+            "COPY_METRICS_UPDATED wallet=%s trades=%s volume=%.2f "
+            "pnl_30d=%.4f win_rate=%.3f avg_hold=%.1fmin "
+            "max_dd=%.1f%% copy_score=%.1f",
+            wallet_address[:10],
+            trade_count,
+            volume,
+            pnl_30d,
+            win_rate,
+            avg_hold_minutes,
+            max_drawdown,
+            copy_score,
+        )
+
     except Exception:
         logging.exception("COPY_UPDATE_METRICS_FAIL wallet=%s", wallet_address[:10])
 
