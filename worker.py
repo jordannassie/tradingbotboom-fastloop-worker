@@ -5818,6 +5818,320 @@ def get_open_positions_count(bot_id: str) -> int:
         return 0
 
 
+# =============================================================================
+# COPY-TRADING LIVE EXECUTION — PAPER PILOT EXTENSION
+# =============================================================================
+#
+# This section extends the copy_trade_loop to support live CLOB orders for
+# copy bots with mode='LIVE'.
+#
+# ISOLATION GUARANTEE:
+#   - Does NOT call record_trade(), _record_live_position(), tracker_apply_fill()
+#     or any other BTC-specific function.
+#   - Does NOT touch rotate_loop, scan_loop, BTC strategies, or bot_trades.
+#   - Uses the same ClobClient built in main() — no parallel auth stack.
+#
+# SAFETY GATES (ALL must pass for any live order):
+#   ENV:  COPY_LIVE_ENABLED=true
+#   DB:   copy_global_settings.live_on = true
+#   DB:   copy_global_settings.emergency_stop = false
+#   DB:   copy_bots.arm_live = true  (per-bot arm)
+#   CAP:  number of enabled LIVE bots ≤ COPY_LIVE_MAX_BOTS
+#   CAP:  live open positions ≤ COPY_LIVE_MAX_OPEN_POSITIONS
+#   CAP:  live trades this hour ≤ COPY_LIVE_MAX_TRADES_PER_HOUR  (global)
+#   CAP:  per-trade USD ≤ COPY_LIVE_MAX_TRADE_USD  (hard clamp)
+#   DATA: token_id must be present
+#   DATA: source price must be valid (0 < price ≤ 1)
+#
+# PRICE STRATEGY (first pilot pass):
+#   BUY limit price  = min(source_price × (1 + max_slippage), 0.99)
+#   SELL limit price = max(source_price × (1 - max_slippage), 0.01)
+#   This gives headroom to fill vs a slightly moved market while capping
+#   our overpay. If market has moved too far, the limit order won't fill.
+# =============================================================================
+
+
+# ── Live copy global rate tracker ─────────────────────────────────────────────
+# Tracks ALL live copy trades across ALL bots. Pruned to a rolling 1-hour window.
+# Separate from copy_bot_trade_timestamps (which is per-bot).
+copy_live_trade_timestamps: deque = deque()
+
+
+def _prune_live_copy_history() -> None:
+    """Prune in-memory live copy timestamps older than 1 hour."""
+    cutoff = time() - 3600
+    while copy_live_trade_timestamps and copy_live_trade_timestamps[0] < cutoff:
+        copy_live_trade_timestamps.popleft()
+
+
+def _get_live_copy_trades_this_hour() -> int:
+    """Return total live copy trades placed in the last hour (all bots)."""
+    _prune_live_copy_history()
+    return len(copy_live_trade_timestamps)
+
+
+def _mark_live_copy_trade() -> None:
+    """Record a live copy trade timestamp for global rate limiting."""
+    copy_live_trade_timestamps.append(time())
+
+
+def get_live_open_positions_count(live_bot_ids: list[str]) -> int:
+    """
+    Count OPEN copied_positions that belong to LIVE-mode copy bots.
+
+    Returns 999 on any DB failure as a fail-safe to block further live orders.
+    """
+    if not live_bot_ids:
+        return 0
+    try:
+        resp = (
+            supabase.table("copied_positions")
+            .select("id")
+            .in_("copy_bot_id", live_bot_ids)
+            .eq("status", "OPEN")
+            .execute()
+        )
+        return len(resp.data or [])
+    except Exception:
+        logging.exception("COPY_LIVE_OPEN_POS_COUNT_FAIL")
+        return 999  # fail-safe: block orders when count is unknown
+
+
+def submit_copy_live_order(
+    client: "ClobClient",
+    token_id: str,
+    order_side: str,
+    source_price: float,
+    size_usd: float,
+    max_slippage: float = 0.03,
+) -> "tuple[bool, float, float, dict]":
+    """
+    Submit a GTC limit order on the Polymarket CLOB for a live copy trade.
+
+    This is a clean copy-trade-only order path. It deliberately does NOT call:
+      record_trade()          — writes to BTC bot_trades table
+      _record_live_position() — BTC position tracker
+      tracker_apply_fill()    — BTC fill tracker
+
+    Price with slippage buffer:
+      BUY:  limit = min(source_price × (1 + max_slippage), 0.99)
+      SELL: limit = max(source_price × (1 - max_slippage), 0.01)
+
+    Returns (success, actual_price, actual_shares, raw_response_dict).
+    On any failure returns (False, 0.0, 0.0, {"error": ...}).
+    """
+    order_side = order_side.upper()
+
+    # Fetch tick size — fall back to DEFAULT_TICK on failure
+    try:
+        tick_str = client.get_tick_size(token_id)
+        tick_size = Decimal(str(tick_str)) if tick_str else DEFAULT_TICK
+    except Exception:
+        tick_size = DEFAULT_TICK
+    if tick_size <= 0:
+        tick_size = DEFAULT_TICK
+
+    # Compute limit price with slippage buffer
+    if order_side == "BUY":
+        limit_price = min(source_price * (1.0 + max_slippage), 0.99)
+    else:
+        limit_price = max(source_price * (1.0 - max_slippage), 0.01)
+
+    price_decimal = Decimal(str(round(limit_price, 6)))
+    try:
+        price_q = price_decimal.quantize(tick_size, rounding=ROUND_DOWN)
+    except InvalidOperation:
+        logging.warning(
+            "COPY_LIVE_SKIP_PRICE_QUANTIZE token=%s price=%s tick=%s",
+            token_id[:16], limit_price, tick_size,
+        )
+        return False, 0.0, 0.0, {}
+
+    if price_q <= 0:
+        logging.warning(
+            "COPY_LIVE_SKIP_INVALID_PRICE token=%s price=%s", token_id[:16], price_q
+        )
+        return False, 0.0, 0.0, {}
+
+    size_decimal = Decimal(str(size_usd))
+    shares_raw = size_decimal / price_q
+    shares_q = shares_raw.quantize(SHARE_QUANT, rounding=ROUND_DOWN)
+
+    if shares_q <= 0:
+        logging.warning(
+            "COPY_LIVE_SKIP_ZERO_SHARES token=%s shares=%s price=%s size_usd=%s",
+            token_id[:16], shares_q, price_q, size_usd,
+        )
+        return False, 0.0, 0.0, {}
+
+    actual_price  = float(price_q)
+    actual_shares = float(shares_q)
+
+    logging.info(
+        "COPY_LIVE_ORDER_SUBMIT token=%s side=%s price=%.4f shares=%.4f "
+        "size_usd=%.2f slippage_cap=%.3f",
+        token_id[:16], order_side, actual_price, actual_shares, size_usd, max_slippage,
+    )
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=actual_price,
+        size=actual_shares,
+        side=order_side,
+    )
+    try:
+        signed = client.create_order(order_args)
+        resp   = client.post_order(signed, OrderType.GTC)
+        raw_response: dict = resp if isinstance(resp, dict) else {"response": str(resp)}
+        logging.info(
+            "COPY_LIVE_ORDER_OK token=%s side=%s price=%.4f shares=%.4f resp_keys=%s",
+            token_id[:16], order_side, actual_price, actual_shares,
+            list(raw_response.keys())[:5],
+        )
+        return True, actual_price, actual_shares, raw_response
+    except Exception as exc:
+        logging.exception(
+            "COPY_LIVE_ORDER_FAIL token=%s side=%s err=%s", token_id[:16], order_side, exc
+        )
+        return False, actual_price, actual_shares, {"error": str(exc)}
+
+
+def evaluate_and_execute_live_copy_trade(
+    copy_bot: dict,
+    wallet_trade: dict,
+    global_settings: dict,
+    trading_client: "ClobClient",
+    live_bot_ids: list[str],
+) -> "tuple[bool, str | None, float | None, float | None, dict]":
+    """
+    Run all live safety gates and, if every gate passes, submit a real CLOB order.
+
+    Returns (copied, skip_reason, submitted_size_usd, submitted_price, raw_response).
+
+    Gates are evaluated in strict order; the first failure exits with a named reason.
+
+    Skip reasons:
+      live_master_off               — copy_global_settings.live_on = false
+      emergency_stop_on             — copy_global_settings.emergency_stop = true
+      arm_live_disabled             — copy_bots.arm_live = false
+      too_many_live_bots_enabled    — enabled LIVE bots > COPY_LIVE_MAX_BOTS
+      closes_not_enabled            — SELL trade, copy_closes = false
+      delay_not_elapsed             — trade too recent for delay_seconds
+      live_trades_per_hour_reached  — per-bot hourly cap exceeded
+      live_global_hourly_cap        — global hourly live cap exceeded
+      live_open_positions_limit     — live open positions ≥ cap
+      insufficient_market_data      — token_id missing
+      unsupported_trade_shape       — price missing or out of range
+      live_trade_size_exceeds_cap   — computed size ≤ 0 after capping
+      order_submission_failed       — CLOB order rejected or exception
+    """
+    bot_id = str(copy_bot["id"])
+
+    # ── Gate L1: master live_on ───────────────────────────────────────────────
+    if not global_settings.get("live_on"):
+        return False, "live_master_off", None, None, {}
+
+    # ── Gate L2: emergency stop ───────────────────────────────────────────────
+    if global_settings.get("emergency_stop"):
+        return False, "emergency_stop_on", None, None, {}
+
+    # ── Gate L3: per-bot arm_live required ───────────────────────────────────
+    if not copy_bot.get("arm_live"):
+        return False, "arm_live_disabled", None, None, {}
+
+    # ── Gate L4: live bot count cap ───────────────────────────────────────────
+    if len(live_bot_ids) > COPY_LIVE_MAX_BOTS:
+        return False, "too_many_live_bots_enabled", None, None, {}
+
+    # ── Gate L5: opens/closes filter ─────────────────────────────────────────
+    trade_side = str(wallet_trade.get("side") or "").upper()
+    copy_closes = bool(copy_bot.get("copy_closes", False))
+    if trade_side == "SELL" and not copy_closes:
+        return False, "closes_not_enabled", None, None, {}
+
+    # ── Gate L6: delay filter ────────────────────────────────────────────────
+    delay_sec = int(copy_bot.get("delay_seconds") or 0)
+    if delay_sec > 0:
+        try:
+            traded_at_dt = datetime.fromisoformat(
+                str(wallet_trade.get("traded_at") or "").replace("Z", "+00:00")
+            )
+            if (datetime.now(timezone.utc) - traded_at_dt).total_seconds() < delay_sec:
+                return False, "delay_not_elapsed", None, None, {}
+        except Exception:
+            pass  # unparseable timestamp — skip delay gate
+
+    # ── Gate L7: per-bot hourly rate limit ───────────────────────────────────
+    max_per_hour_bot = int(copy_bot.get("max_trades_per_hour") or 20)
+    if _copy_bot_trades_this_hour(bot_id) >= max_per_hour_bot:
+        return False, "live_trades_per_hour_reached", None, None, {}
+
+    # ── Gate L8: global live hourly cap ──────────────────────────────────────
+    if _get_live_copy_trades_this_hour() >= COPY_LIVE_MAX_TRADES_PER_HOUR:
+        return False, "live_global_hourly_cap", None, None, {}
+
+    # ── Gate L9: live open positions cap ─────────────────────────────────────
+    if trade_side in ("BUY", ""):
+        live_open = get_live_open_positions_count(live_bot_ids)
+        if live_open >= COPY_LIVE_MAX_OPEN_POSITIONS:
+            return False, "live_open_positions_limit", None, None, {}
+
+    # ── Gate L10: token_id required ──────────────────────────────────────────
+    token_id = wallet_trade.get("token_id")
+    if not token_id:
+        return False, "insufficient_market_data", None, None, {}
+
+    # ── Gate L11: valid source price ─────────────────────────────────────────
+    price_raw = wallet_trade.get("price")
+    if price_raw is None:
+        return False, "unsupported_trade_shape", None, None, {}
+    try:
+        source_price = float(price_raw)
+        if not (0 < source_price <= 1):
+            return False, "unsupported_trade_shape", None, None, {}
+    except (TypeError, ValueError):
+        return False, "unsupported_trade_shape", None, None, {}
+
+    # ── Compute and hard-cap size ─────────────────────────────────────────────
+    computed_size = compute_copy_size(copy_bot, wallet_trade, global_settings)
+    if not computed_size or computed_size <= 0:
+        return False, "unsupported_trade_shape", None, None, {}
+
+    submitted_size = min(float(computed_size), COPY_LIVE_MAX_TRADE_USD)
+    if submitted_size <= 0:
+        return False, "live_trade_size_exceeds_cap", None, None, {}
+
+    if float(computed_size) > COPY_LIVE_MAX_TRADE_USD:
+        logging.info(
+            "COPY_LIVE_SIZE_CAPPED bot=%s computed=%.2f cap=%.2f final=%.2f",
+            str(copy_bot.get("name") or bot_id[:8]),
+            float(computed_size), COPY_LIVE_MAX_TRADE_USD, submitted_size,
+        )
+
+    # ── Submit CLOB order ─────────────────────────────────────────────────────
+    max_slippage = float(
+        copy_bot.get("max_slippage")
+        or global_settings.get("default_slippage_cap")
+        or 0.03
+    )
+    order_side = trade_side if trade_side in ("BUY", "SELL") else "BUY"
+
+    ok, actual_price, actual_shares, raw_response = submit_copy_live_order(
+        trading_client,
+        token_id,
+        order_side,
+        source_price,
+        submitted_size,
+        max_slippage,
+    )
+    if not ok:
+        return False, "order_submission_failed", submitted_size, source_price, raw_response
+
+    return True, None, submitted_size, actual_price, raw_response
+
+
+# ── Audit + position helpers ──────────────────────────────────────────────────
+
 def log_copy_attempt(
     copy_bot: dict,
     wallet_trade: dict,
@@ -5826,6 +6140,7 @@ def log_copy_attempt(
     submitted_size: float | None,
     submitted_price: float | None,
     order_status: str = "SKIPPED",
+    raw_response: dict | None = None,
 ) -> None:
     """Write a copy_attempts audit row. Always written — even for skipped trades."""
     try:
@@ -5845,7 +6160,7 @@ def log_copy_attempt(
             "copied": copied,
             "skip_reason": skip_reason,
             "order_status": order_status,
-            "raw_response": {},
+            "raw_response": raw_response or {},
         }
         supabase.table("copy_attempts").insert(row).execute()
     except Exception:
@@ -5861,14 +6176,21 @@ def open_copied_position(
     wallet_trade: dict,
     submitted_size: float,
     submitted_price: float,
+    mode: str = "PAPER",
 ) -> None:
     """
-    Create a copied_positions row for a paper copy trade.
+    Create a copied_positions row for a paper or live copy trade.
 
-    'size' stores the USD paper position size (submitted_size).
-    'entry_price' is the per-share price at which we paper-entered.
-    PnL at close: pnl = size * (exit_price / entry_price - 1)
+    mode: "PAPER" (default) or "LIVE"
+
+    'size' stores the USD position size (submitted_size).
+    'entry_price' is the per-share price at which we entered.
+    PnL at close: pnl = size * (exit_price - entry_price) / entry_price
+
+    The raw_json includes mode metadata so copied_positions rows can be
+    distinguished as paper vs live without joining to copy_bots.
     """
+    is_live = str(mode).upper() == "LIVE"
     try:
         row = {
             "copy_bot_id": str(copy_bot["id"]),
@@ -5885,7 +6207,9 @@ def open_copied_position(
             "status": "OPEN",
             "pnl": 0,
             "raw_json": {
-                "paper": True,
+                "paper": not is_live,
+                "live": is_live,
+                "mode": mode.upper(),
                 "copy_mode": copy_bot.get("copy_mode"),
                 "sizing_value": copy_bot.get("sizing_value"),
                 "source": {
@@ -5899,7 +6223,9 @@ def open_copied_position(
         }
         supabase.table("copied_positions").insert(row).execute()
         logging.info(
-            "COPY_POSITION_OPENED bot=%s wallet=%s slug=%s side=%s outcome=%s size=%s price=%s",
+            "COPY_POSITION_OPENED mode=%s bot=%s wallet=%s slug=%s "
+            "side=%s outcome=%s size=%s price=%s",
+            mode.upper(),
             str(copy_bot.get("id", "?"))[:8],
             wallet_trade["wallet_address"][:10],
             wallet_trade.get("market_slug") or "unknown",
@@ -6309,62 +6635,80 @@ def evaluate_copy_bot_for_trade(
 
 # ── Copy trade loop ───────────────────────────────────────────────────────────
 
-async def copy_trade_loop() -> None:
+async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
     """
-    PAPER copy-trading ingestion and simulation loop.
+    Copy-trading ingestion and execution loop. Handles both PAPER and LIVE bots.
 
     Runs every COPY_TRADE_LOOP_INTERVAL seconds alongside existing BTC tasks.
-    Does NOT affect BTC strategy logic, live orders, or any BTC-specific tables.
+    Does NOT affect BTC strategy logic, bot_trades, or any BTC-specific tables.
 
     Per-tick flow:
       1. Load active tracked_wallets + enabled copy_bots + global_settings
-      2. For each wallet: fetch recent trades from Polymarket data API
-      3. Normalize raw activity → wallet_trades schema
-      4. Insert new wallet_trades (dedup by wallet_address + source_trade_id)
-      5. Upsert market_cache from trade metadata
-      6. For each enabled PAPER copy bot watching this wallet:
+      2. Identify LIVE bots (for cap checks) and PAPER bots
+      3. For each wallet: fetch + normalize + ingest wallet_trades
+      4. For each bot watching this wallet:
+
+         PAPER bots (mode='PAPER'):
            a. Find unevaluated trades (no copy_attempts row yet)
-           b. Run evaluate_copy_bot_for_trade()
-           c. Write copy_attempts row (always — even for skips)
-           d. On copy: write copied_positions row (status=OPEN)
-      7. Update wallet_metrics (trade_count, volume, last_trade_at)
-      8. Sleep COPY_TRADE_LOOP_INTERVAL seconds
+           b. evaluate_copy_bot_for_trade() — existing paper gate logic
+           c. Write copy_attempts (always, even skips)
+           d. On copy: write copied_positions (status=OPEN, mode=PAPER)
+
+         LIVE bots (mode='LIVE'):
+           a. Pre-check COPY_LIVE_ENABLED and trading_client availability
+           b. evaluate_and_execute_live_copy_trade() — 11 live safety gates
+              including live_on, emergency_stop, arm_live, caps, token_id
+           c. On gate pass: submit real CLOB GTC order
+           d. Write copy_attempts (with order_status, raw_response)
+           e. On copy: write copied_positions (status=OPEN, mode=LIVE)
+
+      5. Update wallet_metrics for each wallet
+      6. Log per-tick summary (paper + live positions opened, errors)
+      7. Sleep COPY_TRADE_LOOP_INTERVAL seconds
     """
     if not COPY_TRADE_ENABLED:
-        logging.info("COPY_TRADE_LOOP disabled via COPY_TRADE_ENABLED env var — exiting task")
+        logging.info("COPY_TRADE_LOOP disabled via COPY_TRADE_ENABLED=false — exiting task")
         return
 
     logging.info(
-        "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s",
+        "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s live_enabled=%s",
         COPY_TRADE_LOOP_INTERVAL,
         COPY_TRADE_LOOKBACK_HOURS,
         COPY_WALLET_TRADE_FETCH_LIMIT,
+        COPY_LIVE_ENABLED,
     )
 
     while True:
-        wallets = load_tracked_wallets()
-        all_bots = load_enabled_copy_bots()
+        wallets        = load_tracked_wallets()
+        all_bots       = load_enabled_copy_bots()
         global_settings = load_copy_global_settings()
 
-        total_wallets = len(wallets)
-        total_new_trades = 0
-        total_attempts = 0
-        total_positions = 0
-        total_errors = 0
+        # Identify LIVE bots once per tick for cap checks
+        live_bots    = [b for b in all_bots if str(b.get("mode", "PAPER")).upper() == "LIVE"]
+        live_bot_ids = [str(b["id"]) for b in live_bots]
+
+        total_wallets      = len(wallets)
+        total_new_trades   = 0
+        total_attempts     = 0
+        total_paper_opened = 0
+        total_live_opened  = 0
+        total_errors       = 0
 
         log_rate_limited(
             "copy_loop_global_settings",
             LOG_THROTTLE_SECONDS,
-            "COPY_GLOBAL_SETTINGS emergency_stop=%s live_on=%s wallets=%s bots=%s",
+            "COPY_GLOBAL_SETTINGS emergency_stop=%s live_on=%s "
+            "wallets=%s bots=%s live_bots=%s",
             global_settings.get("emergency_stop"),
             global_settings.get("live_on"),
             total_wallets,
             len(all_bots),
+            len(live_bots),
         )
 
         for wallet in wallets:
             wallet_address = wallet["wallet_address"]
-            wallet_label = wallet_address[:10] + "..."
+            wallet_label   = wallet_address[:10] + "..."
 
             try:
                 # ── Step 1: Fetch raw activity ────────────────────────────
@@ -6376,9 +6720,7 @@ async def copy_trade_loop() -> None:
                     trade_row = normalize_activity_to_wallet_trade(raw, wallet_address)
                     if not trade_row:
                         continue
-                    # Always upsert market_cache from trade metadata
                     upsert_market_cache(trade_row)
-                    # Insert only if new; dedup via unique constraint
                     if insert_wallet_trade_if_new(trade_row):
                         newly_inserted.append(trade_row)
                         total_new_trades += 1
@@ -6386,90 +6728,141 @@ async def copy_trade_loop() -> None:
                 if newly_inserted:
                     logging.info(
                         "COPY_TRADES_INGESTED wallet=%s new=%s raw_fetched=%s",
-                        wallet_label,
-                        len(newly_inserted),
-                        len(raw_activities),
+                        wallet_label, len(newly_inserted), len(raw_activities),
                     )
 
                 # ── Step 3: Match copy bots + evaluate ───────────────────
-                wallet_bots = [
-                    b for b in all_bots if b["wallet_address"] == wallet_address
-                ]
+                wallet_bots = [b for b in all_bots if b["wallet_address"] == wallet_address]
 
                 for bot in wallet_bots:
-                    bot_id = str(bot["id"])
+                    bot_id    = str(bot["id"])
                     bot_label = bot.get("name") or bot_id[:8]
+                    bot_mode  = str(bot.get("mode", "PAPER")).upper()
 
                     unevaluated = get_unevaluated_trades_for_bot(
-                        wallet_address,
-                        bot_id,
-                        COPY_TRADE_LOOKBACK_HOURS,
+                        wallet_address, bot_id, COPY_TRADE_LOOKBACK_HOURS,
                     )
                     if not unevaluated:
                         continue
 
                     logging.info(
-                        "COPY_BOT_EVAL bot=%s wallet=%s unevaluated=%s",
-                        bot_label,
-                        wallet_label,
-                        len(unevaluated),
+                        "COPY_BOT_EVAL bot=%s mode=%s wallet=%s unevaluated=%s",
+                        bot_label, bot_mode, wallet_label, len(unevaluated),
                     )
 
                     for wallet_trade in unevaluated:
                         trade_label = str(wallet_trade.get("source_trade_id", "?"))[:20]
-                        try:
-                            copied, skip_reason, submitted_size, submitted_price = (
-                                evaluate_copy_bot_for_trade(
-                                    bot, wallet_trade, global_settings
-                                )
-                            )
-                            order_status = "PAPER_MATCHED" if copied else "SKIPPED"
 
-                            log_copy_attempt(
-                                bot,
-                                wallet_trade,
-                                copied,
-                                skip_reason,
-                                submitted_size,
-                                submitted_price,
-                                order_status,
-                            )
-                            total_attempts += 1
-
-                            if copied:
-                                open_copied_position(
-                                    bot, wallet_trade, submitted_size, submitted_price
+                        # ── PAPER path ────────────────────────────────────
+                        if bot_mode == "PAPER":
+                            try:
+                                copied, skip_reason, submitted_size, submitted_price = (
+                                    evaluate_copy_bot_for_trade(bot, wallet_trade, global_settings)
                                 )
-                                _copy_bot_mark_trade(bot_id)
-                                total_positions += 1
-                                logging.info(
-                                    "COPY_PAPER_COPIED bot=%s wallet=%s trade=%s "
-                                    "slug=%s side=%s outcome=%s size=%s price=%s",
-                                    bot_label,
-                                    wallet_label,
-                                    trade_label,
-                                    wallet_trade.get("market_slug") or "?",
-                                    wallet_trade.get("side"),
-                                    wallet_trade.get("outcome"),
+                                order_status = "PAPER_MATCHED" if copied else "SKIPPED"
+                                log_copy_attempt(
+                                    bot, wallet_trade, copied, skip_reason,
+                                    submitted_size, submitted_price, order_status,
+                                )
+                                total_attempts += 1
+                                if copied:
+                                    open_copied_position(
+                                        bot, wallet_trade, submitted_size, submitted_price,
+                                        mode="PAPER",
+                                    )
+                                    _copy_bot_mark_trade(bot_id)
+                                    total_paper_opened += 1
+                                    logging.info(
+                                        "COPY_PAPER_COPIED bot=%s wallet=%s trade=%s "
+                                        "slug=%s side=%s outcome=%s size=%s price=%s",
+                                        bot_label, wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        wallet_trade.get("side"),
+                                        wallet_trade.get("outcome"),
+                                        submitted_size, submitted_price,
+                                    )
+                                else:
+                                    logging.info(
+                                        "COPY_PAPER_SKIPPED bot=%s wallet=%s trade=%s reason=%s",
+                                        bot_label, wallet_label, trade_label, skip_reason,
+                                    )
+                            except Exception:
+                                logging.exception(
+                                    "COPY_PAPER_EVALUATE_FAIL bot=%s trade=%s",
+                                    bot_label, trade_label,
+                                )
+                                total_errors += 1
+
+                        # ── LIVE path ─────────────────────────────────────
+                        elif bot_mode == "LIVE":
+                            try:
+                                # Pre-checks before calling evaluate (fast fails)
+                                if not COPY_LIVE_ENABLED:
+                                    log_copy_attempt(
+                                        bot, wallet_trade, False,
+                                        "live_copy_globally_disabled",
+                                        None, None, "SKIPPED",
+                                    )
+                                    total_attempts += 1
+                                    continue
+
+                                if not trading_client:
+                                    log_copy_attempt(
+                                        bot, wallet_trade, False,
+                                        "live_client_unavailable",
+                                        None, None, "SKIPPED",
+                                    )
+                                    total_attempts += 1
+                                    continue
+
+                                (
+                                    copied,
+                                    skip_reason,
                                     submitted_size,
                                     submitted_price,
-                                )
-                            else:
-                                logging.info(
-                                    "COPY_PAPER_SKIPPED bot=%s wallet=%s trade=%s reason=%s",
-                                    bot_label,
-                                    wallet_label,
-                                    trade_label,
-                                    skip_reason,
+                                    raw_response,
+                                ) = evaluate_and_execute_live_copy_trade(
+                                    bot, wallet_trade, global_settings,
+                                    trading_client, live_bot_ids,
                                 )
 
-                        except Exception:
-                            logging.exception(
-                                "COPY_EVALUATE_FAIL bot=%s trade=%s",
-                                bot_label,
-                                trade_label,
-                            )
-                            total_errors += 1
+                                order_status = "LIVE_MATCHED" if copied else "SKIPPED"
+                                log_copy_attempt(
+                                    bot, wallet_trade, copied, skip_reason,
+                                    submitted_size, submitted_price,
+                                    order_status, raw_response,
+                                )
+                                total_attempts += 1
+
+                                if copied:
+                                    open_copied_position(
+                                        bot, wallet_trade, submitted_size, submitted_price,
+                                        mode="LIVE",
+                                    )
+                                    _copy_bot_mark_trade(bot_id)
+                                    _mark_live_copy_trade()
+                                    total_live_opened += 1
+                                    logging.info(
+                                        "COPY_LIVE_COPIED bot=%s wallet=%s trade=%s "
+                                        "slug=%s side=%s outcome=%s size=%s price=%s",
+                                        bot_label, wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        wallet_trade.get("side"),
+                                        wallet_trade.get("outcome"),
+                                        submitted_size, submitted_price,
+                                    )
+                                else:
+                                    logging.info(
+                                        "COPY_LIVE_SKIPPED bot=%s wallet=%s trade=%s reason=%s",
+                                        bot_label, wallet_label, trade_label, skip_reason,
+                                    )
+
+                            except Exception:
+                                logging.exception(
+                                    "COPY_LIVE_EVALUATE_FAIL bot=%s trade=%s",
+                                    bot_label, trade_label,
+                                )
+                                total_errors += 1
 
                 # ── Step 4: Update wallet metrics ─────────────────────────
                 update_wallet_metrics_for_address(wallet_address)
@@ -6480,12 +6873,9 @@ async def copy_trade_loop() -> None:
 
         logging.info(
             "COPY_TRADE_LOOP_TICK wallets=%s new_trades=%s attempts=%s "
-            "paper_positions_opened=%s errors=%s",
-            total_wallets,
-            total_new_trades,
-            total_attempts,
-            total_positions,
-            total_errors,
+            "paper_opened=%s live_opened=%s errors=%s",
+            total_wallets, total_new_trades, total_attempts,
+            total_paper_opened, total_live_opened, total_errors,
         )
 
         await asyncio.sleep(COPY_TRADE_LOOP_INTERVAL)
@@ -7020,8 +7410,9 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
     # ── Copy-trading tasks (additive — isolated from BTC strategy tasks) ──────
     # Both loops are controlled by COPY_TRADE_ENABLED env var.
-    # Safe to disable either without affecting any BTC strategy behavior.
-    tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop)))
+    # trading_client is passed to copy_trade_loop so LIVE bots can submit CLOB
+    # orders. PAPER bots ignore it. Safe to disable without affecting BTC tasks.
+    tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
     restart_ws_task()
     try:

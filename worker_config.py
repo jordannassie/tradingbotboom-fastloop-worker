@@ -323,3 +323,29 @@ COPY_DATA_API_BASE = "https://data-api.polymarket.com"
 #   Prevents large position backlogs from stalling the loop.
 COPY_SETTLEMENT_LOOP_INTERVAL = int(os.getenv("COPY_SETTLEMENT_LOOP_INTERVAL", "90"))
 COPY_SETTLEMENT_BATCH_SIZE = int(os.getenv("COPY_SETTLEMENT_BATCH_SIZE", "100"))
+
+# ── 19. Live copy-trading pilot config ────────────────────────────────────────
+#
+# ALL of these must be satisfied before any live copy order is submitted.
+# The defaults are intentionally conservative for a first pilot.
+#
+# COPY_LIVE_ENABLED           Master env-var switch for the live path.
+#                             Defaults to "false" — must be explicitly set to
+#                             enable live copy execution.
+# COPY_LIVE_MAX_BOTS          Max enabled LIVE-mode copy bots allowed at once.
+#                             Pilot default: 1.
+# COPY_LIVE_MAX_TRADE_USD     Hard USD cap per live copy order.
+#                             Computed size is clamped to this before submission.
+#                             Pilot default: $5.
+# COPY_LIVE_MAX_OPEN_POSITIONS Max open live copied_positions across all live bots.
+#                             Pilot default: 3.
+# COPY_LIVE_MAX_TRADES_PER_HOUR Global cap on live copy orders per hour (all bots).
+#                             Pilot default: 5.
+
+COPY_LIVE_ENABLED = os.getenv("COPY_LIVE_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+COPY_LIVE_MAX_BOTS             = int(os.getenv("COPY_LIVE_MAX_BOTS",              "1"))
+COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",       "5.0"))
+COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
+COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
