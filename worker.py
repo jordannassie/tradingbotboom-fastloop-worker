@@ -1,3 +1,42 @@
+# =============================================================================
+# WORKER ARCHITECTURE OVERVIEW
+# =============================================================================
+#
+# This is the BTC 5-min Polymarket trading worker (FastLoop).
+# Entry point: main() → asyncio.gather() of five long-running tasks.
+#
+# TASK MAP
+# ────────
+#   heartbeat_loop      Core trading tick (~5s). Reads settings, computes edge,
+#                       fires strategies. COPY-TRADE HOOK: replace strategy body.
+#   rotate_loop         BTC-SPECIFIC. Builds timestamp slugs, resolves up/down
+#                       outcomes → YES/NO tokens, restarts WS.
+#   market_listener     REUSABLE. Polymarket CLOB WebSocket; populates best_quotes.
+#   paper_settlement_loop  REUSABLE. Settles expired paper positions.
+#   live_balance_loop   REUSABLE. Syncs live USDC balance to Supabase.
+#   scan_loop           REUSABLE. Periodic SCAN heartbeat row.
+#
+# CONFIG
+# ──────
+#   All constants and env vars → worker_config.py
+#   BTC-SPECIFIC sections are clearly marked there.
+#   COPY-TRADE HOOK comments in worker_config.py show where copy-trading plugs in.
+#
+# SAFE-TO-REUSE CORE (do not change carelessly)
+# ──────────────────────────────────────────────
+#   _run_forever, build_trading_client, submit_order, close_live_position_ladder
+#   record_heartbeat, record_trade, read_strategy_settings, read_live_master_enabled
+#   market_listener, PAPER / ARM LIVE / LIVE ON / KILL_SWITCH gate logic
+#
+# BTC-SPECIFIC (replace for copy-trading)
+# ────────────────────────────────────────
+#   rotate_loop, interval_from_prefix, slug_start_timestamp, asset_key_from_slug
+#   slug_from_start, _fetch_btc_spot_price_sync, evaluate_candle_strategies
+#   detect_* candle pattern functions, CANDLE_DETECTORS, heartbeat_loop strategy body
+#   up/down outcome mapping in rotate_loop
+#
+# =============================================================================
+
 def log_paper_decision(
     strategy: str,
     slug: str | None,
@@ -27,7 +66,7 @@ from collections import deque, defaultdict
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from math import floor
 from time import time
@@ -47,76 +86,16 @@ from py_clob_client.clob_types import (
 )
 from supabase import create_client
 
-HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137
-WS_MARKET = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-STRATEGY_FASTLOOP = "FASTLOOP"
-STRATEGY_SNIPER = "SNIPER"
-STRATEGY_CANDLE_BIAS = "CANDLE_BIAS"
-STRATEGY_SWEEP_RECLAIM = "SWEEP_RECLAIM"
-STRATEGY_BREAKOUT_CLOSE = "BREAKOUT_CLOSE"
-STRATEGY_ENGULFING_LEVEL = "ENGULFING_LEVEL"
-STRATEGY_REJECTION_WICK = "REJECTION_WICK"
-STRATEGY_FOLLOW_THROUGH = "FOLLOW_THROUGH"
-STRATEGY_FASTLOOP_BOT_ID = "paper_fastloop"
-STRATEGY_SNIPER_BOT_ID = "paper_sniper"
-STRATEGY_CANDLE_BIAS_BOT_ID = "paper_candle_bias"
-STRATEGY_SWEEP_RECLAIM_BOT_ID = "paper_sweep_reclaim"
-STRATEGY_BREAKOUT_CLOSE_BOT_ID = "paper_breakout_close"
-STRATEGY_ENGULFING_LEVEL_BOT_ID = "paper_engulfing_level"
-STRATEGY_REJECTION_WICK_BOT_ID = "paper_rejection_wick"
-STRATEGY_FOLLOW_THROUGH_BOT_ID = "paper_follow_through"
-DEFAULT_PAPER_START_BALANCE = 1000.0
-SNIPER_SIZE_CAP_USD = float(os.getenv("SNIPER_SIZE_CAP_USD", "500"))
-LIVE_MASTER_BOT_ID = "live"
-
-STRATEGY_TO_BOT_ID = {
-    STRATEGY_FASTLOOP: STRATEGY_FASTLOOP_BOT_ID,
-    STRATEGY_SNIPER: STRATEGY_SNIPER_BOT_ID,
-    STRATEGY_CANDLE_BIAS: STRATEGY_CANDLE_BIAS_BOT_ID,
-    STRATEGY_SWEEP_RECLAIM: STRATEGY_SWEEP_RECLAIM_BOT_ID,
-    STRATEGY_BREAKOUT_CLOSE: STRATEGY_BREAKOUT_CLOSE_BOT_ID,
-    STRATEGY_ENGULFING_LEVEL: STRATEGY_ENGULFING_LEVEL_BOT_ID,
-    STRATEGY_REJECTION_WICK: STRATEGY_REJECTION_WICK_BOT_ID,
-    STRATEGY_FOLLOW_THROUGH: STRATEGY_FOLLOW_THROUGH_BOT_ID,
-}
-
-GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-PAPER_BANKROLL_SHARED_ENABLED = os.getenv("PAPER_BANKROLL_SHARED", "false").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
-load_dotenv()
+# ── Configuration ─────────────────────────────────────────────────────────────
+# All constants and environment variables are defined in worker_config.py.
+# BTC-SPECIFIC sections are clearly marked there.
+# COPY-TRADE HOOK comments in worker_config.py show where copy-trading plugs in.
+from worker_config import *  # noqa: F401, F403
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
-PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
-PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
-MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.0"))
-MIN_ORDER_SHARES = float(os.getenv("MIN_ORDER_SHARES", "5.0"))
-ENTRY_CUTOFF_SECONDS = int(os.getenv("ENTRY_CUTOFF_SECONDS", "120"))
-FORCE_EXIT_SECONDS = int(os.getenv("FORCE_EXIT_SECONDS", "150"))
-EXIT_LADDER_MAX_STEPS = int(os.getenv("EXIT_LADDER_MAX_STEPS", "8"))
-EXIT_LADDER_STEP_SECONDS = int(os.getenv("EXIT_LADDER_STEP_SECONDS", "2"))
-EXIT_LADDER_PRICE_IMPROVE_CENTS = float(os.getenv("EXIT_LADDER_PRICE_IMPROVE_CENTS", "1.0"))
-FAST_TP_CENTS = float(os.getenv("FAST_TP_CENTS", "0.05"))
-FAST_SL_CENTS = float(os.getenv("FAST_SL_CENTS", "0.05"))
-FAST_MAX_HOLD_SECONDS = int(os.getenv("FAST_MAX_HOLD_SECONDS", "120"))
-SNIPE_TP_CENTS = float(os.getenv("SNIPE_TP_CENTS", "0.1"))
-SNIPE_SL_CENTS = float(os.getenv("SNIPE_SL_CENTS", "0.1"))
-SNIPE_MAX_HOLD_SECONDS = int(os.getenv("SNIPE_MAX_HOLD_SECONDS", "240"))
-CANDLE_BIAS_TP_CENTS = float(os.getenv("CANDLE_BIAS_TP_CENTS", "0.07"))
-CANDLE_BIAS_SL_CENTS = float(os.getenv("CANDLE_BIAS_SL_CENTS", "0.07"))
-CANDLE_BIAS_MAX_HOLD_SECONDS = int(os.getenv("CANDLE_BIAS_MAX_HOLD_SECONDS", "180"))
-LOW_FUNDS_SKIP_USD = float(os.getenv("LOW_FUNDS_SKIP_USD", "4.0"))
-LIVE_MIN_AVAILABLE_USD = float(os.getenv("LIVE_MIN_AVAILABLE_USD", "5.0"))
-PAPER_MIN_AVAILABLE_USD = float(os.getenv("PAPER_MIN_AVAILABLE_USD", "5.0"))
 logging.info("WORKER_BOOT build=OPUS_FIX_V1")
 logging.info(
     "TP_SL_CONFIG fast_tp=%s fast_sl=%s fast_max_hold=%s snipe_tp=%s snipe_sl=%s snipe_max_hold=%s entry_cutoff=%s force_exit=%s low_funds_skip=%s",
@@ -147,36 +126,30 @@ logging.info(
     "paper_candle_bias",
 )
 
-LIVE_WALLET_ADDRESS_EXPECTED = os.getenv("LIVE_WALLET_ADDRESS_EXPECTED")
-LIVE_BANKROLL_REFRESH_SECONDS = int(os.getenv("LIVE_BANKROLL_REFRESH_SECONDS", "30"))
-LIVE_TEST_ORDER_USD = (
-    float(os.getenv("LIVE_TEST_ORDER_USD")) if os.getenv("LIVE_TEST_ORDER_USD") else None
-)
-LIVE_USDC_DECIMALS = int(os.getenv("LIVE_USDC_DECIMALS", "6"))
-STUCK_LIVE_SECONDS = int(os.getenv("STUCK_LIVE_SECONDS", "600"))
-STUCK_ANY_SECONDS = int(os.getenv("STUCK_ANY_SECONDS", "900"))
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-BOT_ID = os.getenv("BOT_ID", "default")
-
-YES_TOKEN_ID = os.getenv("YES_TOKEN_ID")
-NO_TOKEN_ID = os.getenv("NO_TOKEN_ID")
-
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "0")
-FUNDER = os.getenv("FUNDER")  # optional
-KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
+# ── Global mutable state ───────────────────────────────────────────────────────
+# These are runtime state variables, NOT config. They are mutated by the asyncio
+# tasks (rotate_loop, heartbeat_loop, market_listener) during operation.
+#
+# WARNING: All globals below are shared across asyncio tasks. asyncio is
+# single-threaded so there are no data races, but ordering of mutations matters.
+# Do not add threading here without replacing these with asyncio primitives.
+#
+# COPY-TRADE HOOK: current_yes_token / current_no_token will be populated by
+#                  the copy market config loader instead of rotate_loop.
 
 current_slug = None
 current_yes_token = YES_TOKEN_ID
 current_no_token = NO_TOKEN_ID
-HAVE_PRIVATE_KEY = bool(PRIVATE_KEY)
 rotating = False
 ws_task = None
 live_balance_task = None
 scan_task = None
 HAS_PAPER_START_BALANCE_COLUMN: bool | None = None
+
+# =============================================================================
+# STARTUP VALIDATION & SUPABASE CLIENT
+# =============================================================================
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -235,15 +208,6 @@ async def _run_forever(name: str, coro_fn, *args) -> None:
             await asyncio.sleep(5)
 
 
-SHARE_QUANT = Decimal("0.0001")
-DEFAULT_TICK = Decimal("0.01")
-MIN_SIZE_METHODS = (
-    "get_min_order_size",
-    "get_minimum_order_size",
-    "get_min_size",
-    "get_minimum_size",
-    "get_minimum_order_size",
-)
 
 def get_shared_paper_balance():
     if not PAPER_BANKROLL_SHARED_ENABLED:
@@ -315,10 +279,23 @@ log_throttle_state: dict[str, tuple[int, object | None]] = {}
 last_live_order_ts = 0
 last_any_order_ts = 0
 live_positions: dict[str, float] = {}
-MAX_CANDLE_HISTORY = 32
-CANDLE_HISTORY_MINIMUM = 1
 last_asset_key: str | None = None
 
+
+# =============================================================================
+# BTC-SPECIFIC: CANDLE ENGINE
+# =============================================================================
+# The CandleEngine builds OHLC history from mid-price ticks sampled on each
+# heartbeat tick. CandleManager owns one CandleEngine per asset_key.
+#
+# BTC-SPECIFIC: The candle interval is derived from the BTC slug prefix
+# (e.g. "btc-updown-5m" → 300s). Candle patterns are tuned for BTC 5-min.
+#
+# COPY-TRADE HOOK: The entire CandleEngine / CandleManager stack can be
+#                  removed when the copy-trading engine replaces the BTC
+#                  candle strategy engine. The heartbeat_loop's candle_manager
+#                  calls are the removal points.
+# =============================================================================
 
 @dataclass
 class Candle:
@@ -480,28 +457,11 @@ class CandleManager:
 
 candle_manager = CandleManager()
 
-EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.004"))
-TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5"))
-MAX_TRADES_PER_HOUR = max(1, int(os.getenv("MAX_TRADES_PER_HOUR", "30")))
-MAX_RUNTIME_TRADES = max(1, int(os.getenv("MAX_RUNTIME_TRADES", "200")))
-MAX_CONSECUTIVE_ERRORS = 5
-AUTO_ROTATE_ENV = os.getenv("AUTO_ROTATE", "true")
-AUTO_ROTATE_ENABLED = AUTO_ROTATE_ENV.strip().lower() in ("1", "true", "yes", "y")
-MARKET_SLUG_PREFIX = os.getenv("MARKET_SLUG_PREFIX", "btc-updown-5m")
-MARKET_SLUG_PREFIXES_ENV = os.getenv("MARKET_SLUG_PREFIXES", "")
-MARKET_SLUG_PREFIXES = [
-    prefix.strip()
-    for prefix in MARKET_SLUG_PREFIXES_ENV.split(",")
-    if prefix.strip()
-]
-if not MARKET_SLUG_PREFIXES:
-    MARKET_SLUG_PREFIXES = [MARKET_SLUG_PREFIX]
 logging.info("MARKET_SLUG_PREFIXES parsed: %s", MARKET_SLUG_PREFIXES)
-INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "300"))
+# BTC-SPECIFIC: current_interval_seconds and current_prefix are mutated by rotate_loop.
+# COPY-TRADE HOOK: These become irrelevant once rotate_loop is replaced.
 current_interval_seconds = INTERVAL_SECONDS
 current_prefix = MARKET_SLUG_PREFIXES[0] if MARKET_SLUG_PREFIXES else MARKET_SLUG_PREFIX
-ROTATE_POLL_SECONDS = int(os.getenv("ROTATE_POLL_SECONDS", "10"))
-ROTATE_LOOKAHEAD_SECONDS = int(os.getenv("ROTATE_LOOKAHEAD_SECONDS", "20"))
 
 logging.info(
     "Worker start BOT_ID=%s EDGE=%s SIZE=%s SIG=%s FUNDER=%s (Supabase connected)",
@@ -520,10 +480,13 @@ logging.info(
     ROTATE_POLL_SECONDS,
     ROTATE_LOOKAHEAD_SECONDS,
 )
-LOG_THROTTLE_SECONDS = 60
 shared_mode = "ON" if PAPER_BANKROLL_SHARED_ENABLED else "OFF"
 logging.info("PAPER_BANKROLL_SHARED mode=%s", shared_mode)
 
+
+# =============================================================================
+# UTILITY / HELPER FUNCTIONS (REUSABLE)
+# =============================================================================
 
 def float_or_none(v):
     if v is None:
@@ -2043,6 +2006,15 @@ def persist_live_strategy_settings(wallet_address: str | None, allowance_usd: fl
         logging.exception("Failed updating live strategy settings")
 
 
+# =============================================================================
+# SUPABASE SETTINGS READERS (REUSABLE CORE)
+# =============================================================================
+# read_strategy_settings, read_live_master_enabled, get_global_trade_mode
+# are generic Supabase readers that work for any strategy bot_id.
+# The PAPER / ARM LIVE / LIVE ON / KILL_SWITCH gate logic is also here.
+# These are safe to reuse unchanged for copy-trading.
+# =============================================================================
+
 def get_global_trade_mode() -> str:
     try:
         resp = (
@@ -2434,6 +2406,8 @@ def approx_mid_price():
     return (ya + na) / 2
 
 
+# BTC-SPECIFIC: Infers market interval from BTC slug prefix (e.g. "btc-updown-5m" → 300s).
+# COPY-TRADE HOOK: Remove when rotate_loop is replaced by a static market config loader.
 def interval_from_prefix(prefix: str) -> int:
     if "-15m" in prefix:
         return 900
@@ -2467,6 +2441,15 @@ def get_paper_trade_decision_reason(
         return False, "rate_limited"
     return True, "ok"
 
+
+# =============================================================================
+# LIVE EXECUTION (REUSABLE CORE)
+# =============================================================================
+# execute_live_strategy, close_live_position, close_live_position_ladder,
+# and submit_order are generic CLOB execution functions.
+# They operate on token_id + size_usd and are not BTC-specific.
+# REUSABLE: Keep these unchanged for copy-trading.
+# =============================================================================
 
 def execute_live_strategy(
     client: ClobClient | None,
@@ -2820,6 +2803,14 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# =============================================================================
+# SUPABASE WRITES — HEARTBEAT & TRADE LOGGING (REUSABLE CORE)
+# =============================================================================
+# record_heartbeat → bot_heartbeat table
+# record_trade     → bot_trades table
+# These are generic write helpers, fully reusable for copy-trading.
+# =============================================================================
+
 def record_heartbeat(status_text: str, message: str):
     payload = {
         "bot_id": BOT_ID,
@@ -3147,14 +3138,24 @@ def detect_follow_through(history: list[Candle]) -> CandleSignal:
     return CandleSignal("NEUTRAL", {"reason": "follow_through_no_match"})
 
 
-CANDLE_STRATEGY_IDS = [
-    STRATEGY_SWEEP_RECLAIM,
-    STRATEGY_BREAKOUT_CLOSE,
-    STRATEGY_ENGULFING_LEVEL,
-    STRATEGY_REJECTION_WICK,
-    STRATEGY_FOLLOW_THROUGH,
-]
+# =============================================================================
+# BTC-SPECIFIC: CANDLE PATTERN DETECTORS & STRATEGY REGISTRY
+# =============================================================================
+# All detect_* functions below are pure BTC 5-min candle pattern detectors.
+# They operate on list[Candle] and return CandleSignal("YES"|"NO"|"NEUTRAL").
+#
+# COPY-TRADE HOOK: The entire detect_* block + CANDLE_DETECTORS dict +
+#                  evaluate_candle_strategies() can be deleted when the copy
+#                  engine is built. Replace with a wallet delta signal function:
+#
+#   def detect_copy_signal(target_positions_prev, target_positions_now) -> list[CopySignal]
+#
+# CANDLE_STRATEGY_IDS is defined in worker_config.py.
 
+# BTC-SPECIFIC: CANDLE_DETECTORS maps strategy IDs to detector functions.
+# These detectors are BTC 5-min candle pattern implementations.
+# COPY-TRADE HOOK: Remove CANDLE_DETECTORS when replacing the candle engine
+#                  with a wallet watcher signal.
 CANDLE_DETECTORS: dict[str, Callable[[list[Candle]], CandleSignal]] = {
     STRATEGY_SWEEP_RECLAIM: detect_sweep_reclaim,
     STRATEGY_BREAKOUT_CLOSE: detect_breakout_close,
@@ -3164,6 +3165,8 @@ CANDLE_DETECTORS: dict[str, Callable[[list[Candle]], CandleSignal]] = {
 }
 
 
+# BTC-SPECIFIC: Runs all candle detectors against current OHLC history.
+# COPY-TRADE HOOK: Remove this function. Replace with copy_signal_engine().
 async def evaluate_candle_strategies(
     candle_strategy_settings: dict[str, dict[str, object]],
     total_ask: float | None,
@@ -3452,6 +3455,21 @@ def extract_event_payload(event):
     return None, None
 
 
+# =============================================================================
+# BTC-SPECIFIC: GAMMA API — MARKET DISCOVERY
+# =============================================================================
+# fetch_event_by_slug_sync / fetch_event_by_slug_async call the Polymarket
+# Gamma API to resolve a BTC slug → outcomes + clobTokenIds.
+#
+# The Gamma API call itself is generic and reusable.
+# The BTC coupling is in HOW the slug is constructed (timestamp suffix) and
+# HOW the outcomes are mapped ("up"→YES, "down"→NO) in rotate_loop.
+#
+# COPY-TRADE HOOK: For copy-trading, fetch_event_by_slug_sync is still useful
+#                  for looking up target market token IDs from a slug stored in
+#                  Supabase. The caller changes; the function can stay.
+# =============================================================================
+
 def fetch_event_by_slug_sync(slug):
     if not slug:
         return None
@@ -3513,10 +3531,14 @@ def update_shared_paper_balance(pnl_usd: float, strategy_id: str) -> float:
         logging.exception("Failed updating shared paper_balance_usd")
     return new_balance
 
+# BTC-SPECIFIC: Constructs a BTC 5-min slug from a Unix timestamp.
+# e.g. slug_from_start(1713000000) → "btc-updown-5m-1713000000"
 def slug_from_start(target_start):
     return f"{MARKET_SLUG_PREFIX}-{target_start}"
 
 
+# BTC-SPECIFIC: Fetches BTC spot price from Coinbase.
+# COPY-TRADE HOOK: Remove this function entirely for copy-trading.
 def _fetch_btc_spot_price_sync() -> float | None:
     try:
         req = request.Request(COINBASE_SPOT_URL, headers={"User-Agent": "FastLoopWorker/1.0"})
@@ -3933,6 +3955,26 @@ def restart_ws_task():
     return ws_task
 
 
+# =============================================================================
+# BTC-SPECIFIC: MARKET ROTATION LOOP
+# =============================================================================
+# rotate_loop cycles through MARKET_SLUG_PREFIXES, constructs timestamp-based
+# slugs (e.g. "btc-updown-5m-1713000000"), fetches the Gamma API to resolve
+# outcomes, and maps "up"→YES / "down"→NO token IDs.
+#
+# This entire loop is BTC 5-min specific:
+#   • Slug format: "{prefix}-{unix_timestamp}" is a BTC-only convention.
+#   • Outcome names "up" and "down" are BTC prediction market specific.
+#   • The interval is inferred from the slug prefix string.
+#
+# COPY-TRADE HOOK: Replace rotate_loop with a copy_market_config_loop() that:
+#   1. Reads target market slugs from a Supabase "copy_markets" table.
+#   2. Resolves each slug → (yes_token_id, no_token_id) via fetch_event_by_slug_sync.
+#   3. Uses "yes"/"no" outcome names (standard for non-BTC markets).
+#   4. Does NOT use timestamp suffixes or interval logic.
+#   current_yes_token / current_no_token / restart_ws_task() pattern is REUSABLE.
+# =============================================================================
+
 async def rotate_loop():
     if not AUTO_ROTATE_ENABLED:
         return
@@ -3970,6 +4012,8 @@ async def rotate_loop():
             current_slug = slug
             outcomes = [o.lower() for o in market["outcomes"]]
             clobs = market["clobTokenIds"]
+            # BTC-SPECIFIC: "up" maps to YES, "down" maps to NO.
+            # COPY-TRADE HOOK: Change to "yes" / "no" for non-BTC markets.
             for name, token in zip(outcomes, clobs):
                 if name == "up":
                     current_yes_token = token
@@ -4034,6 +4078,17 @@ def update_best_quotes(asset_id, bid, ask):
     if ask is not None:
         best_quotes[side]["ask"] = ask
 
+
+# =============================================================================
+# POLYMARKET CLOB WEBSOCKET — QUOTE FEED (REUSABLE CORE)
+# =============================================================================
+# market_listener subscribes to any assets_ids list and populates best_quotes.
+# The WS protocol is generic; the BTC coupling is only in which token IDs are
+# subscribed (populated by rotate_loop via current_yes_token / current_no_token).
+#
+# REUSABLE: Keep market_listener and update_best_quotes unchanged.
+# COPY-TRADE HOOK: Feed it the copy market token IDs instead of BTC tokens.
+# =============================================================================
 
 async def market_listener():
     base_payload = {
@@ -4115,6 +4170,13 @@ async def market_listener():
             await asyncio.sleep(2)
 
 
+# =============================================================================
+# CLOB CLIENT CONSTRUCTION (REUSABLE CORE)
+# =============================================================================
+# build_trading_client() constructs a ClobClient from env-provided credentials.
+# REUSABLE: Unchanged for copy-trading.
+# =============================================================================
+
 def build_trading_client() -> ClobClient | None:
     if not HAVE_PRIVATE_KEY:
         return None
@@ -4134,6 +4196,21 @@ def build_trading_client() -> ClobClient | None:
 def fmt(v):
     return f"{v:.6f}" if v is not None else "n/a"
 
+
+# =============================================================================
+# ORDER SUBMISSION (REUSABLE CORE)
+# =============================================================================
+# submit_order() is a generic CLOB order builder. It:
+#   1. Reads the best quote from best_quotes for the given side_label
+#   2. Fetches tick size from the client
+#   3. Quantizes price and shares with Decimal arithmetic
+#   4. Enforces MIN_ORDER_SHARES guard
+#   5. Creates and posts a GTC limit order via ClobClient
+#   6. Calls record_trade() on success
+#
+# REUSABLE: This function is market-agnostic. Use it unchanged for copy-trading
+#            by passing the copy market token_id and desired size_usd.
+# =============================================================================
 
 def submit_order(
     client: ClobClient,
@@ -4424,6 +4501,37 @@ def submit_order(
                 logging.warning("Paused due to consecutive trade errors=%s", consecutive_trade_errors)
         return False
 
+
+# =============================================================================
+# HEARTBEAT LOOP — CORE TRADING TICK  ★ PRIMARY COPY-TRADE HOOK ★
+# =============================================================================
+# heartbeat_loop runs every ~5s and is the main trading engine.
+#
+# REUSABLE PARTS (keep as-is for copy-trading):
+#   • read_strategy_settings() per bot_id
+#   • read_live_master_enabled()
+#   • PAPER / ARM LIVE / LIVE ON / KILL_SWITCH gate logic
+#   • record_heartbeat()
+#   • process_paper_tpsl_positions() / evaluate_live_tpsl_positions()
+#   • force-exit ladder
+#
+# BTC-SPECIFIC PARTS (replace for copy-trading):
+#   • Edge calculation: edge = 1 - (ya + na) — BTC arbitrage signal
+#   • candle_manager.observe() — BTC OHLC candle building
+#   • evaluate_candle_strategies() — BTC candle pattern detection
+#   • execute_strategy() / execute_live_strategy() — BTC strategy execution
+#   • entry_cutoff_active / time_to_end — BTC market expiry logic
+#   • ENTRY_CUTOFF_SECONDS / FORCE_EXIT_SECONDS — BTC timing assumptions
+#
+# COPY-TRADE HOOK — Strategy body replacement:
+#   Replace the block guarded by "if paper_mode_active and edge >= threshold"
+#   and "if arm_live_active and edge >= threshold" with:
+#
+#     target_delta = compute_wallet_delta(target_positions_prev, target_positions_now)
+#     for signal in target_delta:
+#         if paper mode:  create_paper_copy_position(signal)
+#         if live mode:   submit_order(client, signal.token_id, signal.side, ...)
+# =============================================================================
 
 async def heartbeat_loop(client: ClobClient | None):
     global paused_due_to_max_trades, trade_triggers, rotating, last_paper_skip_ts
@@ -5121,6 +5229,17 @@ async def heartbeat_loop(client: ClobClient | None):
             rotating = False
 
 
+# =============================================================================
+# PAPER SETTLEMENT LOOP (REUSABLE CORE)
+# =============================================================================
+# Polls paper_positions every 15s. Closes expired positions by resolving
+# YES/NO outcome, computing PnL, updating paper_positions and bot_trades.
+#
+# REUSABLE: The settlement mechanics (Supabase read/write, PnL calc, balance
+#            update) work for any binary market. The "FASTLOOP" market label
+#            in the trade_payload is the only cosmetic BTC-ism; update it.
+# =============================================================================
+
 async def paper_settlement_loop():
     while True:
         now_ts = int(time())
@@ -5276,14 +5395,926 @@ async def paper_settlement_loop():
         await asyncio.sleep(15)
 
 
+# =============================================================================
+# COPY-TRADING ENGINE — PAPER MODE ONLY
+# =============================================================================
+#
+# This section adds a fully isolated copy-trading worker path.
+# It runs as a separate asyncio task alongside the existing BTC strategy tasks.
+#
+# ISOLATION GUARANTEE:
+#   - Does NOT touch: rotate_loop, heartbeat_loop, BTC strategies, live orders,
+#     bot_settings, bot_trades, paper_positions, or any BTC-specific tables.
+#   - Only reads/writes: tracked_wallets, wallet_metrics, wallet_trades,
+#     copy_bots, copy_attempts, copied_positions, market_cache,
+#     copy_global_settings.
+#
+# LIVE TRADING: Not implemented. All copy bots with mode='LIVE' are skipped
+#   with skip_reason='live_mode_not_supported_yet'.
+#
+# ENTRY POINT: copy_trade_loop() — wired into main() as a _run_forever task.
+# =============================================================================
+
+
+# ── Copy-trading global state ─────────────────────────────────────────────────
+# In-memory per-bot trade rate tracking.
+# Keyed by copy_bot UUID (str). Each value is a deque of Unix timestamps.
+# Pruned to a rolling 1-hour window on each access.
+# Mirrors the pattern used by BTC strategy_trade_timestamps.
+copy_bot_trade_timestamps: dict[str, deque] = defaultdict(deque)
+
+
+# ── Supabase loaders ──────────────────────────────────────────────────────────
+
+def load_tracked_wallets() -> list[dict]:
+    """Return all active tracked wallets from Supabase."""
+    try:
+        resp = (
+            supabase.table("tracked_wallets")
+            .select("id, wallet_address, display_name, is_active, tags")
+            .eq("is_active", True)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        logging.exception("COPY_LOAD_WALLETS_FAIL")
+        return []
+
+
+def load_enabled_copy_bots() -> list[dict]:
+    """Return all enabled copy bots from Supabase."""
+    try:
+        resp = supabase.table("copy_bots").select("*").eq("is_enabled", True).execute()
+        return resp.data or []
+    except Exception:
+        logging.exception("COPY_LOAD_BOTS_FAIL")
+        return []
+
+
+def load_copy_global_settings() -> dict:
+    """
+    Load the singleton copy_global_settings row.
+    Returns conservative safe defaults on any failure so the loop
+    never proceeds with an unknown global state.
+    """
+    defaults: dict = {
+        "live_on": False,
+        "emergency_stop": True,   # fail-safe: default to stopped
+        "max_total_live_exposure": 500,
+        "default_slippage_cap": 0.03,
+        "default_position_size": 10,
+        "default_max_positions": 10,
+    }
+    try:
+        resp = (
+            supabase.table("copy_global_settings")
+            .select("*")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return {**defaults, **resp.data[0]}
+        logging.warning("COPY_GLOBAL_SETTINGS_MISSING using defaults")
+        return defaults
+    except Exception:
+        logging.exception("COPY_LOAD_GLOBAL_SETTINGS_FAIL using defaults")
+        return defaults
+
+
+# ── Wallet trade fetching ─────────────────────────────────────────────────────
+
+def _fetch_wallet_activity_sync(wallet_address: str, limit: int = 50) -> list[dict]:
+    """
+    Fetch recent activity for a wallet from the Polymarket data API.
+    Returns a list of raw activity dicts; empty list on any error.
+
+    Primary endpoint: https://data-api.polymarket.com/activity?user={address}
+    Falls back to CLOB trades endpoint if primary returns nothing.
+    """
+    results: list[dict] = []
+
+    # Primary: Polymarket data API
+    url = (
+        f"{COPY_DATA_API_BASE}/activity"
+        f"?user={parse.quote(wallet_address)}&limit={limit}"
+    )
+    try:
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read())
+        if isinstance(raw, list) and raw:
+            return raw
+        if isinstance(raw, dict) and "data" in raw:
+            return raw["data"] if isinstance(raw["data"], list) else []
+    except Exception as exc:
+        logging.warning(
+            "COPY_FETCH_ACTIVITY_DATA_API_FAIL wallet=%s err=%s",
+            wallet_address[:10],
+            exc,
+        )
+
+    # Fallback: CLOB trades endpoint
+    clob_url = (
+        f"{HOST}/trades"
+        f"?user_address={parse.quote(wallet_address)}&limit={limit}"
+    )
+    try:
+        req = request.Request(clob_url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read())
+        if isinstance(raw, list):
+            results = raw
+        elif isinstance(raw, dict) and "data" in raw:
+            results = raw.get("data") or []
+    except Exception as exc:
+        logging.warning(
+            "COPY_FETCH_ACTIVITY_CLOB_FAIL wallet=%s err=%s",
+            wallet_address[:10],
+            exc,
+        )
+
+    return results
+
+
+async def fetch_wallet_trades_for_address(wallet_address: str) -> list[dict]:
+    """Async wrapper: fetch raw wallet activity without blocking the event loop."""
+    return await asyncio.to_thread(
+        _fetch_wallet_activity_sync,
+        wallet_address,
+        COPY_WALLET_TRADE_FETCH_LIMIT,
+    )
+
+
+# ── Normalization helpers ─────────────────────────────────────────────────────
+
+def _normalize_outcome(outcome_raw: str | None) -> str | None:
+    """Map raw outcome string → 'YES' | 'NO' | None."""
+    if not outcome_raw:
+        return None
+    o = str(outcome_raw).strip().upper()
+    if o in ("YES", "Y", "1", "UP", "TRUE"):
+        return "YES"
+    if o in ("NO", "N", "0", "DOWN", "FALSE"):
+        return "NO"
+    return o  # preserve unknown values for inspection
+
+
+def _normalize_side(side_raw: str | None) -> str | None:
+    """Map raw side string → 'BUY' | 'SELL' | None."""
+    if not side_raw:
+        return None
+    s = str(side_raw).strip().upper()
+    if s in ("BUY", "B", "LONG"):
+        return "BUY"
+    if s in ("SELL", "S", "SHORT"):
+        return "SELL"
+    return s
+
+
+def normalize_activity_to_wallet_trade(raw: dict, wallet_address: str) -> dict | None:
+    """
+    Normalize a raw Polymarket activity/trade record to the wallet_trades schema.
+
+    Returns None if the record is not a trade or lacks enough data to be useful.
+    Handles both the Polymarket data API format and the CLOB trades format.
+
+    Fields mapped:
+      Data API:  id/transactionHash → source_trade_id, market → market_slug,
+                 title → market_title, conditionId → condition_id,
+                 tokenId → token_id, outcome, side, price, shares → size,
+                 amount → notional, timestamp → traded_at
+      CLOB API:  id → source_trade_id, market → condition_id,
+                 asset_id → token_id, size, price, outcome, side,
+                 match_time → traded_at
+    """
+    # Filter: only process trade/fill events; skip order placements / cancellations
+    event_type = str(raw.get("type", "TRADE")).strip().upper()
+    if event_type not in ("TRADE", "FILL", "MATCH", "BUY", "SELL", ""):
+        return None
+
+    # --- source_trade_id ---
+    source_trade_id = (
+        raw.get("transactionHash")
+        or raw.get("transaction_hash")
+        or raw.get("id")
+        or raw.get("trade_id")
+    )
+    if not source_trade_id:
+        # Compose a fallback dedup key from available fields
+        cid = raw.get("conditionId") or raw.get("condition_id") or raw.get("market") or ""
+        ts = str(raw.get("timestamp") or raw.get("match_time") or raw.get("created_at") or "")
+        side = str(raw.get("side") or "")
+        amt = str(raw.get("amount") or raw.get("notional") or raw.get("usdcAmount") or "")
+        composed = f"{cid}_{ts}_{side}_{amt}"
+        if composed.count("_") == 3 and all(p == "" for p in composed.split("_")):
+            return None  # all parts empty — not usable
+        source_trade_id = composed
+
+    # --- price / size / notional ---
+    price_raw = (
+        raw.get("price") or raw.get("avgPrice") or raw.get("avg_price")
+    )
+    size_raw = (
+        raw.get("shares") or raw.get("size") or raw.get("quantity")
+    )
+    notional_raw = (
+        raw.get("amount") or raw.get("notional") or raw.get("usdcAmount")
+        or raw.get("usdc_amount")
+    )
+
+    try:
+        price = float(price_raw) if price_raw is not None else None
+    except (TypeError, ValueError):
+        price = None
+
+    try:
+        size = float(size_raw) if size_raw is not None else None
+    except (TypeError, ValueError):
+        size = None
+
+    try:
+        notional = float(notional_raw) if notional_raw is not None else None
+    except (TypeError, ValueError):
+        notional = None
+
+    if notional is None and price is not None and size is not None:
+        notional = round(price * size, 6)
+
+    # --- traded_at ---
+    ts_raw = (
+        raw.get("timestamp") or raw.get("match_time")
+        or raw.get("created_at") or raw.get("createdAt")
+        or raw.get("last_update")
+    )
+    if not ts_raw:
+        return None  # require a timestamp
+
+    try:
+        if isinstance(ts_raw, (int, float)):
+            ts_val = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
+            traded_at = datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
+        else:
+            traded_at = str(ts_raw)
+    except Exception:
+        traded_at = str(ts_raw)
+
+    # --- field extraction (handles both API response shapes) ---
+    market_slug = (
+        raw.get("market") if not str(raw.get("market", "")).startswith("0x")
+        else None
+    ) or raw.get("marketSlug") or raw.get("slug")
+
+    condition_id = (
+        raw.get("conditionId") or raw.get("condition_id")
+        # CLOB API stores condition_id in "market" field (hex string)
+        or (raw.get("market") if str(raw.get("market", "")).startswith("0x") else None)
+    )
+
+    token_id = raw.get("tokenId") or raw.get("token_id") or raw.get("asset_id")
+    outcome = _normalize_outcome(raw.get("outcome"))
+    side = _normalize_side(raw.get("side"))
+
+    return {
+        "wallet_address": wallet_address,
+        "source_trade_id": str(source_trade_id),
+        "market_slug": market_slug,
+        "market_title": raw.get("title") or raw.get("marketTitle") or raw.get("question"),
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "side": side,
+        "outcome": outcome,
+        "price": price,
+        "size": size,
+        "notional": notional,
+        "traded_at": traded_at,
+        "raw_json": raw,
+    }
+
+
+# ── Supabase write helpers ────────────────────────────────────────────────────
+
+def insert_wallet_trade_if_new(trade_row: dict) -> bool:
+    """
+    Insert a wallet_trade row if (wallet_address, source_trade_id) is new.
+    Returns True if inserted, False if duplicate or error.
+    wallet_trades is append-only — we never update existing rows.
+    """
+    try:
+        resp = supabase.table("wallet_trades").insert(trade_row).execute()
+        return bool(resp.data)
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if any(kw in exc_str for kw in ("duplicate", "unique", "23505", "conflict")):
+            return False  # expected dedup — not an error
+        logging.warning(
+            "COPY_INSERT_WALLET_TRADE_FAIL wallet=%s trade_id=%s err=%s",
+            str(trade_row.get("wallet_address", ""))[:10],
+            str(trade_row.get("source_trade_id", ""))[:20],
+            exc,
+        )
+        return False
+
+
+def upsert_market_cache(trade_row: dict) -> None:
+    """
+    Upsert market_cache from a normalized wallet_trade dict.
+    Populates what we know from the trade; leaves other fields as DB defaults.
+
+    When we see the same market_slug from a YES trade and later a NO trade,
+    the upserts progressively fill in yes_token_id then no_token_id.
+    """
+    market_slug = trade_row.get("market_slug")
+    if not market_slug:
+        return
+
+    payload: dict = {"market_slug": market_slug, "raw_json": {}}
+
+    if trade_row.get("market_title"):
+        payload["market_title"] = trade_row["market_title"]
+    if trade_row.get("condition_id"):
+        payload["condition_id"] = trade_row["condition_id"]
+
+    token_id = trade_row.get("token_id")
+    outcome = trade_row.get("outcome")
+    if token_id and outcome == "YES":
+        payload["yes_token_id"] = token_id
+    elif token_id and outcome == "NO":
+        payload["no_token_id"] = token_id
+
+    try:
+        supabase.table("market_cache").upsert(payload, on_conflict="market_slug").execute()
+    except Exception as exc:
+        logging.warning("COPY_UPSERT_MARKET_CACHE_FAIL slug=%s err=%s", market_slug, exc)
+
+
+def get_unevaluated_trades_for_bot(
+    wallet_address: str,
+    bot_id: str,
+    lookback_hours: int = 24,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Return wallet_trades for this wallet that have NOT yet been evaluated
+    by this specific copy_bot (i.e., no copy_attempts row exists).
+
+    Two-step query:
+      1. Fetch recent wallet_trades for the wallet within the lookback window.
+      2. Fetch already-attempted source_trade_ids for this bot.
+      3. Return the difference.
+    """
+    try:
+        cutoff_ts = time() - (lookback_hours * 3600)
+        cutoff = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).isoformat()
+
+        trades_resp = (
+            supabase.table("wallet_trades")
+            .select("*")
+            .eq("wallet_address", wallet_address)
+            .gte("traded_at", cutoff)
+            .order("traded_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        all_trades = trades_resp.data or []
+        if not all_trades:
+            return []
+
+        trade_ids = [t["source_trade_id"] for t in all_trades]
+
+        attempted_resp = (
+            supabase.table("copy_attempts")
+            .select("source_trade_id")
+            .eq("copy_bot_id", bot_id)
+            .in_("source_trade_id", trade_ids)
+            .execute()
+        )
+        attempted_ids = {row["source_trade_id"] for row in (attempted_resp.data or [])}
+
+        return [t for t in all_trades if t["source_trade_id"] not in attempted_ids]
+
+    except Exception:
+        logging.exception(
+            "COPY_GET_UNEVALUATED_TRADES_FAIL wallet=%s bot=%s",
+            wallet_address[:10],
+            bot_id[:8],
+        )
+        return []
+
+
+def get_open_positions_count(bot_id: str) -> int:
+    """Count currently OPEN copied_positions for a copy bot."""
+    try:
+        resp = (
+            supabase.table("copied_positions")
+            .select("id", count="exact")
+            .eq("copy_bot_id", bot_id)
+            .eq("status", "OPEN")
+            .execute()
+        )
+        return resp.count or 0
+    except Exception:
+        logging.warning("COPY_GET_OPEN_POS_COUNT_FAIL bot=%s", bot_id[:8])
+        return 0
+
+
+def log_copy_attempt(
+    copy_bot: dict,
+    wallet_trade: dict,
+    copied: bool,
+    skip_reason: str | None,
+    submitted_size: float | None,
+    submitted_price: float | None,
+    order_status: str = "SKIPPED",
+) -> None:
+    """Write a copy_attempts audit row. Always written — even for skipped trades."""
+    try:
+        row = {
+            "copy_bot_id": str(copy_bot["id"]),
+            "wallet_address": wallet_trade["wallet_address"],
+            "source_trade_id": wallet_trade["source_trade_id"],
+            "market_slug": wallet_trade.get("market_slug"),
+            "market_title": wallet_trade.get("market_title"),
+            "token_id": wallet_trade.get("token_id"),
+            "source_side": wallet_trade.get("side"),
+            "source_outcome": wallet_trade.get("outcome"),
+            "source_price": wallet_trade.get("price"),
+            "source_size": wallet_trade.get("size"),
+            "submitted_price": submitted_price,
+            "submitted_size": submitted_size,
+            "copied": copied,
+            "skip_reason": skip_reason,
+            "order_status": order_status,
+            "raw_response": {},
+        }
+        supabase.table("copy_attempts").insert(row).execute()
+    except Exception:
+        logging.exception(
+            "COPY_LOG_ATTEMPT_FAIL bot=%s trade=%s",
+            str(copy_bot.get("id", "?"))[:8],
+            str(wallet_trade.get("source_trade_id", "?"))[:20],
+        )
+
+
+def open_copied_position(
+    copy_bot: dict,
+    wallet_trade: dict,
+    submitted_size: float,
+    submitted_price: float,
+) -> None:
+    """
+    Create a copied_positions row for a paper copy trade.
+
+    'size' stores the USD paper position size (submitted_size).
+    'entry_price' is the per-share price at which we paper-entered.
+    PnL at close: pnl = size * (exit_price / entry_price - 1)
+    """
+    try:
+        row = {
+            "copy_bot_id": str(copy_bot["id"]),
+            "wallet_address": wallet_trade["wallet_address"],
+            "source_trade_id": wallet_trade.get("source_trade_id"),
+            "market_slug": wallet_trade.get("market_slug"),
+            "market_title": wallet_trade.get("market_title"),
+            "condition_id": wallet_trade.get("condition_id"),
+            "token_id": wallet_trade.get("token_id"),
+            "side": wallet_trade.get("side"),
+            "outcome": wallet_trade.get("outcome"),
+            "entry_price": submitted_price,
+            "size": submitted_size,
+            "status": "OPEN",
+            "pnl": 0,
+            "raw_json": {
+                "paper": True,
+                "copy_mode": copy_bot.get("copy_mode"),
+                "sizing_value": copy_bot.get("sizing_value"),
+                "source": {
+                    "price": wallet_trade.get("price"),
+                    "size": wallet_trade.get("size"),
+                    "notional": wallet_trade.get("notional"),
+                    "side": wallet_trade.get("side"),
+                    "outcome": wallet_trade.get("outcome"),
+                },
+            },
+        }
+        supabase.table("copied_positions").insert(row).execute()
+        logging.info(
+            "COPY_POSITION_OPENED bot=%s wallet=%s slug=%s side=%s outcome=%s size=%s price=%s",
+            str(copy_bot.get("id", "?"))[:8],
+            wallet_trade["wallet_address"][:10],
+            wallet_trade.get("market_slug") or "unknown",
+            wallet_trade.get("side"),
+            wallet_trade.get("outcome"),
+            submitted_size,
+            submitted_price,
+        )
+    except Exception:
+        logging.exception(
+            "COPY_OPEN_POSITION_FAIL bot=%s trade=%s",
+            str(copy_bot.get("id", "?"))[:8],
+            str(wallet_trade.get("source_trade_id", "?"))[:20],
+        )
+
+
+def update_wallet_metrics_for_address(wallet_address: str) -> None:
+    """
+    Upsert wallet_metrics for a tracked wallet using wallet_trades data.
+
+    Currently computes: trade_count, volume, last_trade_at.
+    PnL, win_rate, avg_hold_minutes, max_drawdown, copy_score are initialized
+    to 0 as placeholders — a proper settlement/resolution pass is needed to
+    compute these accurately once market resolution data is available.
+    """
+    try:
+        resp = (
+            supabase.table("wallet_trades")
+            .select("notional, traded_at")
+            .eq("wallet_address", wallet_address)
+            .execute()
+        )
+        trades = resp.data or []
+        trade_count = len(trades)
+        volume = round(sum(float(t.get("notional") or 0) for t in trades), 4)
+
+        last_trade_at: str | None = None
+        if trades:
+            dates = [str(t["traded_at"]) for t in trades if t.get("traded_at")]
+            if dates:
+                last_trade_at = max(dates)
+
+        metrics = {
+            "wallet_address": wallet_address,
+            "trade_count": trade_count,
+            "volume": volume,
+            "last_trade_at": last_trade_at,
+            # Placeholder fields — requires market resolution data to compute:
+            "pnl_7d": 0,
+            "pnl_30d": 0,
+            "pnl_all": 0,
+            "win_rate": 0,
+            "avg_hold_minutes": 0,
+            "max_drawdown": 0,
+            "copy_score": 0,
+        }
+        supabase.table("wallet_metrics").upsert(
+            metrics, on_conflict="wallet_address"
+        ).execute()
+    except Exception:
+        logging.exception("COPY_UPDATE_METRICS_FAIL wallet=%s", wallet_address[:10])
+
+
+# ── Copy bot evaluation ───────────────────────────────────────────────────────
+
+def _copy_bot_prune_history(bot_id: str) -> None:
+    """Prune in-memory trade timestamps older than 1 hour for a copy bot."""
+    cutoff = time() - 3600
+    dq = copy_bot_trade_timestamps[bot_id]
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+
+def _copy_bot_trades_this_hour(bot_id: str) -> int:
+    """Return how many trades this bot has logged in the last hour (in-memory)."""
+    _copy_bot_prune_history(bot_id)
+    return len(copy_bot_trade_timestamps[bot_id])
+
+
+def _copy_bot_mark_trade(bot_id: str) -> None:
+    """Record a trade timestamp for rate-limit tracking."""
+    copy_bot_trade_timestamps[bot_id].append(time())
+
+
+def compute_copy_size(
+    copy_bot: dict,
+    wallet_trade: dict,
+    global_settings: dict,
+) -> float:
+    """
+    Compute the paper USD size for a copy trade based on copy_mode:
+
+      exact   — fixed USD amount equal to sizing_value (e.g. $10 per trade)
+      scaled  — source notional × sizing_value  (e.g. 0.5 = half the source size)
+      percent — sizing_value% of default_position_size from global settings
+
+    Always capped at copy_bot.max_trade_size.
+    """
+    copy_mode = str(copy_bot.get("copy_mode") or "exact")
+    sizing_value = float(copy_bot.get("sizing_value") or 1)
+    max_trade_size = float(copy_bot.get("max_trade_size") or 25)
+
+    if copy_mode == "exact":
+        size = sizing_value
+    elif copy_mode == "scaled":
+        source_notional = float(wallet_trade.get("notional") or 0)
+        size = source_notional * sizing_value
+    elif copy_mode == "percent":
+        base = float(global_settings.get("default_position_size") or 10)
+        size = base * (sizing_value / 100.0)
+    else:
+        size = sizing_value  # fallback to exact
+
+    size = min(size, max_trade_size)
+    size = max(size, 0.01)
+    return round(size, 4)
+
+
+def evaluate_copy_bot_for_trade(
+    copy_bot: dict,
+    wallet_trade: dict,
+    global_settings: dict,
+) -> tuple[bool, str | None, float | None, float | None]:
+    """
+    Decide whether to paper-copy a wallet trade for a given copy bot.
+
+    Returns (should_copy, skip_reason, submitted_size_usd, submitted_price).
+    Evaluates all filters in order; returns on first failure with a clear reason.
+
+    Skip reasons:
+      live_mode_not_supported_yet   — bot is LIVE mode (not yet implemented)
+      emergency_stop_active         — global emergency_stop is true
+      closes_not_enabled            — SELL trade but copy_closes = false
+      delay_not_elapsed             — trade is too recent for delay_seconds
+      max_trades_per_hour_reached   — in-memory rate limit exceeded
+      max_open_positions_reached    — too many open copied_positions
+      insufficient_market_data      — no token_id or market_slug
+      unsupported_trade_shape       — no price data
+    """
+    bot_id = str(copy_bot["id"])
+
+    # Gate 1: LIVE mode not implemented yet
+    if str(copy_bot.get("mode", "PAPER")).upper() == "LIVE":
+        return False, "live_mode_not_supported_yet", None, None
+
+    # Gate 2: Emergency stop
+    if global_settings.get("emergency_stop"):
+        return False, "emergency_stop_active", None, None
+
+    # Gate 3: opens_only / copy_closes filter
+    trade_side = str(wallet_trade.get("side") or "").upper()
+    opens_only = bool(copy_bot.get("opens_only", True))
+    copy_closes = bool(copy_bot.get("copy_closes", False))
+
+    if trade_side == "SELL" and not copy_closes:
+        return False, "closes_not_enabled", None, None
+    # If opens_only and this is a BUY → allow (opens_only only blocks explicit opens mode)
+    # If opens_only=False, copy everything including sells (if copy_closes allows it)
+
+    # Gate 4: Delay filter
+    delay_sec = int(copy_bot.get("delay_seconds") or 0)
+    if delay_sec > 0:
+        try:
+            traded_at_str = str(wallet_trade.get("traded_at") or "")
+            traded_at_dt = datetime.fromisoformat(traded_at_str.replace("Z", "+00:00"))
+            age_seconds = (datetime.now(timezone.utc) - traded_at_dt).total_seconds()
+            if age_seconds < delay_sec:
+                return False, "delay_not_elapsed", None, None
+        except Exception:
+            pass  # unparseable timestamp — skip delay gate
+
+    # Gate 5: max_trades_per_hour (in-memory)
+    max_per_hour = int(copy_bot.get("max_trades_per_hour") or 20)
+    if _copy_bot_trades_this_hour(bot_id) >= max_per_hour:
+        return False, "max_trades_per_hour_reached", None, None
+
+    # Gate 6: max_open_positions (DB query — only relevant for BUY/entry trades)
+    if trade_side in ("BUY", ""):
+        max_open = int(copy_bot.get("max_open_positions") or 10)
+        open_count = get_open_positions_count(bot_id)
+        if open_count >= max_open:
+            return False, "max_open_positions_reached", None, None
+
+    # Gate 7: Minimum market data required
+    if not wallet_trade.get("token_id") and not wallet_trade.get("market_slug"):
+        return False, "insufficient_market_data", None, None
+
+    # Gate 8: Price must be present
+    price = wallet_trade.get("price")
+    if price is None:
+        return False, "unsupported_trade_shape", None, None
+
+    try:
+        submitted_price = float(price)
+        if submitted_price <= 0 or submitted_price > 1:
+            return False, "unsupported_trade_shape", None, None
+    except (TypeError, ValueError):
+        return False, "unsupported_trade_shape", None, None
+
+    # Category filter (best-effort — market_cache lookup not yet wired)
+    # If category_filter is set but we can't verify, allow for now
+    # TODO: enrich from market_cache.category when available
+
+    submitted_size = compute_copy_size(copy_bot, wallet_trade, global_settings)
+    return True, None, submitted_size, submitted_price
+
+
+# ── Copy trade loop ───────────────────────────────────────────────────────────
+
+async def copy_trade_loop() -> None:
+    """
+    PAPER copy-trading ingestion and simulation loop.
+
+    Runs every COPY_TRADE_LOOP_INTERVAL seconds alongside existing BTC tasks.
+    Does NOT affect BTC strategy logic, live orders, or any BTC-specific tables.
+
+    Per-tick flow:
+      1. Load active tracked_wallets + enabled copy_bots + global_settings
+      2. For each wallet: fetch recent trades from Polymarket data API
+      3. Normalize raw activity → wallet_trades schema
+      4. Insert new wallet_trades (dedup by wallet_address + source_trade_id)
+      5. Upsert market_cache from trade metadata
+      6. For each enabled PAPER copy bot watching this wallet:
+           a. Find unevaluated trades (no copy_attempts row yet)
+           b. Run evaluate_copy_bot_for_trade()
+           c. Write copy_attempts row (always — even for skips)
+           d. On copy: write copied_positions row (status=OPEN)
+      7. Update wallet_metrics (trade_count, volume, last_trade_at)
+      8. Sleep COPY_TRADE_LOOP_INTERVAL seconds
+    """
+    if not COPY_TRADE_ENABLED:
+        logging.info("COPY_TRADE_LOOP disabled via COPY_TRADE_ENABLED env var — exiting task")
+        return
+
+    logging.info(
+        "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s",
+        COPY_TRADE_LOOP_INTERVAL,
+        COPY_TRADE_LOOKBACK_HOURS,
+        COPY_WALLET_TRADE_FETCH_LIMIT,
+    )
+
+    while True:
+        wallets = load_tracked_wallets()
+        all_bots = load_enabled_copy_bots()
+        global_settings = load_copy_global_settings()
+
+        total_wallets = len(wallets)
+        total_new_trades = 0
+        total_attempts = 0
+        total_positions = 0
+        total_errors = 0
+
+        log_rate_limited(
+            "copy_loop_global_settings",
+            LOG_THROTTLE_SECONDS,
+            "COPY_GLOBAL_SETTINGS emergency_stop=%s live_on=%s wallets=%s bots=%s",
+            global_settings.get("emergency_stop"),
+            global_settings.get("live_on"),
+            total_wallets,
+            len(all_bots),
+        )
+
+        for wallet in wallets:
+            wallet_address = wallet["wallet_address"]
+            wallet_label = wallet_address[:10] + "..."
+
+            try:
+                # ── Step 1: Fetch raw activity ────────────────────────────
+                raw_activities = await fetch_wallet_trades_for_address(wallet_address)
+
+                # ── Step 2: Normalize + ingest wallet_trades ──────────────
+                newly_inserted: list[dict] = []
+                for raw in raw_activities:
+                    trade_row = normalize_activity_to_wallet_trade(raw, wallet_address)
+                    if not trade_row:
+                        continue
+                    # Always upsert market_cache from trade metadata
+                    upsert_market_cache(trade_row)
+                    # Insert only if new; dedup via unique constraint
+                    if insert_wallet_trade_if_new(trade_row):
+                        newly_inserted.append(trade_row)
+                        total_new_trades += 1
+
+                if newly_inserted:
+                    logging.info(
+                        "COPY_TRADES_INGESTED wallet=%s new=%s raw_fetched=%s",
+                        wallet_label,
+                        len(newly_inserted),
+                        len(raw_activities),
+                    )
+
+                # ── Step 3: Match copy bots + evaluate ───────────────────
+                wallet_bots = [
+                    b for b in all_bots if b["wallet_address"] == wallet_address
+                ]
+
+                for bot in wallet_bots:
+                    bot_id = str(bot["id"])
+                    bot_label = bot.get("name") or bot_id[:8]
+
+                    unevaluated = get_unevaluated_trades_for_bot(
+                        wallet_address,
+                        bot_id,
+                        COPY_TRADE_LOOKBACK_HOURS,
+                    )
+                    if not unevaluated:
+                        continue
+
+                    logging.info(
+                        "COPY_BOT_EVAL bot=%s wallet=%s unevaluated=%s",
+                        bot_label,
+                        wallet_label,
+                        len(unevaluated),
+                    )
+
+                    for wallet_trade in unevaluated:
+                        trade_label = str(wallet_trade.get("source_trade_id", "?"))[:20]
+                        try:
+                            copied, skip_reason, submitted_size, submitted_price = (
+                                evaluate_copy_bot_for_trade(
+                                    bot, wallet_trade, global_settings
+                                )
+                            )
+                            order_status = "PAPER_MATCHED" if copied else "SKIPPED"
+
+                            log_copy_attempt(
+                                bot,
+                                wallet_trade,
+                                copied,
+                                skip_reason,
+                                submitted_size,
+                                submitted_price,
+                                order_status,
+                            )
+                            total_attempts += 1
+
+                            if copied:
+                                open_copied_position(
+                                    bot, wallet_trade, submitted_size, submitted_price
+                                )
+                                _copy_bot_mark_trade(bot_id)
+                                total_positions += 1
+                                logging.info(
+                                    "COPY_PAPER_COPIED bot=%s wallet=%s trade=%s "
+                                    "slug=%s side=%s outcome=%s size=%s price=%s",
+                                    bot_label,
+                                    wallet_label,
+                                    trade_label,
+                                    wallet_trade.get("market_slug") or "?",
+                                    wallet_trade.get("side"),
+                                    wallet_trade.get("outcome"),
+                                    submitted_size,
+                                    submitted_price,
+                                )
+                            else:
+                                logging.info(
+                                    "COPY_PAPER_SKIPPED bot=%s wallet=%s trade=%s reason=%s",
+                                    bot_label,
+                                    wallet_label,
+                                    trade_label,
+                                    skip_reason,
+                                )
+
+                        except Exception:
+                            logging.exception(
+                                "COPY_EVALUATE_FAIL bot=%s trade=%s",
+                                bot_label,
+                                trade_label,
+                            )
+                            total_errors += 1
+
+                # ── Step 4: Update wallet metrics ─────────────────────────
+                update_wallet_metrics_for_address(wallet_address)
+
+            except Exception:
+                logging.exception("COPY_WALLET_ERROR wallet=%s", wallet_label)
+                total_errors += 1
+
+        logging.info(
+            "COPY_TRADE_LOOP_TICK wallets=%s new_trades=%s attempts=%s "
+            "paper_positions_opened=%s errors=%s",
+            total_wallets,
+            total_new_trades,
+            total_attempts,
+            total_positions,
+            total_errors,
+        )
+
+        await asyncio.sleep(COPY_TRADE_LOOP_INTERVAL)
+
+
+# =============================================================================
+# STARTUP — MAIN ENTRY POINT (REUSABLE SKELETON)
+# =============================================================================
+# main() builds the ClobClient and launches all long-running asyncio tasks.
+# _run_forever() wraps each coroutine in a crash-safe restart loop.
+#
+# REUSABLE: The asyncio.gather + _run_forever pattern is fully reusable.
+# COPY-TRADE HOOK: Add a copy_market_config_loop task.
+#                  Remove or keep rotate_loop (BTC-SPECIFIC) as appropriate.
+# =============================================================================
+
 async def main():
     trading_client = build_trading_client()
     tasks = []
+    # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
     tasks.append(asyncio.create_task(_run_forever("rotate_loop", rotate_loop)))
     tasks.append(asyncio.create_task(_run_forever("paper_settlement_loop", paper_settlement_loop)))
     tasks.append(asyncio.create_task(_run_forever("live_balance_loop", live_balance_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
     tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
+    # ── Copy-trading task (additive — isolated from BTC strategy tasks) ───────
+    # Controlled by COPY_TRADE_ENABLED env var. Safe to disable without
+    # affecting any BTC strategy behavior.
+    tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)
