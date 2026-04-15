@@ -6295,6 +6295,9 @@ def close_matching_open_positions_on_exit(
                 pos.get("outcome") or "?",
                 entry_price, exit_price, size, pnl,
             )
+            # Exit mirror is only called from the PAPER path — always a paper position.
+            if pnl != 0.0:
+                _update_copy_paper_bankroll(pnl, pos_id, close_path="exit_mirror")
             closed_count += 1
         except Exception:
             logging.exception(
@@ -7340,6 +7343,77 @@ def compute_settlement_exit_price(pos: dict, resolution_data: dict) -> float | N
     return 1.0 if pos_outcome == resolution_outcome else 0.0
 
 
+COPY_PAPER_BOT_ID = "copy_paper"
+
+
+def _update_copy_paper_bankroll(
+    pnl: float,
+    pos_id: str,
+    close_path: str = "settlement",
+) -> None:
+    """
+    Apply a paper PnL delta to the copy_paper bankroll row in bot_settings.
+
+    Reads the current paper_balance_usd and paper_pnl_usd for bot_id='copy_paper',
+    adds pnl to both, writes the update, and logs with the required tag.
+
+    Anti-double-count guarantee: this function is only called after the
+    copied_positions row has already been updated to status='CLOSED' in the DB.
+    The settlement loop only loads OPEN positions, and the exit-mirror query also
+    only matches OPEN positions — so the same position can never trigger a second
+    bankroll update.
+
+    close_path identifies which code path triggered the close (for log context):
+      "settlement"  — copy_settlement_loop (market resolution)
+      "exit_mirror" — close_matching_open_positions_on_exit (source wallet SELL)
+    """
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("paper_balance_usd, paper_pnl_usd")
+            .eq("bot_id", COPY_PAPER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        old_balance = float_or_none(row.get("paper_balance_usd") if row else None) or 0.0
+        old_pnl     = float_or_none(row.get("paper_pnl_usd")     if row else None) or 0.0
+
+        new_balance = round(old_balance + pnl, 6)
+        new_pnl     = round(old_pnl     + pnl, 6)
+
+        payload = {
+            "paper_balance_usd": new_balance,
+            "paper_pnl_usd":     new_pnl,
+            "updated_at":        utc_now_iso(),
+        }
+        if row:
+            supabase.table("bot_settings").update(payload).eq("bot_id", COPY_PAPER_BOT_ID).execute()
+        else:
+            supabase.table("bot_settings").insert(
+                {"bot_id": COPY_PAPER_BOT_ID, **payload}
+            ).execute()
+
+        logging.info(
+            "COPY_PAPER_BANKROLL_UPDATED pos=%s path=%s pnl=%+.4f "
+            "old_balance=%.4f new_balance=%.4f old_pnl=%.4f new_pnl=%.4f",
+            pos_id[:8] if pos_id else "?",
+            close_path,
+            pnl,
+            old_balance,
+            new_balance,
+            old_pnl,
+            new_pnl,
+        )
+    except Exception:
+        logging.exception(
+            "COPY_PAPER_BANKROLL_UPDATE_FAIL pos=%s path=%s pnl=%s",
+            pos_id[:8] if pos_id else "?",
+            close_path,
+            pnl,
+        )
+
+
 def close_copied_position(
     pos: dict,
     exit_price: float,
@@ -7402,6 +7476,13 @@ def close_copied_position(
             size,
             pnl,
         )
+        # Update copy_paper bankroll — paper positions only.
+        # Live positions are tracked separately (real balance, not paper).
+        # Default to paper=True so pre-mode-tag positions are also credited.
+        raw_json = pos.get("raw_json") or {}
+        is_paper = raw_json.get("paper", True)
+        if is_paper and pnl != 0.0:
+            _update_copy_paper_bankroll(pnl, pos_id, close_path="settlement")
     except Exception:
         logging.exception("COPY_SETTLE_CLOSE_POSITION_FAIL pos=%s", pos_id)
 
