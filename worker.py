@@ -6062,16 +6062,19 @@ def evaluate_and_execute_live_copy_trade(
             pass  # unparseable timestamp — skip delay gate
 
     # ── Gate L7: per-bot hourly rate limit ───────────────────────────────────
-    max_per_hour_bot = int(copy_bot.get("max_trades_per_hour") or 20)
-    if _copy_bot_trades_this_hour(bot_id) >= max_per_hour_bot:
+    # 0 means UNLIMITED — only enforce when the configured value is > 0.
+    max_per_hour_bot = int(copy_bot.get("max_trades_per_hour") or 0)
+    if max_per_hour_bot > 0 and _copy_bot_trades_this_hour(bot_id) >= max_per_hour_bot:
         return False, "live_trades_per_hour_reached", None, None, {}
 
     # ── Gate L8: global live hourly cap ──────────────────────────────────────
-    if _get_live_copy_trades_this_hour() >= COPY_LIVE_MAX_TRADES_PER_HOUR:
+    # COPY_LIVE_MAX_TRADES_PER_HOUR=0 means UNLIMITED for the global cap too.
+    if COPY_LIVE_MAX_TRADES_PER_HOUR > 0 and _get_live_copy_trades_this_hour() >= COPY_LIVE_MAX_TRADES_PER_HOUR:
         return False, "live_global_hourly_cap", None, None, {}
 
     # ── Gate L9: live open positions cap ─────────────────────────────────────
-    if trade_side in ("BUY", ""):
+    # COPY_LIVE_MAX_OPEN_POSITIONS=0 means UNLIMITED.
+    if trade_side in ("BUY", "") and COPY_LIVE_MAX_OPEN_POSITIONS > 0:
         live_open = get_live_open_positions_count(live_bot_ids)
         if live_open >= COPY_LIVE_MAX_OPEN_POSITIONS:
             return False, "live_open_positions_limit", None, None, {}
@@ -6169,6 +6172,136 @@ def log_copy_attempt(
             str(copy_bot.get("id", "?"))[:8],
             str(wallet_trade.get("source_trade_id", "?"))[:20],
         )
+
+
+def close_matching_open_positions_on_exit(
+    copy_bot: dict,
+    wallet_trade: dict,
+) -> int:
+    """
+    Close open copied_positions that match the source wallet's SELL trade.
+
+    Called when copy_closes=True and a source wallet SELL is observed.
+    Finds OPEN positions for this bot on the same market and closes them using
+    the SELL trade's price as the exit price.
+
+    Matching priority: token_id > market_slug > condition_id
+
+    PnL formula (long position closed by source exit):
+      pnl = size * (exit_price - entry_price) / entry_price
+
+    Returns the number of positions closed.
+
+    Assumption: Only long BUY positions are mirrored in this pass.
+    If the copied position was opened as a SELL (short), exit logic would invert
+    — not handled here, logged and skipped.
+    """
+    bot_id      = str(copy_bot["id"])
+    token_id    = wallet_trade.get("token_id")
+    market_slug = wallet_trade.get("market_slug")
+    condition_id = wallet_trade.get("condition_id")
+
+    exit_price_raw = wallet_trade.get("price")
+    try:
+        exit_price = float(exit_price_raw) if exit_price_raw is not None else None
+    except (TypeError, ValueError):
+        exit_price = None
+
+    if exit_price is None:
+        logging.warning(
+            "COPY_EXIT_MIRROR_NO_PRICE bot=%s trade=%s slug=%s "
+            "— cannot close without a valid exit price from SELL trade",
+            bot_id[:8],
+            str(wallet_trade.get("source_trade_id", "?"))[:20],
+            market_slug or "?",
+        )
+        return 0
+
+    # Build the query to find matching OPEN positions for this bot
+    try:
+        base_q = (
+            supabase.table("copied_positions")
+            .select("*")
+            .eq("copy_bot_id", bot_id)
+            .eq("status", "OPEN")
+        )
+        if token_id:
+            resp = base_q.eq("token_id", token_id).execute()
+        elif market_slug:
+            resp = base_q.eq("market_slug", market_slug).execute()
+        elif condition_id:
+            resp = base_q.eq("condition_id", condition_id).execute()
+        else:
+            logging.info(
+                "COPY_EXIT_MIRROR_SKIP bot=%s — SELL trade has no market identifier "
+                "(no token_id, market_slug, or condition_id)",
+                bot_id[:8],
+            )
+            return 0
+        positions_to_close = resp.data or []
+    except Exception:
+        logging.exception("COPY_EXIT_MIRROR_QUERY_FAIL bot=%s", bot_id[:8])
+        return 0
+
+    if not positions_to_close:
+        logging.info(
+            "COPY_EXIT_MIRROR_NO_MATCH bot=%s slug=%s token=%s "
+            "— no open positions found to close for this SELL trade",
+            bot_id[:8],
+            market_slug or "?",
+            str(token_id or "?")[:16],
+        )
+        return 0
+
+    closed_count = 0
+    for pos in positions_to_close:
+        pos_id = str(pos.get("id") or "")
+        try:
+            entry_price = float_or_none(pos.get("entry_price")) or 0.0
+            size        = float_or_none(pos.get("size")) or 0.0
+
+            if str(pos.get("side") or "BUY").upper() == "SELL":
+                logging.info(
+                    "COPY_EXIT_MIRROR_SKIP_SHORT pos=%s "
+                    "— position is a SELL/short, exit mirroring not yet implemented",
+                    pos_id[:8],
+                )
+                continue
+
+            pnl = round(size * (exit_price - entry_price) / entry_price, 6) if entry_price > 0 else 0.0
+
+            updates = {
+                "status":    "CLOSED",
+                "exit_price": exit_price,
+                "pnl":        pnl,
+                "closed_at":  utc_now_iso(),
+                "raw_json": {
+                    **(pos.get("raw_json") or {}),
+                    "close": {
+                        "reason":          "source_wallet_exit",
+                        "source_trade_id": wallet_trade.get("source_trade_id"),
+                        "exit_price":      exit_price,
+                        "pnl":             pnl,
+                        "closed_at":       utc_now_iso(),
+                    },
+                },
+            }
+            supabase.table("copied_positions").update(updates).eq("id", pos_id).execute()
+            logging.info(
+                "COPY_EXIT_MIRROR_CLOSED pos=%s bot=%s slug=%s outcome=%s "
+                "entry=%.4f exit=%.4f size=%.2f pnl=%+.4f",
+                pos_id[:8], bot_id[:8],
+                pos.get("market_slug") or "?",
+                pos.get("outcome") or "?",
+                entry_price, exit_price, size, pnl,
+            )
+            closed_count += 1
+        except Exception:
+            logging.exception(
+                "COPY_EXIT_MIRROR_CLOSE_FAIL pos=%s bot=%s", pos_id[:8], bot_id[:8]
+            )
+
+    return closed_count
 
 
 def open_copied_position(
@@ -6598,16 +6731,19 @@ def evaluate_copy_bot_for_trade(
             pass  # unparseable timestamp — skip delay gate
 
     # Gate 5: max_trades_per_hour (in-memory)
-    max_per_hour = int(copy_bot.get("max_trades_per_hour") or 20)
-    if _copy_bot_trades_this_hour(bot_id) >= max_per_hour:
+    # 0 means UNLIMITED — only enforce when the configured value is > 0.
+    max_per_hour = int(copy_bot.get("max_trades_per_hour") or 0)
+    if max_per_hour > 0 and _copy_bot_trades_this_hour(bot_id) >= max_per_hour:
         return False, "max_trades_per_hour_reached", None, None
 
     # Gate 6: max_open_positions (DB query — only relevant for BUY/entry trades)
+    # 0 means UNLIMITED — only enforce when the configured value is > 0.
     if trade_side in ("BUY", ""):
-        max_open = int(copy_bot.get("max_open_positions") or 10)
-        open_count = get_open_positions_count(bot_id)
-        if open_count >= max_open:
-            return False, "max_open_positions_reached", None, None
+        max_open = int(copy_bot.get("max_open_positions") or 0)
+        if max_open > 0:
+            open_count = get_open_positions_count(bot_id)
+            if open_count >= max_open:
+                return False, "max_open_positions_reached", None, None
 
     # Gate 7: Minimum market data required
     if not wallet_trade.get("token_id") and not wallet_trade.get("market_slug"):
@@ -6759,28 +6895,57 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                 copied, skip_reason, submitted_size, submitted_price = (
                                     evaluate_copy_bot_for_trade(bot, wallet_trade, global_settings)
                                 )
-                                order_status = "PAPER_MATCHED" if copied else "SKIPPED"
+                                trade_side_for_log = str(wallet_trade.get("side") or "").upper()
+
+                                # Determine order_status before logging so the
+                                # audit row reflects what actually happened.
+                                if copied and trade_side_for_log == "SELL":
+                                    order_status = "SOURCE_EXIT_MIRRORED"
+                                elif copied:
+                                    order_status = "PAPER_MATCHED"
+                                else:
+                                    order_status = "SKIPPED"
+
                                 log_copy_attempt(
                                     bot, wallet_trade, copied, skip_reason,
                                     submitted_size, submitted_price, order_status,
                                 )
                                 total_attempts += 1
+
                                 if copied:
-                                    open_copied_position(
-                                        bot, wallet_trade, submitted_size, submitted_price,
-                                        mode="PAPER",
-                                    )
-                                    _copy_bot_mark_trade(bot_id)
-                                    total_paper_opened += 1
-                                    logging.info(
-                                        "COPY_PAPER_COPIED bot=%s wallet=%s trade=%s "
-                                        "slug=%s side=%s outcome=%s size=%s price=%s",
-                                        bot_label, wallet_label, trade_label,
-                                        wallet_trade.get("market_slug") or "?",
-                                        wallet_trade.get("side"),
-                                        wallet_trade.get("outcome"),
-                                        submitted_size, submitted_price,
-                                    )
+                                    if trade_side_for_log == "SELL":
+                                        # Source wallet exit: close matching open positions.
+                                        # Do NOT create a new SELL row — update existing BUY rows.
+                                        n_closed = close_matching_open_positions_on_exit(
+                                            bot, wallet_trade
+                                        )
+                                        if n_closed:
+                                            update_wallet_metrics_for_address(wallet_address)
+                                        total_paper_opened += n_closed
+                                        logging.info(
+                                            "COPY_EXIT_MIRROR_DONE bot=%s wallet=%s trade=%s "
+                                            "slug=%s positions_closed=%s",
+                                            bot_label, wallet_label, trade_label,
+                                            wallet_trade.get("market_slug") or "?",
+                                            n_closed,
+                                        )
+                                    else:
+                                        # BUY / entry: open a new paper position
+                                        open_copied_position(
+                                            bot, wallet_trade, submitted_size, submitted_price,
+                                            mode="PAPER",
+                                        )
+                                        _copy_bot_mark_trade(bot_id)
+                                        total_paper_opened += 1
+                                        logging.info(
+                                            "COPY_PAPER_COPIED bot=%s wallet=%s trade=%s "
+                                            "slug=%s side=%s outcome=%s size=%s price=%s",
+                                            bot_label, wallet_label, trade_label,
+                                            wallet_trade.get("market_slug") or "?",
+                                            wallet_trade.get("side"),
+                                            wallet_trade.get("outcome"),
+                                            submitted_size, submitted_price,
+                                        )
                                 else:
                                     logging.info(
                                         "COPY_PAPER_SKIPPED bot=%s wallet=%s trade=%s reason=%s",
@@ -7300,17 +7465,28 @@ async def copy_settlement_loop() -> None:
             pos_id = str(pos.get("id") or "")
             wallet_address = pos.get("wallet_address") or ""
 
+            # Compute position age once for logging
+            pos_age_min: float | None = None
+            opened_dt = _parse_ts(pos.get("opened_at"))
+            if opened_dt:
+                pos_age_min = round(
+                    (datetime.now(timezone.utc) - opened_dt).total_seconds() / 60, 1
+                )
+
             try:
                 # ── Step 1: Build market lookup key ───────────────────────
                 condition_id = pos.get("condition_id")
-                market_slug = pos.get("market_slug")
-                token_id = pos.get("token_id")
+                market_slug  = pos.get("market_slug")
+                token_id     = pos.get("token_id")
 
                 market_key = condition_id or market_slug or token_id
                 if not market_key:
                     logging.info(
-                        "COPY_SETTLE_NO_MARKET_KEY pos=%s — no condition_id/slug/token_id",
-                        pos_id[:8],
+                        "COPY_SETTLE_SKIP pos=%s reason=no_market_key "
+                        "age_min=%s slug=%s outcome=%s "
+                        "(no condition_id, market_slug, or token_id on this position)",
+                        pos_id[:8], pos_age_min,
+                        market_slug or "—", pos.get("outcome") or "—",
                     )
                     skipped_no_data += 1
                     continue
@@ -7332,26 +7508,57 @@ async def copy_settlement_loop() -> None:
                 resolution_data = market_resolution_cache[market_key]
 
                 if not resolution_data:
-                    logging.debug(
-                        "COPY_SETTLE_NO_RESOLUTION_DATA pos=%s slug=%s",
-                        pos_id[:8],
-                        market_slug or "?",
+                    # Previously logging.debug (invisible in Railway) — now INFO.
+                    # This is the most common failure path; must be visible.
+                    logging.info(
+                        "COPY_SETTLE_SKIP pos=%s reason=gamma_api_no_data "
+                        "age_min=%s slug=%s cid=%s token=%s "
+                        "(Gamma API returned no market data — market may be very new, "
+                        "slug may be missing, or API is temporarily unavailable)",
+                        pos_id[:8], pos_age_min,
+                        market_slug or "—",
+                        str(condition_id or "—")[:16],
+                        str(token_id or "—")[:16],
                     )
                     skipped_no_data += 1
                     continue
 
                 # ── Step 3: Check whether market has resolved ─────────────
                 if not resolution_data.get("resolved"):
+                    logging.info(
+                        "COPY_SETTLE_SKIP pos=%s reason=market_unresolved "
+                        "age_min=%s slug=%s active=%s resolution=%s",
+                        pos_id[:8], pos_age_min,
+                        market_slug or "—",
+                        resolution_data.get("active"),
+                        resolution_data.get("resolution_outcome") or "pending",
+                    )
                     skipped_unresolved += 1
                     continue
 
                 # ── Step 4: Compute exit price ────────────────────────────
                 exit_price = compute_settlement_exit_price(pos, resolution_data)
                 if exit_price is None:
-                    # Could be SELL position or missing outcome data
                     if str(pos.get("side") or "BUY").upper() == "SELL":
+                        logging.info(
+                            "COPY_SETTLE_SKIP pos=%s reason=sell_position_not_settled "
+                            "age_min=%s slug=%s — SELL-side settlement not yet implemented",
+                            pos_id[:8], pos_age_min, market_slug or "—",
+                        )
                         skipped_sell += 1
                     else:
+                        logging.info(
+                            "COPY_SETTLE_SKIP pos=%s reason=cannot_determine_exit_price "
+                            "age_min=%s slug=%s outcome=%s resolution=%s "
+                            "yes_token=%s no_token=%s pos_token=%s",
+                            pos_id[:8], pos_age_min,
+                            market_slug or "—",
+                            pos.get("outcome") or "—",
+                            resolution_data.get("resolution_outcome") or "—",
+                            str(resolution_data.get("yes_token_id") or "—")[:12],
+                            str(resolution_data.get("no_token_id") or "—")[:12],
+                            str(token_id or "—")[:12],
+                        )
                         skipped_no_data += 1
                     continue
 
