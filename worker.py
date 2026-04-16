@@ -120,6 +120,22 @@ logging.warning(
     COPY_LIVE_MAX_TRADE_USD,
 )
 logging.warning("WORKER_BOOT build=SHARED_BRAIN_V1")
+# ── Proof-of-deploy marker ────────────────────────────────────────────────────
+# This line proves which code version Railway is actually running.
+# If you see COPY_LIVE_GATE_L4_FAIL in Railway, the container below is NOT
+# the one emitting it — an older deployment is still alive.
+# Confirm by searching Railway logs for DEPLOY_PROOF — only the new container
+# will emit it.  If you cannot find DEPLOY_PROOF, Railway has NOT deployed
+# this commit.
+logging.warning(
+    "DEPLOY_PROOF commit=8e1f286 "
+    "gate_L4=REMOVED "
+    "gate_too_many_live_bots=REMOVED "
+    "multi_live_bots=UNLIMITED "
+    "sell_always_closes_db=TRUE "
+    "— if you see COPY_LIVE_GATE_L4_FAIL alongside this, "
+    "two containers are running simultaneously"
+)
 logging.info(
     "TP_SL_CONFIG fast_tp=%s fast_sl=%s fast_max_hold=%s snipe_tp=%s snipe_sl=%s snipe_max_hold=%s entry_cutoff=%s force_exit=%s low_funds_skip=%s",
     FAST_TP_CENTS,
