@@ -313,11 +313,17 @@ COPY_TRADE_ENABLED = os.getenv("COPY_TRADE_ENABLED", "true").strip().lower() in 
     "1", "true", "yes",
 )
 COPY_TRADE_LOOP_INTERVAL = int(os.getenv("COPY_TRADE_LOOP_INTERVAL", "60"))
-COPY_WALLET_TRADE_FETCH_LIMIT = int(os.getenv("COPY_WALLET_TRADE_FETCH_LIMIT", "50"))
+# Raised 50 -> 200 so active wallets don't silently miss older SELL/BUY
+# events between ticks. Override via env if needed.
+COPY_WALLET_TRADE_FETCH_LIMIT = int(os.getenv("COPY_WALLET_TRADE_FETCH_LIMIT", "200"))
 # COPY_WALLET_TRADE_DB_LIMIT: how many wallet_trades rows to scan per bot per tick
 # from the local DB (separate from the API fetch limit). Higher values reduce the
 # chance of SELL events being missed for high-activity wallets.
-COPY_WALLET_TRADE_DB_LIMIT = int(os.getenv("COPY_WALLET_TRADE_DB_LIMIT", "200"))
+# Raised 200 → 500 → 1000. Active wallets with many trades need a large window
+# so older SELL events remain visible. Set to 0 for unlimited (full lookback).
+# IMPORTANT: if Railway has COPY_WALLET_TRADE_DB_LIMIT=200 set as an env var,
+# remove it or update it — the old value blocks close detection.
+COPY_WALLET_TRADE_DB_LIMIT = int(os.getenv("COPY_WALLET_TRADE_DB_LIMIT", "1000"))
 COPY_TRADE_LOOKBACK_HOURS = int(os.getenv("COPY_TRADE_LOOKBACK_HOURS", "24"))
 COPY_DATA_API_BASE = "https://data-api.polymarket.com"
 
@@ -336,20 +342,20 @@ COPY_SETTLEMENT_BATCH_SIZE = int(os.getenv("COPY_SETTLEMENT_BATCH_SIZE", "100"))
 # COPY_LIVE_ENABLED           Master env-var switch for the live path.
 #                             Defaults to "false" — must be explicitly set to
 #                             enable live copy execution.
-# COPY_LIVE_MAX_BOTS          Max enabled LIVE-mode copy bots allowed at once.
-#                             Pilot default: 1.
 # COPY_LIVE_MAX_TRADE_USD     Hard USD cap per live copy order.
 #                             Computed size is clamped to this before submission.
-#                             Pilot default: $5.
+#                             Default: $5.
 # COPY_LIVE_MAX_OPEN_POSITIONS Max open live copied_positions across all live bots.
-#                             Pilot default: 3.
-# COPY_LIVE_MAX_TRADES_PER_HOUR Global cap on live copy orders per hour (all bots).
-#                             Pilot default: 5.
+#                             0 = unlimited. Default: 3.
+# COPY_LIVE_MAX_TRADES_PER_HOUR Global cap on live copy orders per hour (BUY only).
+#                             SELL/close orders are exempt. 0 = unlimited. Default: 5.
+#
+# NOTE: COPY_LIVE_MAX_BOTS has been removed. Multiple ARM LIVE bots are
+# allowed simultaneously with no bot-count gate. The old L4 gate is gone.
 
 COPY_LIVE_ENABLED = os.getenv("COPY_LIVE_ENABLED", "false").strip().lower() in (
     "1", "true", "yes",
 )
-COPY_LIVE_MAX_BOTS             = int(os.getenv("COPY_LIVE_MAX_BOTS",              "1"))
 COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",       "5.0"))
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))

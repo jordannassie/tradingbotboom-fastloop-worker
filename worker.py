@@ -113,11 +113,10 @@ logging.warning(
     "legacy_btc_routing=disabled_for_copy_trading "
     "env_COPY_LIVE_ENABLED=%s "
     "env_COPY_TRADE_ENABLED=%s "
-    "COPY_LIVE_MAX_BOTS=%s "
-    "COPY_LIVE_MAX_TRADE_USD=%s",
+    "COPY_LIVE_MAX_TRADE_USD=%s "
+    "multi_live_bots=UNLIMITED",
     COPY_LIVE_ENABLED,
     COPY_TRADE_ENABLED,
-    COPY_LIVE_MAX_BOTS,
     COPY_LIVE_MAX_TRADE_USD,
 )
 logging.warning("WORKER_BOOT build=SHARED_BRAIN_V1")
@@ -5798,7 +5797,7 @@ def get_unevaluated_trades_for_bot(
     wallet_address: str,
     bot_id: str,
     lookback_hours: int = 24,
-    limit: int = 200,
+    limit: int = 1000,
     copy_closes: bool = False,
     bot_label: str = "",
 ) -> list[dict]:
@@ -5818,37 +5817,55 @@ def get_unevaluated_trades_for_bot(
       positions to be closed after copy_closes is enabled on a bot that was
       running with copy_closes=False.
 
-    The limit default is 200 (was 50) to reduce the chance of SELL events being
-    dropped for wallets with high intraday activity.
+    limit controls how many wallet_trades rows are scanned.  The default is
+    1000 (raised from 200 → 500 → 1000).  If Railway has a lower value set
+    as an env var (COPY_WALLET_TRADE_DB_LIMIT), older SELL events will be
+    invisible.  Set to 0 to remove the cap entirely (full lookback window).
     """
     _label = bot_label or bot_id[:8]
     try:
         cutoff_ts = time() - (lookback_hours * 3600)
         cutoff = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).isoformat()
 
-        trades_resp = (
+        _query = (
             supabase.table("wallet_trades")
             .select("*")
             .eq("wallet_address", wallet_address)
             .gte("traded_at", cutoff)
             .order("traded_at", desc=True)
-            .limit(limit)
-            .execute()
         )
+        # limit=0 means no cap — return every row in the lookback window.
+        if limit > 0:
+            _query = _query.limit(limit)
+        trades_resp = _query.execute()
         all_trades = trades_resp.data or []
         if not all_trades:
             return []
 
-        # Warn if we hit the limit — SELL events beyond this window are invisible.
-        if len(all_trades) == limit:
-            logging.warning(
-                "COPY_UNEVALUATED_LIMIT_HIT bot=%s wallet=%s — wallet_trades query "
-                "returned exactly limit=%s rows; SELL events for older positions "
-                "may be invisible. Consider raising COPY_WALLET_TRADE_DB_LIMIT.",
-                _label,
-                wallet_address[:10],
-                limit,
-            )
+        # Warn if we saturated the limit — SELL events beyond the window are
+        # invisible.  Also cross-check open positions so the operator knows
+        # whether any existing positions are at risk of a missed close.
+        if limit > 0 and len(all_trades) >= limit:
+            # Count open positions for this bot to judge severity.
+            _open_count = get_open_positions_count(bot_id)
+            if _open_count > 0:
+                logging.warning(
+                    "COPY_UNEVALUATED_LIMIT_HIT bot=%s wallet=%s limit=%s "
+                    "open_positions=%s — query saturated AND bot has open "
+                    "positions.  SELL events for older opens ARE INVISIBLE. "
+                    "Fix: remove COPY_WALLET_TRADE_DB_LIMIT env var in Railway "
+                    "or raise it above %s.",
+                    _label, wallet_address[:10], limit, _open_count, limit,
+                )
+            else:
+                logging.warning(
+                    "COPY_UNEVALUATED_LIMIT_HIT bot=%s wallet=%s limit=%s "
+                    "open_positions=0 — query saturated but no open positions "
+                    "currently; SELL events for future opens may be invisible if "
+                    "this wallet stays active.  Fix: remove or raise "
+                    "COPY_WALLET_TRADE_DB_LIMIT in Railway.",
+                    _label, wallet_address[:10], limit,
+                )
 
         trade_ids = [t["source_trade_id"] for t in all_trades]
 
@@ -6132,7 +6149,6 @@ def _get_copy_buy_lock(mode: str) -> asyncio.Lock:
 #   DB:   copy_global_settings.live_on = true
 #   DB:   copy_global_settings.emergency_stop = false
 #   DB:   copy_bots.arm_live = true  (per-bot arm)
-#   CAP:  number of enabled LIVE bots ≤ COPY_LIVE_MAX_BOTS
 #   CAP:  live open positions ≤ COPY_LIVE_MAX_OPEN_POSITIONS
 #   CAP:  live trades this hour ≤ COPY_LIVE_MAX_TRADES_PER_HOUR  (global)
 #   CAP:  per-trade USD ≤ COPY_LIVE_MAX_TRADE_USD  (hard clamp)
@@ -6320,7 +6336,6 @@ def evaluate_and_execute_live_copy_trade(
     Returns (ok, skip_reason, final_size_usd, actual_price, raw_response).
 
     Live-only gates (in order):
-      L4   too_many_live_bots_enabled  — enabled live bots > COPY_LIVE_MAX_BOTS
       L8   live_global_hourly_cap      — global hourly live cap exceeded
       L9   live_open_positions_limit   — open live positions ≥ COPY_LIVE_MAX_OPEN_POSITIONS
       L9b  live_max_exposure_reached   — BUY would exceed live_max_exposure_usd
@@ -6336,28 +6351,19 @@ def evaluate_and_execute_live_copy_trade(
     # Entry diagnostic — after shared brain, before live-only gates.
     logging.info(
         "COPY_LIVE_EVAL_ENTRY bot=%s wallet=%s trade=%s side=%s "
-        "live_on=%s arm_live=%s live_bots=%s max_bots=%s "
+        "live_on=%s arm_live=%s live_bots=%s "
         "max_open_pos=%s max_trades_hr=%s size=%.4f price=%.4f",
         _bot_name, _wallet, _trade_id, trade_side,
         bool(global_settings.get("live_on")),
         bool(copy_bot.get("arm_live")),
-        len(live_bot_ids), COPY_LIVE_MAX_BOTS,
+        len(live_bot_ids),
         COPY_LIVE_MAX_OPEN_POSITIONS, COPY_LIVE_MAX_TRADES_PER_HOUR,
         submitted_size, submitted_price,
     )
 
-    # ── Gate L4: live bot count cap ───────────────────────────────────────────
-    if len(live_bot_ids) > COPY_LIVE_MAX_BOTS:
-        logging.warning(
-            "COPY_LIVE_GATE_L4_FAIL bot=%s trade=%s "
-            "live_bots=%s max_bots=%s reason=too_many_live_bots_enabled",
-            _bot_name, _trade_id, len(live_bot_ids), COPY_LIVE_MAX_BOTS,
-        )
-        return False, "too_many_live_bots_enabled", None, None, {}
-
     # ── Gate L8: global live hourly cap ──────────────────────────────────────
-    # 0 = unlimited.
-    if COPY_LIVE_MAX_TRADES_PER_HOUR > 0:
+    # 0 = unlimited. SELL/close orders are exempt — exits must not be capped.
+    if COPY_LIVE_MAX_TRADES_PER_HOUR > 0 and trade_side != "SELL":
         _global_hr_count = _get_live_copy_trades_this_hour()
         if _global_hr_count >= COPY_LIVE_MAX_TRADES_PER_HOUR:
             logging.warning(
@@ -6603,12 +6609,28 @@ def close_matching_open_positions_on_exit(
     Assumption: Only long BUY positions are mirrored in this pass.
     If the copied position was opened as a SELL (short), exit logic would invert
     — not handled here, logged and skipped.
+
+    Every decision in this function emits a tagged log prefixed SELL_MIRROR_*
+    so Railway search can confirm the full chain:
+      SELL_MIRROR_ENTER  — function called
+      SELL_MIRROR_NO_PRICE   — no price, abort
+      SELL_MIRROR_NO_ID      — no market identifier, abort
+      SELL_MIRROR_QUERY_FAIL — DB query exception, abort
+      SELL_MIRROR_NO_MATCH   — query returned 0 rows
+      SELL_MIRROR_FOUND      — N rows returned, processing each
+      SELL_MIRROR_SKIP_SHORT — position side=SELL, skipped
+      SELL_MIRROR_DB_ATTEMPT — about to write close to DB
+      SELL_MIRROR_DB_OK      — DB update confirmed
+      SELL_MIRROR_DB_FAIL    — DB update exception
+      SELL_MIRROR_SUMMARY    — final count at end of call
     """
-    bot_id      = str(copy_bot["id"])
-    bot_label   = copy_bot.get("name") or bot_id[:8]
-    token_id    = wallet_trade.get("token_id")
-    market_slug = wallet_trade.get("market_slug")
+    bot_id       = str(copy_bot["id"])
+    bot_label    = copy_bot.get("name") or bot_id[:8]
+    token_id     = wallet_trade.get("token_id")
+    market_slug  = wallet_trade.get("market_slug")
     condition_id = wallet_trade.get("condition_id")
+    trade_id     = str(wallet_trade.get("source_trade_id") or "?")[:24]
+    wallet_short = str(wallet_trade.get("wallet_address") or "?")[:12]
 
     exit_price_raw = wallet_trade.get("price")
     try:
@@ -6616,19 +6638,40 @@ def close_matching_open_positions_on_exit(
     except (TypeError, ValueError):
         exit_price = None
 
+    # ── SELL_MIRROR_ENTER ─────────────────────────────────────────────────────
+    # Always log entry so we can confirm this function was reached for any SELL.
+    logging.warning(
+        "SELL_MIRROR_ENTER bot=%s wallet=%s trade=%s "
+        "slug=%s token=%s condition=%s exit_price=%s",
+        bot_label, wallet_short, trade_id,
+        market_slug or "NONE",
+        str(token_id or "NONE")[:20],
+        str(condition_id or "NONE")[:20],
+        exit_price,
+    )
+
     if exit_price is None:
+        logging.warning(
+            "SELL_MIRROR_NO_PRICE bot=%s trade=%s slug=%s token=%s "
+            "— SELL trade has no usable price; cannot compute exit. "
+            "raw_price=%r",
+            bot_label, trade_id,
+            market_slug or "?",
+            str(token_id or "?")[:20],
+            exit_price_raw,
+        )
+        # keep legacy tag for backwards compat
         logging.warning(
             "COPY_EXIT_MIRROR_NO_PRICE bot=%s trade=%s slug=%s token=%s condition=%s "
             "— cannot close without a valid exit price from SELL trade",
-            bot_label,
-            str(wallet_trade.get("source_trade_id", "?"))[:20],
+            bot_label, trade_id,
             market_slug or "?",
             str(token_id or "?")[:16],
             str(condition_id or "?")[:16],
         )
         return 0
 
-    # Build the query to find matching OPEN positions for this bot
+    # ── Build query ───────────────────────────────────────────────────────────
     match_field: str
     try:
         base_q = (
@@ -6647,28 +6690,52 @@ def close_matching_open_positions_on_exit(
             match_field = "condition_id"
             resp = base_q.eq("condition_id", condition_id).execute()
         else:
+            logging.warning(
+                "SELL_MIRROR_NO_ID bot=%s wallet=%s trade=%s "
+                "— SELL trade has no token_id, market_slug, or condition_id; "
+                "cannot query open positions. raw_trade=%r",
+                bot_label, wallet_short, trade_id,
+                {k: wallet_trade.get(k) for k in
+                 ("side", "outcome", "market_slug", "token_id", "condition_id")},
+            )
             logging.info(
                 "COPY_EXIT_MIRROR_SKIP bot=%s wallet=%s — SELL trade has no market identifier "
                 "(no token_id, market_slug, or condition_id); trade=%s",
-                bot_label,
-                str(wallet_trade.get("wallet_address") or "?")[:10],
-                str(wallet_trade.get("source_trade_id", "?"))[:20],
+                bot_label, wallet_short, trade_id,
             )
             return 0
         positions_to_close = resp.data or []
     except Exception:
+        logging.warning(
+            "SELL_MIRROR_QUERY_FAIL bot=%s trade=%s slug=%s token=%s "
+            "— DB query for open positions threw an exception",
+            bot_label, trade_id,
+            market_slug or "?",
+            str(token_id or "?")[:20],
+        )
         logging.exception(
             "COPY_EXIT_MIRROR_QUERY_FAIL bot=%s slug=%s token=%s",
             bot_label, market_slug or "?", str(token_id or "?")[:16],
         )
         return 0
 
+    # ── No rows returned ──────────────────────────────────────────────────────
     if not positions_to_close:
+        logging.warning(
+            "SELL_MIRROR_NO_MATCH bot=%s wallet=%s trade=%s "
+            "match_field=%s match_value=%s "
+            "— 0 OPEN positions found for this bot+market. "
+            "Possible reasons: position never opened for this bot, "
+            "already closed, or market identifier mismatch between "
+            "wallet_trade and copied_positions.",
+            bot_label, wallet_short, trade_id,
+            match_field,
+            (token_id or market_slug or condition_id or "NONE"),
+        )
         logging.info(
             "COPY_EXIT_MIRROR_NO_MATCH bot=%s wallet=%s slug=%s token=%s condition=%s "
             "match_field=%s — no open positions found to close for this SELL trade",
-            bot_label,
-            str(wallet_trade.get("wallet_address") or "?")[:10],
+            bot_label, wallet_short,
             market_slug or "?",
             str(token_id or "?")[:16],
             str(condition_id or "?")[:16],
@@ -6676,25 +6743,57 @@ def close_matching_open_positions_on_exit(
         )
         return 0
 
-    closed_count = 0
+    # ── Rows found ────────────────────────────────────────────────────────────
+    logging.warning(
+        "SELL_MIRROR_FOUND bot=%s wallet=%s trade=%s "
+        "match_field=%s match_value=%s found=%s "
+        "— processing each open position for DB close",
+        bot_label, wallet_short, trade_id,
+        match_field,
+        (token_id or market_slug or condition_id or "NONE"),
+        len(positions_to_close),
+    )
+
+    closed_count  = 0
+    skipped_count = 0
+    failed_count  = 0
+
     for pos in positions_to_close:
-        pos_id = str(pos.get("id") or "")
+        pos_id     = str(pos.get("id") or "")
+        pos_slug   = pos.get("market_slug") or "?"
+        pos_side   = str(pos.get("side") or "BUY").upper()
+        pos_outcome = pos.get("outcome") or "?"
+
         try:
             entry_price = float_or_none(pos.get("entry_price")) or 0.0
             size        = float_or_none(pos.get("size")) or 0.0
 
-            if str(pos.get("side") or "BUY").upper() == "SELL":
+            if pos_side == "SELL":
+                logging.warning(
+                    "SELL_MIRROR_SKIP_SHORT pos=%s bot=%s slug=%s outcome=%s "
+                    "— position side=SELL (short); exit mirror not implemented for shorts",
+                    pos_id[:12], bot_label, pos_slug, pos_outcome,
+                )
                 logging.info(
                     "COPY_EXIT_MIRROR_SKIP_SHORT pos=%s bot=%s slug=%s "
                     "— position is a SELL/short, exit mirroring not yet implemented",
-                    pos_id[:8], bot_label,
-                    pos.get("market_slug") or "?",
+                    pos_id[:8], bot_label, pos_slug,
                 )
+                skipped_count += 1
                 continue
 
             pnl = round(size * (exit_price - entry_price) / entry_price, 6) if entry_price > 0 else 0.0
-
             is_live_position = bool((pos.get("raw_json") or {}).get("live"))
+
+            # ── SELL_MIRROR_DB_ATTEMPT ────────────────────────────────────────
+            logging.warning(
+                "SELL_MIRROR_DB_ATTEMPT pos=%s bot=%s slug=%s outcome=%s "
+                "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
+                "— writing CLOSED to DB now",
+                pos_id[:12], bot_label, pos_slug, pos_outcome,
+                entry_price, exit_price, size, pnl, is_live_position,
+            )
+
             updates = {
                 "status":    "CLOSED",
                 "exit_price": exit_price,
@@ -6711,25 +6810,58 @@ def close_matching_open_positions_on_exit(
                     },
                 },
             }
-            supabase.table("copied_positions").update(updates).eq("id", pos_id).execute()
+            update_resp = (
+                supabase.table("copied_positions")
+                .update(updates)
+                .eq("id", pos_id)
+                .execute()
+            )
+            updated_rows = len(update_resp.data) if update_resp.data else 0
+
+            # ── SELL_MIRROR_DB_OK ─────────────────────────────────────────────
+            logging.warning(
+                "SELL_MIRROR_DB_OK pos=%s bot=%s slug=%s outcome=%s "
+                "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
+                "rows_updated=%s",
+                pos_id[:12], bot_label, pos_slug, pos_outcome,
+                entry_price, exit_price, size, pnl, is_live_position,
+                updated_rows,
+            )
+            # keep legacy tag for backwards compat
             logging.info(
                 "COPY_EXIT_MIRROR_CLOSED pos=%s bot=%s slug=%s outcome=%s "
                 "entry=%.4f exit=%.4f size=%.2f pnl=%+.4f live=%s",
-                pos_id[:8], bot_label,
-                pos.get("market_slug") or "?",
-                pos.get("outcome") or "?",
+                pos_id[:8], bot_label, pos_slug, pos_outcome,
                 entry_price, exit_price, size, pnl, is_live_position,
             )
+
             if pnl != 0.0 and not is_live_position:
                 _update_copy_paper_bankroll(pnl, pos_id, close_path="exit_mirror")
             closed_count += 1
+
         except Exception:
+            failed_count += 1
+            logging.warning(
+                "SELL_MIRROR_DB_FAIL pos=%s bot=%s slug=%s "
+                "— exception during DB close attempt",
+                pos_id[:12], bot_label, pos_slug,
+            )
             logging.exception(
                 "COPY_EXIT_MIRROR_CLOSE_FAIL pos=%s bot=%s slug=%s token=%s",
                 pos_id[:8], bot_label,
                 pos.get("market_slug") or "?",
                 str(pos.get("token_id") or "?")[:16],
             )
+
+    # ── SELL_MIRROR_SUMMARY ───────────────────────────────────────────────────
+    logging.warning(
+        "SELL_MIRROR_SUMMARY bot=%s wallet=%s trade=%s slug=%s "
+        "found=%s closed=%s skipped=%s failed=%s",
+        bot_label, wallet_short, trade_id,
+        market_slug or "?",
+        len(positions_to_close),
+        closed_count, skipped_count, failed_count,
+    )
 
     return closed_count
 
@@ -7166,9 +7298,9 @@ def evaluate_copy_trade_shared(
     if trade_side == "SELL" and not copy_closes:
         return False, "closes_not_enabled", None, None
 
-    # G3: Delay filter
+    # G3: Delay filter — SELL/close events are exempt; the source already sold.
     delay_sec = int(copy_bot.get("delay_seconds") or 0)
-    if delay_sec > 0:
+    if delay_sec > 0 and trade_side != "SELL":
         try:
             traded_at_str = str(wallet_trade.get("traded_at") or "")
             traded_at_dt  = datetime.fromisoformat(traded_at_str.replace("Z", "+00:00"))
@@ -7179,8 +7311,9 @@ def evaluate_copy_trade_shared(
             pass  # unparseable timestamp — skip delay gate
 
     # G4: max_trades_per_hour (in-memory; 0 = unlimited)
+    # SELL/close events are exempt — position exits must not be rate-limited.
     max_per_hour = int(copy_bot.get("max_trades_per_hour") or 0)
-    if max_per_hour > 0 and _copy_bot_trades_this_hour(bot_id) >= max_per_hour:
+    if max_per_hour > 0 and trade_side != "SELL" and _copy_bot_trades_this_hour(bot_id) >= max_per_hour:
         return False, "max_trades_per_hour_reached", None, None
 
     # G5: per-bot max_open_positions (DB query; BUY/entry only; 0 = unlimited)
@@ -7247,7 +7380,6 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
 
       LIVE   (effective_live=True):
         → evaluate_and_execute_live_copy_trade (live-only gates + CLOB):
-            L4   too_many_live_bots_enabled
             L8   live_global_hourly_cap
             L9   live_open_positions_limit
             L9b  live_max_exposure_reached
@@ -7289,12 +7421,11 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         "legacy_btc_strategy_routing=disabled_for_copy_trading "
         "env_COPY_LIVE_ENABLED=%s "
         "env_COPY_TRADE_ENABLED=%s "
-        "COPY_LIVE_MAX_BOTS=%s "
         "COPY_LIVE_MAX_TRADE_USD=%s "
-        "COPY_LIVE_MAX_OPEN_POSITIONS=%s",
+        "COPY_LIVE_MAX_OPEN_POSITIONS=%s "
+        "multi_live_bots=UNLIMITED",
         COPY_LIVE_ENABLED,
         COPY_TRADE_ENABLED,
-        COPY_LIVE_MAX_BOTS,
         COPY_LIVE_MAX_TRADE_USD,
         COPY_LIVE_MAX_OPEN_POSITIONS,
     )
@@ -7312,13 +7443,51 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
             await asyncio.sleep(300)  # re-log every 5 min so it stays visible
         return  # unreachable; satisfies type checkers
 
+    # Read DB-side effective runtime config once at boot so operators can
+    # confirm what the worker is actually using (live_on, emergency_stop,
+    # exposure caps). If the read fails, log the failure but still boot.
+    try:
+        _boot_gs = load_copy_global_settings()
+    except Exception:
+        logging.exception("COPY_TRADE_LOOP_BOOT_GS_FAIL")
+        _boot_gs = {}
+
     logging.info(
-        "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s live_enabled=%s",
+        "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s "
+        "db_limit=%s live_enabled=%s live_on=%s emergency_stop=%s "
+        "paper_max_exposure=%s live_max_exposure=%s "
+        "live_max_trade_usd=%s live_max_open_pos=%s "
+        "live_max_trades_per_hour=%s "
+        "note_multi_live_bots=allowed close_path=exit_mirror+settlement",
         COPY_TRADE_LOOP_INTERVAL,
         COPY_TRADE_LOOKBACK_HOURS,
         COPY_WALLET_TRADE_FETCH_LIMIT,
+        COPY_WALLET_TRADE_DB_LIMIT,
         COPY_LIVE_ENABLED,
+        _boot_gs.get("live_on"),
+        _boot_gs.get("emergency_stop"),
+        _boot_gs.get("paper_max_exposure_usd"),
+        _boot_gs.get("live_max_exposure_usd"),
+        COPY_LIVE_MAX_TRADE_USD,
+        COPY_LIVE_MAX_OPEN_POSITIONS,
+        COPY_LIVE_MAX_TRADES_PER_HOUR,
     )
+
+    # ── Loud warning if DB limit is set dangerously low via env var ──────────
+    # A limit ≤ 200 hides SELL events for active wallets and causes missed
+    # closes.  The Railway env var COPY_WALLET_TRADE_DB_LIMIT may override the
+    # code default — if Railway logs show limit=200 at COPY_UNEVALUATED_LIMIT_HIT,
+    # remove or raise that env var.
+    _SAFE_DB_LIMIT = 500
+    if 0 < COPY_WALLET_TRADE_DB_LIMIT < _SAFE_DB_LIMIT:
+        logging.warning(
+            "COPY_DB_LIMIT_TOO_LOW db_limit=%s safe_minimum=%s "
+            "— SELL events for active wallets WILL be invisible at this limit. "
+            "Remove COPY_WALLET_TRADE_DB_LIMIT from Railway env vars or raise "
+            "it to at least %s.  Current value was likely set manually and "
+            "overrides the code default of 1000.",
+            COPY_WALLET_TRADE_DB_LIMIT, _SAFE_DB_LIMIT, _SAFE_DB_LIMIT,
+        )
 
     while True:
         wallets        = load_tracked_wallets()
@@ -7445,20 +7614,54 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                 raw_activities = await fetch_wallet_trades_for_address(wallet_address)
 
                 # ── Step 2: Normalize + ingest wallet_trades ──────────────
+                # Track every drop path so operators can see where rows go.
                 newly_inserted: list[dict] = []
+                _ingest_normalize_drop = 0
+                _ingest_dup_or_fail    = 0
                 for raw in raw_activities:
                     trade_row = normalize_activity_to_wallet_trade(raw, wallet_address)
                     if not trade_row:
+                        _ingest_normalize_drop += 1
                         continue
                     upsert_market_cache(trade_row)
                     if insert_wallet_trade_if_new(trade_row):
                         newly_inserted.append(trade_row)
                         total_new_trades += 1
+                    else:
+                        _ingest_dup_or_fail += 1
 
+                # Always emit an ingest summary — even when nothing is new.
+                # This makes the difference between "wallet quiet" vs
+                # "everything dropped" visible in Railway on every tick.
+                logging.info(
+                    "COPY_INGEST_SUMMARY wallet=%s raw_fetched=%s "
+                    "new_inserted=%s normalize_drop=%s dup_or_fail=%s "
+                    "fetch_limit=%s",
+                    wallet_label,
+                    len(raw_activities),
+                    len(newly_inserted),
+                    _ingest_normalize_drop,
+                    _ingest_dup_or_fail,
+                    COPY_WALLET_TRADE_FETCH_LIMIT,
+                )
                 if newly_inserted:
+                    _new_sides = [
+                        str(t.get("side") or "?").upper() for t in newly_inserted
+                    ]
                     logging.info(
-                        "COPY_TRADES_INGESTED wallet=%s new=%s raw_fetched=%s",
+                        "COPY_TRADES_INGESTED wallet=%s new=%s raw_fetched=%s "
+                        "sides=%s",
                         wallet_label, len(newly_inserted), len(raw_activities),
+                        {s: _new_sides.count(s) for s in set(_new_sides)},
+                    )
+                if len(raw_activities) >= COPY_WALLET_TRADE_FETCH_LIMIT:
+                    logging.warning(
+                        "COPY_INGEST_FETCH_CAP_HIT wallet=%s fetch=%s limit=%s "
+                        "— older activity may not be seen; consider raising "
+                        "COPY_WALLET_TRADE_FETCH_LIMIT",
+                        wallet_label,
+                        len(raw_activities),
+                        COPY_WALLET_TRADE_FETCH_LIMIT,
                     )
 
                 # ── Step 3: Match copy bots + evaluate ───────────────────
@@ -7487,11 +7690,12 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                     logging.info(
                         "COPY_BOT_EVAL bot=%s db_mode=%s arm_live=%s "
                         "effective_live=%s db_live_on=%r live_session_active=%s "
-                        "wallet=%s unevaluated=%s",
+                        "wallet=%s unevaluated=%s db_limit=%s lookback_hours=%s",
                         bot_label, bot_mode, bool(bot.get("arm_live")),
                         _effective_live, global_settings.get("live_on"),
                         _live_session_active,
                         wallet_label, len(unevaluated),
+                        COPY_WALLET_TRADE_DB_LIMIT, COPY_TRADE_LOOKBACK_HOURS,
                     )
 
                     # ── Paper cap top-of-loop lock ─────────────────────────
@@ -7578,6 +7782,17 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             if not _effective_live:
                                 if trade_side == "SELL":
                                     order_status = "SOURCE_EXIT_MIRRORED"
+                                    # ── SELL detected — log before mirror ────
+                                    logging.warning(
+                                        "SELL_DETECTED mode=paper bot=%s "
+                                        "wallet=%s trade=%s slug=%s "
+                                        "copy_closes=%s "
+                                        "— shared brain passed; calling "
+                                        "close_matching_open_positions_on_exit",
+                                        bot_label, wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        bool(bot.get("copy_closes")),
+                                    )
                                 else:
                                     order_status = "PAPER_MATCHED"
                                 log_copy_attempt(
@@ -7734,6 +7949,10 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     order_status = "LIVE_EXIT_MIRRORED"
                                 elif live_ok:
                                     order_status = "LIVE_MATCHED"
+                                elif trade_side == "SELL":
+                                    # CLOB failed but we will still close the
+                                    # DB exit mirror below.
+                                    order_status = "LIVE_EXIT_DB_ONLY"
                                 else:
                                     order_status = "SKIPPED"
 
@@ -7745,22 +7964,41 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                 )
                                 total_attempts += 1
 
-                                if live_ok:
-                                    if trade_side == "SELL":
-                                        # CLOB SELL submitted; close DB rows.
-                                        n_closed = (
-                                            close_matching_open_positions_on_exit(
-                                                bot, wallet_trade
-                                            )
+                                # ── SELL/close: ALWAYS mirror the DB exit ──
+                                # The source wallet has already sold; the thesis
+                                # is dead.  We must close the DB row regardless
+                                # of whether the CLOB SELL submission succeeded.
+                                # CLOB submission is best-effort; operator can
+                                # manually reconcile on Polymarket if the order
+                                # failed (e.g. already filled, market gone, etc).
+                                # This prevents stuck-open live positions when
+                                # any live gate or order submission fails.
+                                if trade_side == "SELL":
+                                    logging.warning(
+                                        "SELL_DETECTED mode=live bot=%s "
+                                        "wallet=%s trade=%s slug=%s "
+                                        "copy_closes=%s clob_ok=%s "
+                                        "— calling close_matching_open_positions_on_exit",
+                                        bot_label, wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        bool(bot.get("copy_closes")),
+                                        live_ok,
+                                    )
+                                    n_closed = (
+                                        close_matching_open_positions_on_exit(
+                                            bot, wallet_trade
                                         )
-                                        if n_closed:
-                                            update_wallet_metrics_for_address(
-                                                wallet_address
-                                            )
+                                    )
+                                    if n_closed:
+                                        update_wallet_metrics_for_address(
+                                            wallet_address
+                                        )
+                                    if live_ok:
                                         logging.info(
                                             "COPY_LIVE_EXIT_MIRROR_DONE "
                                             "bot=%s wallet=%s trade=%s "
-                                            "slug=%s positions_closed=%s",
+                                            "slug=%s positions_closed=%s "
+                                            "clob=ok",
                                             bot_label, wallet_label,
                                             trade_label,
                                             wallet_trade.get("market_slug")
@@ -7768,41 +8006,57 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                             n_closed,
                                         )
                                     else:
-                                        # CLOB BUY submitted — write DB row.
-                                        _live_pos_id = open_copied_position(
-                                            bot, wallet_trade,
-                                            submitted_size, submitted_price,
-                                            mode="LIVE",
+                                        logging.warning(
+                                            "COPY_LIVE_EXIT_MIRROR_DB_ONLY "
+                                            "bot=%s wallet=%s trade=%s "
+                                            "slug=%s positions_closed=%s "
+                                            "clob=failed clob_reason=%s "
+                                            "— source exited, DB closed; "
+                                            "CLOB SELL did not submit. "
+                                            "Manual Polymarket reconcile may "
+                                            "be needed.",
+                                            bot_label, wallet_label,
+                                            trade_label,
+                                            wallet_trade.get("market_slug")
+                                            or "?",
+                                            n_closed, live_skip_reason,
                                         )
-                                        if _live_pos_id is not None:
-                                            _copy_bot_mark_trade(bot_id)
-                                            _mark_live_copy_trade()
-                                            total_live_opened += 1
-                                            logging.info(
-                                                "COPY_LIVE_COPIED bot=%s "
-                                                "wallet=%s trade=%s slug=%s "
-                                                "side=%s outcome=%s "
-                                                "size=%s price=%s "
-                                                "position_id=%s",
-                                                bot_label, wallet_label,
-                                                trade_label,
-                                                wallet_trade.get("market_slug")
-                                                or "?",
-                                                wallet_trade.get("side"),
-                                                wallet_trade.get("outcome"),
-                                                submitted_size, submitted_price,
-                                                _live_pos_id,
-                                            )
-                                        else:
-                                            logging.warning(
-                                                "COPY_LIVE_POSITION_WRITE_FAIL"
-                                                " bot=%s trade=%s size=%.4f"
-                                                " — CLOB submitted but DB"
-                                                " insert failed; manual"
-                                                " reconciliation needed",
-                                                bot_label, trade_label,
-                                                submitted_size or 0.0,
-                                            )
+                                elif live_ok:
+                                    # CLOB BUY submitted — write DB row.
+                                    _live_pos_id = open_copied_position(
+                                        bot, wallet_trade,
+                                        submitted_size, submitted_price,
+                                        mode="LIVE",
+                                    )
+                                    if _live_pos_id is not None:
+                                        _copy_bot_mark_trade(bot_id)
+                                        _mark_live_copy_trade()
+                                        total_live_opened += 1
+                                        logging.info(
+                                            "COPY_LIVE_COPIED bot=%s "
+                                            "wallet=%s trade=%s slug=%s "
+                                            "side=%s outcome=%s "
+                                            "size=%s price=%s "
+                                            "position_id=%s",
+                                            bot_label, wallet_label,
+                                            trade_label,
+                                            wallet_trade.get("market_slug")
+                                            or "?",
+                                            wallet_trade.get("side"),
+                                            wallet_trade.get("outcome"),
+                                            submitted_size, submitted_price,
+                                            _live_pos_id,
+                                        )
+                                    else:
+                                        logging.warning(
+                                            "COPY_LIVE_POSITION_WRITE_FAIL"
+                                            " bot=%s trade=%s size=%.4f"
+                                            " — CLOB submitted but DB"
+                                            " insert failed; manual"
+                                            " reconciliation needed",
+                                            bot_label, trade_label,
+                                            submitted_size or 0.0,
+                                        )
                                 else:
                                     logging.info(
                                         "COPY_LIVE_SKIPPED bot=%s wallet=%s "
