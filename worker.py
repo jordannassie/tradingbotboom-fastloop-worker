@@ -5945,15 +5945,20 @@ def get_unevaluated_trades_for_bot(
         unevaluated = [t for t in all_trades if t["source_trade_id"] not in attempted_ids]
 
         # Log any SELL events present in the unevaluated set so the close path
-        # is fully traceable in logs.
+        # is fully traceable in logs.  WARNING so it's visible in Railway at any
+        # log-level filter — this is the first confirmation that SELLs will be
+        # processed by the shared brain.
         sell_unevaluated = [t for t in unevaluated if str(t.get("side") or "").upper() == "SELL"]
         if sell_unevaluated:
-            logging.info(
-                "COPY_SELL_EVENTS_QUEUED bot=%s wallet=%s sell_count=%s slugs=%s",
+            logging.warning(
+                "COPY_SELL_EVENTS_QUEUED bot=%s wallet=%s sell_count=%s "
+                "slugs=%s tokens=%s "
+                "— these SELL events will now enter evaluate_copy_trade_shared",
                 _label,
                 wallet_address[:10],
                 len(sell_unevaluated),
-                [t.get("market_slug") or t.get("token_id", "?")[:12] for t in sell_unevaluated[:5]],
+                [t.get("market_slug") or "?" for t in sell_unevaluated[:5]],
+                [str(t.get("token_id") or "?")[:16] for t in sell_unevaluated[:5]],
             )
 
         return unevaluated
@@ -7309,9 +7314,20 @@ def evaluate_copy_trade_shared(
         return False, "emergency_stop_active", None, None
 
     # G2: opens_only / copy_closes filter
+    # Default True so that bots without an explicit copy_closes column still close
+    # positions.  Set copy_closes=false on the copy_bots row to disable mirroring.
     trade_side  = str(wallet_trade.get("side") or "").upper()
-    copy_closes = bool(copy_bot.get("copy_closes", False))
+    copy_closes = bool(copy_bot.get("copy_closes", True))
     if trade_side == "SELL" and not copy_closes:
+        logging.warning(
+            "SELL_BLOCKED_COPY_CLOSES_DISABLED bot=%s wallet=%s trade=%s slug=%s "
+            "— copy_closes=False is explicitly set on this bot; "
+            "SELL will NOT close any copied_position. "
+            "Set copy_closes=true on the copy_bots row to enable close mirroring.",
+            _bot_label, _wallet_lbl,
+            str(wallet_trade.get("source_trade_id", "?"))[:20],
+            wallet_trade.get("market_slug") or "?",
+        )
         return False, "closes_not_enabled", None, None
 
     # G3: Delay filter — SELL/close events are exempt; the source already sold.
@@ -7342,15 +7358,51 @@ def evaluate_copy_trade_shared(
 
     # G6: Minimum market data required
     if not wallet_trade.get("token_id") and not wallet_trade.get("market_slug"):
+        if trade_side == "SELL":
+            logging.warning(
+                "SELL_BLOCKED_NO_MARKET_ID bot=%s wallet=%s trade=%s "
+                "— SELL trade has no token_id and no market_slug; "
+                "cannot match any open copied_position. "
+                "raw condition_id=%r raw_keys=%s",
+                _bot_label, _wallet_lbl,
+                str(wallet_trade.get("source_trade_id", "?"))[:20],
+                wallet_trade.get("condition_id"),
+                sorted(wallet_trade.keys()),
+            )
         return False, "insufficient_market_data", None, None
 
     # G7: Price must be present and in range
     price = wallet_trade.get("price")
     if price is None:
+        if trade_side == "SELL":
+            logging.warning(
+                "SELL_BLOCKED_NO_PRICE bot=%s wallet=%s trade=%s slug=%s token=%s "
+                "— SELL trade has no price field; close_matching_open_positions_on_exit "
+                "would also abort with SELL_MIRROR_NO_PRICE. "
+                "raw_trade=%r",
+                _bot_label, _wallet_lbl,
+                str(wallet_trade.get("source_trade_id", "?"))[:20],
+                wallet_trade.get("market_slug") or "?",
+                str(wallet_trade.get("token_id") or "?")[:20],
+                {k: wallet_trade.get(k) for k in
+                 ("side", "price", "outcome", "market_slug", "token_id", "condition_id")},
+            )
         return False, "unsupported_trade_shape", None, None
     try:
         submitted_price = float(price)
         if submitted_price <= 0 or submitted_price > 1:
+            if trade_side == "SELL":
+                logging.warning(
+                    "SELL_BLOCKED_PRICE_RANGE bot=%s wallet=%s trade=%s slug=%s "
+                    "price_raw=%r submitted_price=%.6f "
+                    "— SELL price outside (0, 1]; blocking close mirror. "
+                    "If source wallet redeemed at resolution this may be a REDEEM "
+                    "event rather than a plain SELL — check raw_json.type.",
+                    _bot_label, _wallet_lbl,
+                    str(wallet_trade.get("source_trade_id", "?"))[:20],
+                    wallet_trade.get("market_slug") or "?",
+                    price, submitted_price,
+                )
             return False, "unsupported_trade_shape", None, None
     except (TypeError, ValueError):
         return False, "unsupported_trade_shape", None, None
@@ -7670,6 +7722,18 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                         wallet_label, len(newly_inserted), len(raw_activities),
                         {s: _new_sides.count(s) for s in set(_new_sides)},
                     )
+                    _new_sells = [t for t in newly_inserted if str(t.get("side") or "").upper() == "SELL"]
+                    if _new_sells:
+                        logging.warning(
+                            "SELL_INGESTED wallet=%s sell_count=%s "
+                            "slugs=%s tokens=%s "
+                            "— new SELL events stored in wallet_trades; "
+                            "will appear in next evaluate cycle",
+                            wallet_label,
+                            len(_new_sells),
+                            [t.get("market_slug") or "?" for t in _new_sells[:5]],
+                            [str(t.get("token_id") or "?")[:16] for t in _new_sells[:5]],
+                        )
                 if len(raw_activities) >= COPY_WALLET_TRADE_FETCH_LIMIT:
                     logging.warning(
                         "COPY_INGEST_FETCH_CAP_HIT wallet=%s fetch=%s limit=%s "
@@ -7697,7 +7761,7 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                         bot_id,
                         lookback_hours=COPY_TRADE_LOOKBACK_HOURS,
                         limit=COPY_WALLET_TRADE_DB_LIMIT,
-                        copy_closes=bool(bot.get("copy_closes", False)),
+                        copy_closes=bool(bot.get("copy_closes", True)),
                         bot_label=bot_label,
                     )
                     if not unevaluated:
