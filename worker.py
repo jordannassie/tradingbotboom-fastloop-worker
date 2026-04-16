@@ -7379,20 +7379,10 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         live_bot_ids = [str(b["id"]) for b in live_bots]
         paper_bots   = [b for b in all_bots if not (_live_session_active and bool(b.get("arm_live")))]
 
-        # Routing tick — always WARNING so it's visible in Railway log filters.
         logging.warning(
-            "COPY_LIVE_ROUTING_TICK "
-            "live_session_active=%s "
-            "env_COPY_LIVE_ENABLED=%s db_live_on=%r db_emergency_stop=%r "
-            "total_bots=%s live_bot_count=%s paper_bot_count=%s "
-            "live_bots=%s",
-            _live_session_active,
-            COPY_LIVE_ENABLED,
+            "SHARED_BRAIN_TICK live_on=%s arm_live_bots=%s effective_live_bots=%s",
             global_settings.get("live_on"),
-            global_settings.get("emergency_stop"),
-            len(all_bots),
-            len(live_bots),
-            len(paper_bots),
+            sum(1 for b in all_bots if bool(b.get("arm_live"))),
             [b.get("name") or str(b["id"])[:8] for b in live_bots] or "none",
         )
 
@@ -7576,18 +7566,12 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
 
                             trade_side = str(wallet_trade.get("side") or "").upper()
 
-                            # ── COPY_EXECUTION_PATH ───────────────────────────
-                            # Always WARNING — visible in Railway log filters.
                             logging.warning(
-                                "COPY_EXECUTION_PATH bot=%s trade=%s "
-                                "mode=%s reason=%s "
-                                "size=%.4f price=%.4f",
-                                bot_label, trade_label,
+                                "SHARED_BRAIN_EXECUTION mode=%s bot=%s reason=%s",
                                 _exec_mode,
+                                bot_label,
                                 "effective_live_true" if _effective_live
                                 else "effective_live_false",
-                                submitted_size or 0.0,
-                                submitted_price or 0.0,
                             )
 
                             # ══ PAPER EXECUTION ══════════════════════════════
@@ -8765,14 +8749,10 @@ async def copy_diag_loop() -> None:
     """
     while True:
         logging.warning(
-            "COPY_BRAIN_ALIVE build=SHARED_BRAIN_V1 "
-            "architecture=shared_copy_brain "
-            "env_COPY_TRADE_ENABLED=%s "
-            "env_COPY_LIVE_ENABLED=%s "
-            "COPY_LIVE_MAX_BOTS=%s",
+            "SHARED_BRAIN_ACTIVE build=SHARED_BRAIN_V1 "
+            "env_COPY_TRADE_ENABLED=%s env_COPY_LIVE_ENABLED=%s",
             COPY_TRADE_ENABLED,
             COPY_LIVE_ENABLED,
-            COPY_LIVE_MAX_BOTS,
         )
         await asyncio.sleep(10)
 
