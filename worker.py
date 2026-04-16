@@ -9027,6 +9027,619 @@ async def copy_diag_loop() -> None:
         await asyncio.sleep(10)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LEADERBOARD WALLET DISCOVERY PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Data flow:
+#   Polymarket leaderboard API (crypto / today / profit)
+#     └─ _fetch_leaderboard_page_sync()    — HTTP GET per page
+#     └─ _normalize_leaderboard_row()      — extract address, rank, profit
+#     └─ upsert_candidate_wallet()         — write to candidate_wallets
+#     └─ _enrich_candidate_wallet()        — fetch recent activity, compute score
+#     └─ candidate_wallets table           — BTCBOT reads for Hot Wallet suggestions
+#
+# candidate_wallets is separate from tracked_wallets.
+# A human or automation must promote a candidate to tracked_wallets to start
+# copy trading it.  The table is purely a discovery/ranking surface.
+#
+# Columns written:
+#   wallet_address, display_name, rank, daily_profit, daily_volume,
+#   source, fetched_at,
+#   recent_trade_count, trades_per_day, avg_hold_minutes,
+#   exit_before_resolution_rate, recent_pnl, copy_score, enriched_at,
+#   is_tracked, status, updated_at
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _fetch_leaderboard_page_sync(offset: int, limit: int) -> list[dict]:
+    """
+    Fetch one page of the Polymarket Crypto/Today/Profit leaderboard.
+
+    Endpoint: GET {COPY_DATA_API_BASE}/leaderboard
+    Params:   timeframe, categoryType, sortBy=profit, limit, offset
+
+    Handles both list and dict-wrapped response shapes.
+    Returns [] on any error — caller skips empty pages.
+    """
+    url = (
+        f"{COPY_DATA_API_BASE}/leaderboard"
+        f"?timeframe={LEADERBOARD_TIMEFRAME}"
+        f"&categoryType={LEADERBOARD_CATEGORY.upper()}"
+        f"&sortBy=profit"
+        f"&limit={limit}"
+        f"&offset={offset}"
+    )
+    try:
+        resp = requests.get(url, timeout=15, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        raw = resp.json()
+        if isinstance(raw, list):
+            return raw
+        # Common wrapped shapes
+        for key in ("data", "results", "leaderboard", "users", "entries"):
+            if isinstance(raw.get(key), list):
+                return raw[key]
+        logging.warning(
+            "LEADERBOARD_UNKNOWN_SHAPE offset=%s keys=%s",
+            offset, list(raw.keys())[:8] if isinstance(raw, dict) else type(raw),
+        )
+        return []
+    except Exception as exc:
+        logging.warning(
+            "LEADERBOARD_FETCH_FAIL offset=%s url=%s err=%s",
+            offset, url, exc,
+        )
+        return []
+
+
+def _safe_float(val: object) -> "float | None":
+    """Parse a value to float, return None if unparseable."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_leaderboard_row(
+    row: dict,
+    rank: int,
+    fetched_at: str,
+) -> "dict | None":
+    """
+    Normalise a raw leaderboard API row to the candidate_wallets schema.
+
+    Returns None if the row lacks a usable wallet address.
+    Accepts both Polymarket data-API field names and alternative spellings.
+    """
+    wallet = (
+        row.get("proxyWallet")
+        or row.get("userId")
+        or row.get("user")
+        or row.get("address")
+        or row.get("wallet_address")
+        or row.get("walletAddress")
+    )
+    if not wallet or not str(wallet).startswith("0x"):
+        return None
+
+    return {
+        "wallet_address": str(wallet).lower(),
+        "display_name": (
+            row.get("name")
+            or row.get("displayName")
+            or row.get("username")
+            or row.get("pseudonym")
+        ),
+        "rank": int(row.get("position") or row.get("rank") or rank),
+        "daily_profit": _safe_float(
+            row.get("profit") or row.get("pnl") or row.get("dailyProfit")
+        ),
+        "daily_volume": _safe_float(
+            row.get("volume") or row.get("dailyVolume") or row.get("amountBet")
+        ),
+        "source":     "leaderboard_crypto_today_profit",
+        "fetched_at": fetched_at,
+    }
+
+
+def _compute_candidate_copy_score(
+    trades_per_day: float,
+    avg_hold_minutes: float,
+    exit_before_resolution_rate: float,
+    recent_pnl: float,
+    recent_trade_count: int,
+) -> float:
+    """
+    Composite copy suitability score in the range 0–100.
+
+    Designed for the leaderboard discovery context where we have no
+    historical copy-position data — all inputs come from recent raw activity.
+
+    Component weights:
+
+      activity_score       (25 pts) — trades_per_day: 0 → 0, 5+ → 1.0
+                                      Fast traders are more copyable; slow
+                                      traders (1 trade/week) score near 0.
+                                      Formula: clamp(trades_per_day / 5, 0, 1)
+
+      hold_score           (25 pts) — avg_hold_minutes: rewards short holds.
+                                      <30 min → 1.0, 60 min → 0.5, 240+ → 0.
+                                      Formula: clamp(1 - avg_hold_minutes/240, 0, 1)
+                                      Rationale: copy value decays if we can only
+                                      fill AFTER the source has already exited.
+
+      exit_before_res      (25 pts) — fraction exiting before market resolves.
+                                      1.0 → full score, 0 → 0.
+                                      Rationale: wallets that hold to resolution
+                                      give copy traders no exit signal.
+
+      pnl_score            (15 pts) — recent_pnl normalised: -$50 → 0, $100 → 1.
+                                      Formula: clamp((recent_pnl+50)/150, 0, 1)
+
+      volume_score         (10 pts) — recent_trade_count: 0 → 0, 20+ → 1.0.
+                                      Formula: clamp(recent_trade_count/20, 0, 1)
+                                      Sanity check: low-count wallets get capped.
+    """
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    activity_score  = _clamp(trades_per_day / 5.0,              0.0, 1.0)
+    hold_score      = _clamp(1.0 - avg_hold_minutes / 240.0,    0.0, 1.0)
+    exit_score      = _clamp(exit_before_resolution_rate,        0.0, 1.0)
+    pnl_score       = _clamp((recent_pnl + 50.0) / 150.0,       0.0, 1.0)
+    volume_score    = _clamp(recent_trade_count / 20.0,          0.0, 1.0)
+
+    raw = (
+        activity_score * 25.0
+        + hold_score   * 25.0
+        + exit_score   * 25.0
+        + pnl_score    * 15.0
+        + volume_score * 10.0
+    )
+    return round(raw, 2)
+
+
+def _enrich_candidate_wallet(
+    wallet_address: str,
+    activities: list[dict],
+    fetched_at: str,
+) -> dict:
+    """
+    Compute enrichment metrics for a candidate from its recent activity.
+
+    Activities come from the same Polymarket data API used by copy_trade_loop.
+    No DB queries here — enrichment is pure computation on the raw activity list.
+
+    Returns a dict of enrichment columns ready to merge into a candidate row.
+
+    Metrics computed:
+      recent_trade_count          — len(activities)
+      trades_per_day              — based on span between first and last trade
+      avg_hold_minutes            — average gap between consecutive BUY and SELL
+                                    on the same market/token within the window
+      exit_before_resolution_rate — fraction of closed trades where the SELL
+                                    happened before we see a resolution event
+                                    (approximated: SELL price between 0.02–0.98
+                                    suggests pre-resolution exit)
+      recent_pnl                  — sum of (price × size) for SELLs minus BUYs
+                                    (notional, not realised PnL)
+      copy_score                  — _compute_candidate_copy_score(...)
+    """
+    now_utc = datetime.now(timezone.utc)
+    enriched_at = now_utc.isoformat()
+
+    recent_trade_count = len(activities)
+    if not activities:
+        return {
+            "recent_trade_count": 0,
+            "trades_per_day": 0.0,
+            "avg_hold_minutes": 0.0,
+            "exit_before_resolution_rate": 0.0,
+            "recent_pnl": 0.0,
+            "copy_score": 0.0,
+            "enriched_at": enriched_at,
+        }
+
+    # ── Parse timestamps for span computation ─────────────────────────────────
+    trade_times: list[datetime] = []
+    for act in activities:
+        ts_raw = (
+            act.get("timestamp") or act.get("match_time")
+            or act.get("created_at") or act.get("createdAt")
+        )
+        if ts_raw:
+            try:
+                if isinstance(ts_raw, (int, float)):
+                    ts_val = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
+                    trade_times.append(
+                        datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                    )
+                else:
+                    trade_times.append(
+                        datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    )
+            except Exception:
+                pass
+
+    if trade_times:
+        span_days = (
+            (max(trade_times) - min(trade_times)).total_seconds() / 86400
+        )
+        trades_per_day = round(
+            recent_trade_count / max(span_days, 1.0), 2
+        )
+    else:
+        trades_per_day = 0.0
+
+    # ── avg_hold_minutes via BUY→SELL pairing per market ─────────────────────
+    # Group trades by token_id / market identifier, compute time between
+    # consecutive BUY and SELL on the same market.
+    from collections import defaultdict
+    buys_by_market: dict[str, list[datetime]] = defaultdict(list)
+    hold_durations: list[float] = []
+    pre_resolution_exits = 0
+    total_exits = 0
+
+    for act in activities:
+        side_raw = str(act.get("side") or "").strip().upper()
+        market_key = (
+            act.get("tokenId") or act.get("token_id") or act.get("asset_id")
+            or act.get("conditionId") or act.get("condition_id")
+            or act.get("market") or ""
+        )
+        price_raw = act.get("price") or act.get("avgPrice") or act.get("avg_price")
+        try:
+            price_f = float(price_raw) if price_raw is not None else None
+        except (TypeError, ValueError):
+            price_f = None
+        size_raw = act.get("shares") or act.get("size") or act.get("quantity")
+        try:
+            size_f = float(size_raw) if size_raw is not None else None
+        except (TypeError, ValueError):
+            size_f = None
+
+        ts_raw = (
+            act.get("timestamp") or act.get("match_time")
+            or act.get("created_at") or act.get("createdAt")
+        )
+        act_dt: "datetime | None" = None
+        if ts_raw:
+            try:
+                if isinstance(ts_raw, (int, float)):
+                    ts_val = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
+                    act_dt = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                else:
+                    act_dt = datetime.fromisoformat(
+                        str(ts_raw).replace("Z", "+00:00")
+                    )
+            except Exception:
+                pass
+
+        if side_raw in ("BUY", "ENTER", "LONG") and market_key and act_dt:
+            buys_by_market[market_key].append(act_dt)
+
+        elif side_raw in ("SELL", "EXIT", "SHORT") and market_key and act_dt:
+            total_exits += 1
+            # Pre-resolution exit: price is between 0.02 and 0.98
+            if price_f is not None and 0.02 < price_f < 0.98:
+                pre_resolution_exits += 1
+            # Match against an open BUY for hold duration
+            if buys_by_market[market_key]:
+                buy_dt = buys_by_market[market_key].pop(0)
+                if act_dt > buy_dt:
+                    hold_durations.append(
+                        (act_dt - buy_dt).total_seconds() / 60.0
+                    )
+
+    avg_hold_minutes = (
+        round(sum(hold_durations) / len(hold_durations), 2)
+        if hold_durations else 0.0
+    )
+    exit_before_resolution_rate = (
+        round(pre_resolution_exits / total_exits, 4) if total_exits > 0 else 0.0
+    )
+
+    # ── recent_pnl (notional) ─────────────────────────────────────────────────
+    # Sum of SELL notionals minus BUY notionals = crude net flow proxy.
+    # Positive = net seller (realised value); negative = net buyer (deployed).
+    recent_pnl = 0.0
+    for act in activities:
+        side_raw = str(act.get("side") or "").strip().upper()
+        price_raw = act.get("price") or act.get("avgPrice") or act.get("avg_price")
+        size_raw  = act.get("shares") or act.get("size") or act.get("quantity")
+        try:
+            p = float(price_raw) if price_raw is not None else 0.0
+        except (TypeError, ValueError):
+            p = 0.0
+        try:
+            s = float(size_raw) if size_raw is not None else 0.0
+        except (TypeError, ValueError):
+            s = 0.0
+        notional = p * s
+        if side_raw in ("SELL", "EXIT", "SHORT"):
+            recent_pnl += notional
+        elif side_raw in ("BUY", "ENTER", "LONG"):
+            recent_pnl -= notional
+
+    recent_pnl = round(recent_pnl, 4)
+
+    # ── copy_score ────────────────────────────────────────────────────────────
+    copy_score = _compute_candidate_copy_score(
+        trades_per_day=trades_per_day,
+        avg_hold_minutes=avg_hold_minutes,
+        exit_before_resolution_rate=exit_before_resolution_rate,
+        recent_pnl=recent_pnl,
+        recent_trade_count=recent_trade_count,
+    )
+
+    return {
+        "recent_trade_count":          recent_trade_count,
+        "trades_per_day":              trades_per_day,
+        "avg_hold_minutes":            avg_hold_minutes,
+        "exit_before_resolution_rate": exit_before_resolution_rate,
+        "recent_pnl":                  recent_pnl,
+        "copy_score":                  copy_score,
+        "enriched_at":                 enriched_at,
+    }
+
+
+def _load_tracked_wallet_addresses() -> set[str]:
+    """Return the set of lower-cased wallet addresses already in tracked_wallets."""
+    try:
+        resp = (
+            supabase.table("tracked_wallets")
+            .select("wallet_address")
+            .execute()
+        )
+        return {str(r["wallet_address"]).lower() for r in (resp.data or [])}
+    except Exception:
+        logging.exception("LEADERBOARD_LOAD_TRACKED_WALLETS_FAIL")
+        return set()
+
+
+def _upsert_candidate_wallet(candidate: dict) -> bool:
+    """
+    Upsert a single row into candidate_wallets.
+    Returns True on success, False on failure.
+    Conflict target: wallet_address.
+    """
+    try:
+        candidate["updated_at"] = utc_now_iso()
+        supabase.table("candidate_wallets").upsert(
+            candidate, on_conflict="wallet_address"
+        ).execute()
+        return True
+    except Exception:
+        logging.exception(
+            "LEADERBOARD_UPSERT_FAIL wallet=%s",
+            str(candidate.get("wallet_address", "?"))[:12],
+        )
+        return False
+
+
+async def leaderboard_ingest_loop() -> None:
+    """
+    Periodically scrape the Polymarket Crypto/Today/Profit leaderboard and
+    write new candidates to candidate_wallets for Hot Wallet discovery.
+
+    Loop cadence: LEADERBOARD_INGEST_INTERVAL seconds (default 3600 = 1 hour).
+    Pages: up to LEADERBOARD_MAX_PAGES × LEADERBOARD_PAGE_SIZE rows per scan.
+
+    For each wallet found:
+      1. Normalise fields from the raw API row.
+      2. Mark is_tracked = True if address is already in tracked_wallets.
+      3. Upsert into candidate_wallets (updates leaderboard snapshot).
+      4. Fetch recent activity and compute enrichment + copy_score.
+      5. Upsert enrichment fields back into candidate_wallets.
+
+    Logs (all prefixed LEADERBOARD_*):
+      LEADERBOARD_INGEST_BOOT   — on startup, shows effective config
+      LEADERBOARD_SCAN_START    — each scan begins
+      LEADERBOARD_PAGE_FETCHED  — per page: count, offset
+      LEADERBOARD_PAGE_EMPTY    — page returned 0 rows → stop paginating
+      LEADERBOARD_SCAN_SUMMARY  — total discovered / inserted / skipped
+      LEADERBOARD_ENRICH_START  — enrichment pass begins
+      LEADERBOARD_ENRICH_DONE   — per wallet: score, hold time, trades/day
+      LEADERBOARD_ENRICH_FAIL   — enrichment fetch failed for wallet
+      LEADERBOARD_HOT_CANDIDATE — wallet scored above LEADERBOARD_MIN_COPY_SCORE
+      LEADERBOARD_SCAN_DONE     — scan complete, sleeping until next interval
+    """
+    if not LEADERBOARD_INGEST_ENABLED:
+        logging.warning(
+            "LEADERBOARD_INGEST_DISABLED — set LEADERBOARD_INGEST_ENABLED=true "
+            "to enable wallet discovery from Polymarket leaderboard"
+        )
+        while True:
+            await asyncio.sleep(3600)
+        return  # unreachable
+
+    logging.warning(
+        "LEADERBOARD_INGEST_BOOT interval=%ss max_pages=%s page_size=%s "
+        "category=%s timeframe=%s min_copy_score=%.1f enrich_limit=%s",
+        LEADERBOARD_INGEST_INTERVAL,
+        LEADERBOARD_MAX_PAGES,
+        LEADERBOARD_PAGE_SIZE,
+        LEADERBOARD_CATEGORY,
+        LEADERBOARD_TIMEFRAME,
+        LEADERBOARD_MIN_COPY_SCORE,
+        LEADERBOARD_ENRICH_LIMIT,
+    )
+
+    while True:
+        try:
+            await _run_leaderboard_scan()
+        except Exception:
+            logging.exception("LEADERBOARD_SCAN_UNHANDLED_ERROR")
+
+        await asyncio.sleep(LEADERBOARD_INGEST_INTERVAL)
+
+
+async def _run_leaderboard_scan() -> None:
+    """Execute one full leaderboard scan + enrichment pass."""
+    scan_start = datetime.now(timezone.utc)
+    fetched_at = scan_start.isoformat()
+
+    logging.warning(
+        "LEADERBOARD_SCAN_START category=%s timeframe=%s max_pages=%s page_size=%s",
+        LEADERBOARD_CATEGORY, LEADERBOARD_TIMEFRAME,
+        LEADERBOARD_MAX_PAGES, LEADERBOARD_PAGE_SIZE,
+    )
+
+    # ── Step 1: Load currently tracked wallet addresses for dedup ─────────────
+    tracked_addresses = await asyncio.to_thread(_load_tracked_wallet_addresses)
+
+    # ── Step 2: Paginate through leaderboard ──────────────────────────────────
+    all_candidates: list[dict] = []
+    global_rank = 0
+
+    for page_num in range(LEADERBOARD_MAX_PAGES):
+        offset = page_num * LEADERBOARD_PAGE_SIZE
+        rows = await asyncio.to_thread(
+            _fetch_leaderboard_page_sync, offset, LEADERBOARD_PAGE_SIZE
+        )
+
+        if not rows:
+            logging.info(
+                "LEADERBOARD_PAGE_EMPTY page=%s offset=%s — stopping pagination",
+                page_num + 1, offset,
+            )
+            break
+
+        logging.info(
+            "LEADERBOARD_PAGE_FETCHED page=%s offset=%s rows=%s",
+            page_num + 1, offset, len(rows),
+        )
+
+        for row in rows:
+            global_rank += 1
+            candidate = _normalize_leaderboard_row(row, global_rank, fetched_at)
+            if not candidate:
+                continue
+            candidate["is_tracked"] = (
+                candidate["wallet_address"] in tracked_addresses
+            )
+            candidate["status"] = (
+                "tracked" if candidate["is_tracked"] else "candidate"
+            )
+            all_candidates.append(candidate)
+
+        # If page was shorter than a full page, we've hit the end.
+        if len(rows) < LEADERBOARD_PAGE_SIZE:
+            logging.info(
+                "LEADERBOARD_PAGE_PARTIAL page=%s rows=%s < page_size=%s "
+                "— end of leaderboard reached",
+                page_num + 1, len(rows), LEADERBOARD_PAGE_SIZE,
+            )
+            break
+
+    # ── Step 3: Upsert snapshot rows ──────────────────────────────────────────
+    inserted = skipped_tracked = upsert_failed = 0
+    new_candidate_wallets: list[str] = []   # wallets needing enrichment
+
+    for candidate in all_candidates:
+        ok = await asyncio.to_thread(_upsert_candidate_wallet, candidate)
+        if not ok:
+            upsert_failed += 1
+            continue
+        if candidate["is_tracked"]:
+            skipped_tracked += 1
+            logging.info(
+                "LEADERBOARD_ALREADY_TRACKED wallet=%s rank=%s — skipped "
+                "(already in tracked_wallets)",
+                candidate["wallet_address"][:12], candidate.get("rank"),
+            )
+        else:
+            inserted += 1
+            new_candidate_wallets.append(candidate["wallet_address"])
+
+    logging.warning(
+        "LEADERBOARD_SCAN_SUMMARY pages_fetched=%s wallets_discovered=%s "
+        "inserted_or_updated=%s already_tracked=%s upsert_failed=%s",
+        min(LEADERBOARD_MAX_PAGES, (global_rank // LEADERBOARD_PAGE_SIZE) + 1),
+        len(all_candidates),
+        inserted,
+        skipped_tracked,
+        upsert_failed,
+    )
+
+    # ── Step 4: Enrich new/updated candidates ─────────────────────────────────
+    if not new_candidate_wallets:
+        logging.info("LEADERBOARD_ENRICH_SKIP — no new candidates to enrich")
+    else:
+        logging.warning(
+            "LEADERBOARD_ENRICH_START candidates=%s fetch_limit=%s",
+            len(new_candidate_wallets), LEADERBOARD_ENRICH_LIMIT,
+        )
+        enrich_ok = enrich_failed = hot_count = 0
+
+        for wallet_address in new_candidate_wallets:
+            try:
+                activities = await asyncio.to_thread(
+                    _fetch_wallet_activity_sync,
+                    wallet_address,
+                    LEADERBOARD_ENRICH_LIMIT,
+                )
+                enrichment = _enrich_candidate_wallet(
+                    wallet_address, activities, fetched_at
+                )
+                ok = await asyncio.to_thread(
+                    _upsert_candidate_wallet,
+                    {"wallet_address": wallet_address, **enrichment},
+                )
+                if ok:
+                    enrich_ok += 1
+                    score = enrichment.get("copy_score", 0.0)
+                    logging.info(
+                        "LEADERBOARD_ENRICH_DONE wallet=%s "
+                        "copy_score=%.1f trades_per_day=%.2f "
+                        "avg_hold_min=%.1f exit_before_res=%.2f recent_pnl=%.2f",
+                        wallet_address[:12],
+                        score,
+                        enrichment.get("trades_per_day", 0.0),
+                        enrichment.get("avg_hold_minutes", 0.0),
+                        enrichment.get("exit_before_resolution_rate", 0.0),
+                        enrichment.get("recent_pnl", 0.0),
+                    )
+                    if score >= LEADERBOARD_MIN_COPY_SCORE:
+                        hot_count += 1
+                        logging.warning(
+                            "LEADERBOARD_HOT_CANDIDATE wallet=%s "
+                            "copy_score=%.1f trades_per_day=%.2f "
+                            "avg_hold_min=%.1f exit_before_res=%.2f "
+                            "— above min_copy_score=%.1f; "
+                            "consider adding to tracked_wallets",
+                            wallet_address[:12],
+                            score,
+                            enrichment.get("trades_per_day", 0.0),
+                            enrichment.get("avg_hold_minutes", 0.0),
+                            enrichment.get("exit_before_resolution_rate", 0.0),
+                            LEADERBOARD_MIN_COPY_SCORE,
+                        )
+                else:
+                    enrich_failed += 1
+
+            except Exception:
+                enrich_failed += 1
+                logging.exception(
+                    "LEADERBOARD_ENRICH_FAIL wallet=%s", wallet_address[:12]
+                )
+
+        logging.warning(
+            "LEADERBOARD_ENRICH_SUMMARY enriched=%s failed=%s "
+            "hot_candidates=%s min_score=%.1f",
+            enrich_ok, enrich_failed, hot_count, LEADERBOARD_MIN_COPY_SCORE,
+        )
+
+    elapsed = (datetime.now(timezone.utc) - scan_start).total_seconds()
+    logging.warning(
+        "LEADERBOARD_SCAN_DONE elapsed_s=%.1f next_scan_in=%ss",
+        elapsed, LEADERBOARD_INGEST_INTERVAL,
+    )
+
+
 async def main():
     # ── Unmistakable startup marker in the running event loop ─────────────────
     # Fires from main() — same scope as heartbeat_loop and all other tasks.
@@ -9051,9 +9664,11 @@ async def main():
     #   Logs COPY_BRAIN_ALIVE every 10s so the build is always visible in Railway.
     # copy_trade_loop: shared-brain decision + paper/live execution.
     # copy_settlement_loop: resolves expired paper positions via Gamma API.
+    # leaderboard_ingest_loop: scrapes Polymarket leaderboard → candidate_wallets.
     tasks.append(asyncio.create_task(_run_forever("copy_diag_loop", copy_diag_loop)))
     tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
+    tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)

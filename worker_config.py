@@ -359,3 +359,34 @@ COPY_LIVE_ENABLED = os.getenv("COPY_LIVE_ENABLED", "false").strip().lower() in (
 COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",       "5.0"))
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
+
+# ── 20. Leaderboard wallet discovery config ────────────────────────────────────
+#
+# LEADERBOARD_INGEST_ENABLED   Toggle the leaderboard ingest loop on/off.
+#                               Default: true.
+# LEADERBOARD_INGEST_INTERVAL  Seconds between full leaderboard scans.
+#                               Default: 3600 (1 hour). Polymarket leaderboard
+#                               refreshes roughly hourly so polling faster
+#                               gives little benefit.
+# LEADERBOARD_MAX_PAGES        Max pages to fetch per scan.  Each page has
+#                               LEADERBOARD_PAGE_SIZE rows. 10 pages × 100 = 1000.
+#                               Default: 10.
+# LEADERBOARD_PAGE_SIZE        Rows per API page. Default: 100.
+# LEADERBOARD_CATEGORY         Polymarket category filter. Default: "crypto".
+# LEADERBOARD_TIMEFRAME        Leaderboard timeframe. "1d" = today.
+#                               Default: "1d".
+# LEADERBOARD_MIN_COPY_SCORE   Minimum candidate copy_score to be surfaced
+#                               as a Hot Wallet suggestion. Default: 50.
+# LEADERBOARD_ENRICH_LIMIT     Recent activity rows fetched per candidate
+#                               during enrichment. Default: 50.
+
+LEADERBOARD_INGEST_ENABLED  = os.getenv("LEADERBOARD_INGEST_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes",
+)
+LEADERBOARD_INGEST_INTERVAL = int(os.getenv("LEADERBOARD_INGEST_INTERVAL", "3600"))
+LEADERBOARD_MAX_PAGES       = int(os.getenv("LEADERBOARD_MAX_PAGES",       "10"))
+LEADERBOARD_PAGE_SIZE       = int(os.getenv("LEADERBOARD_PAGE_SIZE",       "100"))
+LEADERBOARD_CATEGORY        = os.getenv("LEADERBOARD_CATEGORY",            "crypto")
+LEADERBOARD_TIMEFRAME       = os.getenv("LEADERBOARD_TIMEFRAME",           "1d")
+LEADERBOARD_MIN_COPY_SCORE  = float(os.getenv("LEADERBOARD_MIN_COPY_SCORE", "50.0"))
+LEADERBOARD_ENRICH_LIMIT    = int(os.getenv("LEADERBOARD_ENRICH_LIMIT",    "50"))
