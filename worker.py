@@ -8757,7 +8757,37 @@ async def copy_settlement_loop() -> None:
 #                  Remove or keep rotate_loop (BTC-SPECIFIC) as appropriate.
 # =============================================================================
 
+async def copy_diag_loop() -> None:
+    """
+    Lightweight diagnostic loop — no DB calls, no external deps.
+    Fires every 10 seconds at WARNING so the copy-brain build is always visible
+    in Railway logs regardless of COPY_TRADE_ENABLED or any DB connectivity.
+    """
+    while True:
+        logging.warning(
+            "COPY_BRAIN_ALIVE build=SHARED_BRAIN_V1 "
+            "architecture=shared_copy_brain "
+            "env_COPY_TRADE_ENABLED=%s "
+            "env_COPY_LIVE_ENABLED=%s "
+            "COPY_LIVE_MAX_BOTS=%s",
+            COPY_TRADE_ENABLED,
+            COPY_LIVE_ENABLED,
+            COPY_LIVE_MAX_BOTS,
+        )
+        await asyncio.sleep(10)
+
+
 async def main():
+    # ── Unmistakable startup marker in the running event loop ─────────────────
+    # Fires from main() — same scope as heartbeat_loop and all other tasks.
+    # This is the definitive proof that the shared-brain code is executing.
+    logging.warning(
+        "COPY_WORKER_BUILD architecture=shared_copy_brain build=SHARED_BRAIN_V1 "
+        "from=main_entrypoint "
+        "env_COPY_TRADE_ENABLED=%s env_COPY_LIVE_ENABLED=%s",
+        COPY_TRADE_ENABLED,
+        COPY_LIVE_ENABLED,
+    )
     trading_client = build_trading_client()
     tasks = []
     # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
@@ -8767,9 +8797,11 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
     tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
     # ── Copy-trading tasks (additive — isolated from BTC strategy tasks) ──────
-    # Both loops are controlled by COPY_TRADE_ENABLED env var.
-    # trading_client is passed to copy_trade_loop so LIVE bots can submit CLOB
-    # orders. PAPER bots ignore it. Safe to disable without affecting BTC tasks.
+    # copy_diag_loop: lightweight heartbeat — no DB, no deps, always runs.
+    #   Logs COPY_BRAIN_ALIVE every 10s so the build is always visible in Railway.
+    # copy_trade_loop: shared-brain decision + paper/live execution.
+    # copy_settlement_loop: resolves expired paper positions via Gamma API.
+    tasks.append(asyncio.create_task(_run_forever("copy_diag_loop", copy_diag_loop)))
     tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
     restart_ws_task()
