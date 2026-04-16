@@ -314,6 +314,10 @@ COPY_TRADE_ENABLED = os.getenv("COPY_TRADE_ENABLED", "true").strip().lower() in 
 )
 COPY_TRADE_LOOP_INTERVAL = int(os.getenv("COPY_TRADE_LOOP_INTERVAL", "60"))
 COPY_WALLET_TRADE_FETCH_LIMIT = int(os.getenv("COPY_WALLET_TRADE_FETCH_LIMIT", "50"))
+# COPY_WALLET_TRADE_DB_LIMIT: how many wallet_trades rows to scan per bot per tick
+# from the local DB (separate from the API fetch limit). Higher values reduce the
+# chance of SELL events being missed for high-activity wallets.
+COPY_WALLET_TRADE_DB_LIMIT = int(os.getenv("COPY_WALLET_TRADE_DB_LIMIT", "200"))
 COPY_TRADE_LOOKBACK_HOURS = int(os.getenv("COPY_TRADE_LOOKBACK_HOURS", "24"))
 COPY_DATA_API_BASE = "https://data-api.polymarket.com"
 
