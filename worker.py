@@ -120,6 +120,15 @@ logging.warning(
     COPY_LIVE_MAX_TRADE_USD,
 )
 logging.warning("WORKER_BOOT build=SHARED_BRAIN_V1")
+logging.warning(
+    "COPY_DB_LIMIT_EFFECTIVE COPY_WALLET_TRADE_DB_LIMIT=%s "
+    "COPY_WALLET_TRADE_FETCH_LIMIT=%s COPY_TRADE_LOOKBACK_HOURS=%s "
+    "— if COPY_WALLET_TRADE_DB_LIMIT is 200 in Railway env vars, "
+    "remove or raise it; old value hides SELL events and blocks closes",
+    COPY_WALLET_TRADE_DB_LIMIT,
+    COPY_WALLET_TRADE_FETCH_LIMIT,
+    COPY_TRADE_LOOKBACK_HOURS,
+)
 # ── Proof-of-deploy marker ────────────────────────────────────────────────────
 # This line proves which code version Railway is actually running.
 # If you see COPY_LIVE_GATE_L4_FAIL in Railway, the container below is NOT
@@ -128,11 +137,14 @@ logging.warning("WORKER_BOOT build=SHARED_BRAIN_V1")
 # will emit it.  If you cannot find DEPLOY_PROOF, Railway has NOT deployed
 # this commit.
 logging.warning(
-    "DEPLOY_PROOF commit=8e1f286 "
+    "DEPLOY_PROOF commit=THIS_COMMIT "
     "gate_L4=REMOVED "
     "gate_too_many_live_bots=REMOVED "
     "multi_live_bots=UNLIMITED "
     "sell_always_closes_db=TRUE "
+    "g6_condition_id_for_sell=FIXED "
+    "live_sell_clob_decoupled_from_db_close=FIXED "
+    "copy_closes_default=TRUE "
     "— if you see COPY_LIVE_GATE_L4_FAIL alongside this, "
     "two containers are running simultaneously"
 )
@@ -7356,17 +7368,23 @@ def evaluate_copy_trade_shared(
             if open_count >= max_open:
                 return False, "max_open_positions_reached", None, None
 
-    # G6: Minimum market data required
-    if not wallet_trade.get("token_id") and not wallet_trade.get("market_slug"):
+    # G6: Minimum market data required.
+    # For BUY trades: need token_id OR market_slug.
+    # For SELL trades: condition_id is also sufficient — close_matching_open_positions_on_exit
+    # supports all three identifiers (token_id > market_slug > condition_id).  A SELL that
+    # only carries condition_id must NOT be blocked here; it can still find and close an
+    # open position using the condition_id fallback.
+    _sell_has_id = (
+        trade_side == "SELL" and bool(wallet_trade.get("condition_id"))
+    )
+    if not wallet_trade.get("token_id") and not wallet_trade.get("market_slug") and not _sell_has_id:
         if trade_side == "SELL":
             logging.warning(
                 "SELL_BLOCKED_NO_MARKET_ID bot=%s wallet=%s trade=%s "
-                "— SELL trade has no token_id and no market_slug; "
-                "cannot match any open copied_position. "
-                "raw condition_id=%r raw_keys=%s",
+                "— SELL trade has no token_id, market_slug, or condition_id; "
+                "cannot match any open copied_position. raw_keys=%s",
                 _bot_label, _wallet_lbl,
                 str(wallet_trade.get("source_trade_id", "?"))[:20],
-                wallet_trade.get("condition_id"),
                 sorted(wallet_trade.keys()),
             )
         return False, "insufficient_market_data", None, None
@@ -7567,11 +7585,15 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         logging.warning(
             "COPY_WORKER_BUILD architecture=shared_copy_brain build=SHARED_BRAIN_V1 "
             "env_COPY_LIVE_ENABLED=%s env_COPY_TRADE_ENABLED=%s "
-            "bots_loaded=%s wallets_loaded=%s",
+            "bots_loaded=%s wallets_loaded=%s "
+            "db_limit=%s fetch_limit=%s lookback_hours=%s",
             COPY_LIVE_ENABLED,
             COPY_TRADE_ENABLED,
             len(all_bots),
             len(wallets),
+            COPY_WALLET_TRADE_DB_LIMIT,
+            COPY_WALLET_TRADE_FETCH_LIMIT,
+            COPY_TRADE_LOOKBACK_HOURS,
         )
 
         # ── Log every enabled copy bot (WARNING for Railway visibility) ───────
@@ -7980,8 +8002,13 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             # shared brain.  Turning it on → live CLOB orders.
                             # Turning it off → falls back to paper execution.
                             else:
-                                # Infrastructure checks (not trade logic)
-                                if not COPY_LIVE_ENABLED:
+                                # Infrastructure checks gate the CLOB submission
+                                # ONLY.  For SELL/close events, DB close mirroring
+                                # is unconditional — the source wallet already
+                                # exited, so the thesis is dead.  We ALWAYS close
+                                # the DB row to prevent stuck-open positions even
+                                # when CLOB infra is unavailable.
+                                if not COPY_LIVE_ENABLED and trade_side != "SELL":
                                     logging.warning(
                                         "COPY_LIVE_SKIP_ENV_OFF bot=%s "
                                         "trade=%s — add COPY_LIVE_ENABLED=true"
@@ -7996,7 +8023,7 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     total_attempts += 1
                                     continue
 
-                                if not trading_client:
+                                if not trading_client and trade_side != "SELL":
                                     logging.warning(
                                         "COPY_LIVE_SKIP_NO_CLIENT bot=%s "
                                         "trade=%s — trading_client is None "
@@ -8011,19 +8038,42 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     total_attempts += 1
                                     continue
 
-                                # Apply live-only gates + submit CLOB.
-                                # submitted_size/price from shared brain.
-                                (
-                                    live_ok,
-                                    live_skip_reason,
-                                    submitted_size,
-                                    submitted_price,
-                                    raw_response,
-                                ) = evaluate_and_execute_live_copy_trade(
-                                    bot, wallet_trade, global_settings,
-                                    trading_client, live_bot_ids,
-                                    submitted_size, submitted_price,
-                                )
+                                # Apply live-only gates + submit CLOB when infra
+                                # is available.  For SELL trades reaching here with
+                                # no CLOB infra, skip the CLOB but let DB close run.
+                                _clob_ready = COPY_LIVE_ENABLED and bool(trading_client)
+                                if _clob_ready:
+                                    (
+                                        live_ok,
+                                        live_skip_reason,
+                                        submitted_size,
+                                        submitted_price,
+                                        raw_response,
+                                    ) = evaluate_and_execute_live_copy_trade(
+                                        bot, wallet_trade, global_settings,
+                                        trading_client, live_bot_ids,
+                                        submitted_size, submitted_price,
+                                    )
+                                else:
+                                    # CLOB infra unavailable (COPY_LIVE_ENABLED=False
+                                    # or trading_client=None).  Only SELLs reach here
+                                    # because BUYs were caught by the guards above.
+                                    live_ok = False
+                                    live_skip_reason = (
+                                        "live_copy_globally_disabled"
+                                        if not COPY_LIVE_ENABLED
+                                        else "live_client_unavailable"
+                                    )
+                                    raw_response = {}
+                                    logging.warning(
+                                        "COPY_LIVE_SELL_CLOB_SKIP bot=%s trade=%s "
+                                        "slug=%s reason=%s "
+                                        "— CLOB infra unavailable; DB close mirror "
+                                        "will still execute unconditionally below",
+                                        bot_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        live_skip_reason,
+                                    )
 
                                 if live_ok and trade_side == "SELL":
                                     order_status = "LIVE_EXIT_MIRRORED"
