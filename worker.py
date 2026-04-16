@@ -7300,8 +7300,17 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
     )
 
     if not COPY_TRADE_ENABLED:
-        logging.info("COPY_TRADE_LOOP disabled via COPY_TRADE_ENABLED=false — exiting task")
-        return
+        # Loop forever with a long sleep so _run_forever doesn't spin tightly.
+        # Log at WARNING so this is visible in Railway even with log-level filters.
+        while True:
+            logging.warning(
+                "COPY_TRADE_LOOP_DISABLED build=SHARED_BRAIN_V1 "
+                "reason=COPY_TRADE_ENABLED_is_false "
+                "action=sleeping_not_running "
+                "fix=set_COPY_TRADE_ENABLED=true_in_Railway_env_vars",
+            )
+            await asyncio.sleep(300)  # re-log every 5 min so it stays visible
+        return  # unreachable; satisfies type checkers
 
     logging.info(
         "COPY_TRADE_LOOP_BOOT interval=%ss lookback=%sh fetch_limit=%s live_enabled=%s",
@@ -7316,11 +7325,21 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         all_bots       = load_enabled_copy_bots()
         global_settings = load_copy_global_settings()
 
-        # ── Log every enabled copy bot exactly as loaded from DB ──────────────
-        # Fires every tick so any bot row change is visible immediately.
-        # Use this to confirm arm_live / mode are read correctly from copy_bots.
+        # ── Repeating build marker (WARNING so it's always visible in Railway) ─
+        # Fires every tick — cannot be missed regardless of when you start watching.
+        logging.warning(
+            "COPY_WORKER_BUILD architecture=shared_copy_brain build=SHARED_BRAIN_V1 "
+            "env_COPY_LIVE_ENABLED=%s env_COPY_TRADE_ENABLED=%s "
+            "bots_loaded=%s wallets_loaded=%s",
+            COPY_LIVE_ENABLED,
+            COPY_TRADE_ENABLED,
+            len(all_bots),
+            len(wallets),
+        )
+
+        # ── Log every enabled copy bot (WARNING for Railway visibility) ───────
         for _b in all_bots:
-            logging.info(
+            logging.warning(
                 "COPY_BOT_LOADED id=%s name=%s is_enabled=%s arm_live=%s mode=%s wallet=%s",
                 str(_b.get("id", "?"))[:8],
                 _b.get("name") or "(no name)",
@@ -7360,8 +7379,8 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         live_bot_ids = [str(b["id"]) for b in live_bots]
         paper_bots   = [b for b in all_bots if not (_live_session_active and bool(b.get("arm_live")))]
 
-        # Log derived live vs paper routing for this tick.
-        logging.info(
+        # Routing tick — always WARNING so it's visible in Railway log filters.
+        logging.warning(
             "COPY_LIVE_ROUTING_TICK "
             "live_session_active=%s "
             "env_COPY_LIVE_ENABLED=%s db_live_on=%r db_emergency_stop=%r "
@@ -7406,12 +7425,8 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         # live_bots = enabled bots with arm_live=True when session is active.
         # Emitted at WARNING when live_on=True but session is not active (mismatch).
         _diag_live_on_raw = global_settings.get("live_on")
-        _diag_log = (
-            logging.warning
-            if (bool(_diag_live_on_raw) and not _live_session_active)
-            else logging.info
-        )
-        _diag_log(
+        # Always WARNING — visible in Railway regardless of log-level filters.
+        logging.warning(
             "COPY_LIVE_DIAG_TICK "
             "arming_source=copy_bots.arm_live "
             "env_COPY_LIVE_ENABLED=%s "
@@ -7562,8 +7577,8 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             trade_side = str(wallet_trade.get("side") or "").upper()
 
                             # ── COPY_EXECUTION_PATH ───────────────────────────
-                            # All shared gates passed.  Only execution differs.
-                            logging.info(
+                            # Always WARNING — visible in Railway log filters.
+                            logging.warning(
                                 "COPY_EXECUTION_PATH bot=%s trade=%s "
                                 "mode=%s reason=%s "
                                 "size=%.4f price=%.4f",
@@ -7847,7 +7862,7 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                 _snap_paper_exp,
             )
 
-        logging.info(
+        logging.warning(
             "COPY_TRADE_LOOP_TICK wallets=%s new_trades=%s attempts=%s "
             "paper_opened=%s live_opened=%s errors=%s",
             total_wallets, total_new_trades, total_attempts,
