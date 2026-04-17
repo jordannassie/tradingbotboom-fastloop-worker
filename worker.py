@@ -9878,6 +9878,32 @@ def _ema5m_fetch_market_prices_sync(slug: str) -> tuple[float, float]:
         return 0.50, 0.50
 
 
+def _ema5m_get_paper_exposure_sync() -> float:
+    """
+    Return the total USD exposure currently OPEN in paper_positions for bot_id=btc_5m_ema.
+
+    Only sums rows where bot_id = EMA_5M_BOT_ID and status = 'OPEN'.
+    Completely isolated from copy-trading exposure — does not read copied_positions
+    or any copy-trading table.
+
+    Returns 0.0 on any DB error so a transient failure does not permanently block
+    new entries (fail-open for exposure query, not for exposure cap).
+    """
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("size_usd")
+            .eq("bot_id", EMA_5M_BOT_ID)
+            .eq("status", "OPEN")
+            .execute()
+        )
+        rows = resp.data or []
+        return round(sum(float(r.get("size_usd") or 0.0) for r in rows), 4)
+    except Exception:
+        logging.exception("EMA_EXPOSURE_QUERY_FAIL bot_id=%s", EMA_5M_BOT_ID)
+        return 0.0
+
+
 def _ema5m_upsert_telemetry_sync(
     slug: str,
     signal: str,
@@ -9893,17 +9919,26 @@ def _ema5m_upsert_telemetry_sync(
 
     JSON shape written (matches what the card polls for):
       {
-        "ema9":        <float | null>,
-        "ema200":      <float | null>,
-        "last_close":  <float | null>,
-        "signal":      "YES" | "NO" | "NONE",
-        "updated_at":  "<iso-timestamp>",
-        "market_slug": "<current slug>"
+        "ema9":                  <float | null>,
+        "ema200":                <float | null>,
+        "last_close":            <float | null>,
+        "signal":                "YES" | "NO" | "NONE",
+        "updated_at":            "<iso-timestamp>",
+        "market_slug":           "<current slug>",
+        "paper_max_exposure_usd": 100.0,   (preserved from existing row, default on create)
+        "live_max_exposure_usd":  0.0      (preserved from existing row, default on create)
       }
 
-    Uses update-then-insert pattern: if the bot_settings row for EMA_5M_BOT_ID
-    does not yet exist (e.g. first boot before the card is set up), it is created
-    with is_enabled=True so the strategy starts enabled by default.
+    Uses update-then-insert pattern.
+
+    Auto-create safe defaults (row did not exist):
+      is_enabled            = false   ← SAFE: must be explicitly enabled via card
+      mode                  = PAPER
+      arm_live              = false
+      trade_size_usd        = 10.0
+      paper_balance_usd     = 100.0
+      paper_max_exposure_usd = 100.0  (stored in strategy_settings JSON)
+      live_max_exposure_usd  = 0.0    (stored in strategy_settings JSON)
     """
     telemetry = {
         "ema9":        ema9,
@@ -9914,20 +9949,57 @@ def _ema5m_upsert_telemetry_sync(
         "market_slug": slug,
     }
     try:
-        resp = (
+        # Read the existing row first so we can preserve operator-set exposure caps
+        # that live inside strategy_settings (they must not be overwritten by telemetry).
+        existing_resp = (
             supabase.table("bot_settings")
-            .update({"strategy_settings": telemetry, "updated_at": utc_now_iso()})
+            .select("strategy_settings")
             .eq("bot_id", EMA_5M_BOT_ID)
+            .limit(1)
             .execute()
         )
-        if not (resp.data):
-            # Row doesn't exist yet — create it with sensible defaults so the
-            # card can read it immediately without manual DB setup.
+        existing_row = (existing_resp.data or [None])[0]
+
+        if existing_row is None:
+            # ── Row does not exist — create with safe defaults ────────────────
+            # is_enabled=False: operator must explicitly enable via card/DB.
+            # Exposure caps stored in strategy_settings so they survive the
+            # row existing before any custom columns are added.
+            new_ss = {
+                **telemetry,
+                "paper_max_exposure_usd": 100.0,
+                "live_max_exposure_usd":  0.0,
+            }
             supabase.table("bot_settings").insert({
-                "bot_id":            EMA_5M_BOT_ID,
-                "is_enabled":        True,
-                "strategy_settings": telemetry,
+                "bot_id":              EMA_5M_BOT_ID,
+                "is_enabled":          False,
+                "mode":                "PAPER",
+                "arm_live":            False,
+                "trade_size_usd":      10.0,
+                "paper_balance_usd":   100.0,
+                "strategy_settings":   new_ss,
             }).execute()
+            logging.warning(
+                "EMA_STRATEGY_STATE_WRITE bot_id=%s signal=%s "
+                "ema9=%s ema200=%s last_close=%s slug=%s action=row_created_with_safe_defaults",
+                EMA_5M_BOT_ID, signal, ema9, ema200, last_close, slug,
+            )
+            return
+
+        # ── Row exists — preserve existing strategy_settings, merge telemetry ──
+        raw_ss = existing_row.get("strategy_settings") or {}
+        if isinstance(raw_ss, str):
+            try:
+                raw_ss = json.loads(raw_ss)
+            except json.JSONDecodeError:
+                raw_ss = {}
+        # Merge: keep operator-set caps, overwrite only the telemetry fields.
+        merged_ss = {**raw_ss, **telemetry}
+
+        supabase.table("bot_settings").update(
+            {"strategy_settings": merged_ss, "updated_at": utc_now_iso()}
+        ).eq("bot_id", EMA_5M_BOT_ID).execute()
+
         logging.warning(
             "EMA_STRATEGY_STATE_WRITE bot_id=%s signal=%s "
             "ema9=%s ema200=%s last_close=%s slug=%s",
@@ -9989,16 +10061,27 @@ async def ema_5m_btc_loop() -> None:
     while True:
         try:
             # ── 1. Read settings from bot_settings ───────────────────────────
-            settings   = read_strategy_settings(EMA_5M_BOT_ID)
-            is_enabled = bool(settings.get("is_enabled", False))
-            mode       = str(settings.get("mode") or "PAPER").upper()
-            trade_size = float(settings.get("trade_size_usd") or EMA_5M_TRADE_SIZE_USD)
-            arm_live   = bool(settings.get("arm_live", False))
+            # read_strategy_settings fetches is_enabled, mode, trade_size_usd,
+            # arm_live, paper_balance_usd, AND strategy_settings JSON (which
+            # holds the EMA-specific exposure caps).
+            settings      = read_strategy_settings(EMA_5M_BOT_ID)
+            is_enabled    = bool(settings.get("is_enabled", False))
+            mode          = str(settings.get("mode") or "PAPER").upper()
+            trade_size    = float(settings.get("trade_size_usd") or EMA_5M_TRADE_SIZE_USD)
+            arm_live      = bool(settings.get("arm_live", False))
+
+            # Exposure caps live in strategy_settings JSON so they require no
+            # schema change and are completely isolated from copy-trading caps.
+            _inner_ss          = settings.get("strategy_settings") or {}
+            paper_max_exposure = float(_inner_ss.get("paper_max_exposure_usd") or 100.0)
+            live_max_exposure  = float(_inner_ss.get("live_max_exposure_usd")  or 0.0)
 
             logging.warning(
                 "EMA_STRATEGY_SETTINGS_LOADED bot_id=%s is_enabled=%s "
-                "mode=%s trade_size_usd=%.2f arm_live=%s",
+                "mode=%s trade_size_usd=%.2f arm_live=%s "
+                "paper_max_exposure_usd=%.2f live_max_exposure_usd=%.2f",
                 EMA_5M_BOT_ID, is_enabled, mode, trade_size, arm_live,
+                paper_max_exposure, live_max_exposure,
             )
 
             # ── 2. Compute current market slug ────────────────────────────────
@@ -10092,6 +10175,44 @@ async def ema_5m_btc_loop() -> None:
                 await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
                 continue
 
+            # ── 11b. Exposure cap check (btc_5m_ema bucket only) ─────────────
+            # Queries paper_positions WHERE bot_id='btc_5m_ema' AND status='OPEN'.
+            # Completely isolated from copy-trading exposure/cap logic.
+            current_exposure  = await asyncio.to_thread(_ema5m_get_paper_exposure_sync)
+            projected_exposure = current_exposure + trade_size
+
+            logging.warning(
+                "EMA_EXPOSURE_CHECK bot_id=%s slug=%s "
+                "current_exposure=%.2f trade_size=%.2f "
+                "projected=%.2f cap=%.2f",
+                EMA_5M_BOT_ID, slug,
+                current_exposure, trade_size,
+                projected_exposure, paper_max_exposure,
+            )
+
+            if paper_max_exposure > 0 and projected_exposure > paper_max_exposure:
+                logging.warning(
+                    "EMA_EXPOSURE_BLOCKED bot_id=%s slug=%s signal=%s "
+                    "current_exposure=%.2f trade_size=%.2f "
+                    "projected=%.2f cap=%.2f "
+                    "— trade blocked; reduce open positions or raise "
+                    "paper_max_exposure_usd in strategy_settings",
+                    EMA_5M_BOT_ID, slug, signal,
+                    current_exposure, trade_size,
+                    projected_exposure, paper_max_exposure,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            logging.warning(
+                "EMA_EXPOSURE_OK bot_id=%s slug=%s signal=%s "
+                "current_exposure=%.2f trade_size=%.2f "
+                "projected=%.2f cap=%.2f — proceeding to entry",
+                EMA_5M_BOT_ID, slug, signal,
+                current_exposure, trade_size,
+                projected_exposure, paper_max_exposure,
+            )
+
             # ── 12. Fetch market prices and place PAPER position ──────────────
             yes_price, no_price = await asyncio.to_thread(
                 _ema5m_fetch_market_prices_sync, slug
@@ -10105,10 +10226,12 @@ async def ema_5m_btc_loop() -> None:
             logging.warning(
                 "EMA_STRATEGY_PAPER_ENTRY slug=%s signal=%s side=%s "
                 "entry_price=%.4f size_usd=%.2f shares=%.4f "
-                "ema9=%.2f ema200=%.2f btc_price=%.2f",
+                "ema9=%.2f ema200=%.2f btc_price=%.2f "
+                "exposure_after=%.2f cap=%.2f",
                 slug, signal, side,
                 entry_price, trade_size, shares,
                 ema9 or 0.0, ema200 or 0.0, btc_price,
+                projected_exposure, paper_max_exposure,
             )
 
             await insert_paper_position_row(
