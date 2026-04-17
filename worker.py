@@ -8918,6 +8918,427 @@ def _execute_paper_reset() -> int:
     return cancelled_count
 
 
+# ── Auto-profit / max-hold exit loop ─────────────────────────────────────────
+#
+# Scans OPEN copied_positions on a background loop and closes positions early
+# when per-bot exit rules (take_profit_pct / max_hold_minutes) are met.
+#
+# COMPLETELY ISOLATED from:
+#   • copy trading ingestion   (copy_trade_loop, get_unevaluated_trades_for_bot)
+#   • source-wallet SELL close (close_matching_open_positions_on_exit)
+#   • market-resolution settle (copy_settlement_loop / close_copied_position)
+#
+# Settings read from the copy_bot row (copy_bots table, select("*")):
+#   exit_mode         text     DEFAULT 'mirror_only'
+#                              allowed: mirror_only | auto_profit | auto_profit_max_hold
+#   take_profit_pct   numeric  target profit % (e.g. 20 = 20 %)
+#   max_hold_minutes  numeric  max age in minutes before forced close
+#
+# These columns must be added to copy_bots in Supabase (see deploy steps).
+# Until the columns exist, copy_bot.get("exit_mode") returns None which
+# defaults to "mirror_only" — existing behavior is fully preserved.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
+    """
+    Fetch the current market price for the outcome held in this position.
+
+    Returns a probability in [0.0, 1.0] or None on failure.
+
+    Attempts:
+      1. Gamma /markets?clob_token_ids={token_id}  — most specific
+      2. Gamma /markets?condition_id={condition_id}
+      3. Gamma events/slug/{slug}  — fallback via _ema5m_fetch_market_prices_sync
+
+    Does NOT use the resolution cache from the settlement loop — prices are
+    fetched live so the auto-exit loop sees the real current mark price.
+    """
+    token_id     = pos.get("token_id")
+    condition_id = pos.get("condition_id")
+    market_slug  = pos.get("market_slug")
+    outcome      = str(pos.get("outcome") or "").upper()
+
+    def _extract_price(market_obj: dict) -> float | None:
+        op       = market_obj.get("outcomePrices") or []
+        outcomes = market_obj.get("outcomes") or []
+        # Match by outcome name first
+        for i, o in enumerate(outcomes):
+            if str(o).upper() == outcome and i < len(op):
+                try:
+                    return float(op[i])
+                except (TypeError, ValueError):
+                    pass
+        # Positional fallback
+        if outcome == "YES" and op:
+            try:
+                return float(op[0])
+            except (TypeError, ValueError):
+                pass
+        if outcome == "NO" and len(op) > 1:
+            try:
+                return float(op[1])
+            except (TypeError, ValueError):
+                pass
+        # lastPrice (some markets)
+        lp = market_obj.get("lastPrice")
+        if lp:
+            try:
+                return float(lp)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    # ── Attempt 1: by token_id ────────────────────────────────────────────
+    if token_id:
+        try:
+            url  = f"{GAMMA_API_BASE}/markets?clob_token_ids={token_id}"
+            resp = requests.get(url, timeout=8, headers={"User-Agent": "FastLoopWorker/1.0"})
+            resp.raise_for_status()
+            data    = resp.json()
+            markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for m in markets:
+                price = _extract_price(m)
+                if price is not None:
+                    return price
+        except Exception:
+            pass
+
+    # ── Attempt 2: by condition_id ────────────────────────────────────────
+    if condition_id:
+        try:
+            url  = f"{GAMMA_API_BASE}/markets?condition_id={condition_id}"
+            resp = requests.get(url, timeout=8, headers={"User-Agent": "FastLoopWorker/1.0"})
+            resp.raise_for_status()
+            data    = resp.json()
+            markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for m in markets:
+                price = _extract_price(m)
+                if price is not None:
+                    return price
+        except Exception:
+            pass
+
+    # ── Attempt 3: by slug ────────────────────────────────────────────────
+    if market_slug:
+        try:
+            yes_p, no_p = _ema5m_fetch_market_prices_sync(market_slug)
+            if outcome == "YES" and yes_p not in (None, 0.50):
+                return yes_p
+            if outcome == "NO" and no_p not in (None, 0.50):
+                return no_p
+        except Exception:
+            pass
+
+    return None
+
+
+def _copy_auto_exit_close_position_sync(
+    pos: dict,
+    exit_price: float,
+    reason: str,
+) -> bool:
+    """
+    Close a single OPEN copied_positions row via auto-exit logic.
+
+    Only called for PAPER positions — live auto-exit is blocked upstream.
+
+    Uses .eq("status", "OPEN") as a concurrency guard: if another path
+    (settlement loop, source wallet SELL) closed the position between
+    load and this update, the DB update matches 0 rows and we log
+    COPY_EXIT_ALREADY_CLOSED cleanly.
+
+    reason: "auto_profit" | "max_hold"
+    """
+    pos_id      = str(pos.get("id") or "")
+    entry_price = float_or_none(pos.get("entry_price")) or 0.0
+    size        = float_or_none(pos.get("size")) or 0.0
+
+    pnl = (
+        round(size * (exit_price - entry_price) / entry_price, 6)
+        if entry_price > 0
+        else 0.0
+    )
+
+    updates = {
+        "status":     "CLOSED",
+        "exit_price": exit_price,
+        "pnl":        pnl,
+        "closed_at":  utc_now_iso(),
+        "raw_json": {
+            **(pos.get("raw_json") or {}),
+            "auto_exit": {
+                "reason":     reason,
+                "exit_price": exit_price,
+                "pnl":        pnl,
+                "closed_at":  utc_now_iso(),
+            },
+        },
+    }
+
+    try:
+        resp = (
+            supabase.table("copied_positions")
+            .update(updates)
+            .eq("id", pos_id)
+            .eq("status", "OPEN")          # concurrency guard
+            .execute()
+        )
+
+        if not (resp.data):
+            # 0 rows updated — position was already closed by another path
+            # (settlement loop, source-wallet SELL, paper reset, etc.)
+            logging.warning(
+                "COPY_EXIT_ALREADY_CLOSED pos=%s reason=%s "
+                "— DB update matched 0 OPEN rows; position already closed elsewhere",
+                pos_id[:8], reason,
+            )
+            return False
+
+        logging.warning(
+            "COPY_EXIT_CLOSE_OK pos=%s slug=%s reason=%s "
+            "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f",
+            pos_id[:8],
+            pos.get("market_slug") or "?",
+            reason,
+            entry_price, exit_price, size, pnl,
+        )
+
+        raw_json = pos.get("raw_json") or {}
+        is_paper = raw_json.get("paper", True)
+        if is_paper and pnl != 0.0:
+            _update_copy_paper_bankroll(pnl, pos_id, close_path=f"auto_exit_{reason}")
+
+        return True
+
+    except Exception:
+        logging.warning(
+            "COPY_EXIT_CLOSE_FAIL pos=%s reason=%s exit_price=%.4f pnl=%+.4f",
+            pos_id[:8], reason, exit_price, pnl,
+        )
+        logging.exception("COPY_EXIT_CLOSE_FAIL detail pos=%s", pos_id[:8])
+        return False
+
+
+async def copy_auto_exit_loop() -> None:
+    """
+    Auto-profit / max-hold background scanner for OPEN copied positions.
+
+    Runs every COPY_AUTO_EXIT_LOOP_INTERVAL seconds.
+    Completely isolated from copy trade ingestion, source-wallet SELL mirroring,
+    and the settlement loop.
+
+    Per-tick flow:
+      1. Load all enabled copy_bots → build {copy_bot_id: bot} lookup map.
+      2. Load OPEN copied_positions (up to COPY_SETTLEMENT_BATCH_SIZE).
+      3. For each position:
+           a. Look up its bot's exit_mode (defaults to mirror_only if column absent).
+           b. Log COPY_EXIT_MODE.
+           c. If exit_mode = mirror_only → skip (keep existing close path).
+           d. Compute hold age (minutes since opened_at).
+           e. Fetch current mark price from Gamma API.
+           f. Compute profit_pct = (mark - entry) / entry * 100.
+           g. Log COPY_EXIT_TP_CHECK.
+           h. If exit_mode = auto_profit or auto_profit_max_hold:
+                - profit_pct >= take_profit_pct → close, reason=auto_profit
+           i. If exit_mode = auto_profit_max_hold:
+                - hold_min >= max_hold_minutes (and TP not hit) → close, reason=max_hold
+           j. If close triggered and position is live → log COPY_EXIT_SKIP_LIVE_UNSUPPORTED.
+           k. Otherwise close and log COPY_EXIT_CLOSE_OK / COPY_EXIT_CLOSE_FAIL.
+
+    Source-wallet SELL arriving after auto-exit:
+      close_matching_open_positions_on_exit queries WHERE status=OPEN so it
+      naturally finds 0 rows and logs SELL_MIRROR_NO_MATCH — no special
+      handling needed; the existing path is already concurrency-safe.
+    """
+    if not COPY_TRADE_ENABLED:
+        logging.info(
+            "COPY_AUTO_EXIT_LOOP disabled via COPY_TRADE_ENABLED=false — exiting task"
+        )
+        return
+
+    logging.warning(
+        "COPY_AUTO_EXIT_LOOP_BOOT interval=%ss batch=%s "
+        "— reads exit_mode/take_profit_pct/max_hold_minutes from copy_bots table",
+        COPY_AUTO_EXIT_LOOP_INTERVAL,
+        COPY_SETTLEMENT_BATCH_SIZE,
+    )
+
+    while True:
+        try:
+            # ── 1. Load bots into a lookup map ────────────────────────────────
+            bots    = load_enabled_copy_bots()
+            bot_map = {str(b["id"]): b for b in bots}
+
+            # ── 2. Load OPEN positions ────────────────────────────────────────
+            open_positions = load_open_copied_positions(COPY_SETTLEMENT_BATCH_SIZE)
+
+            checked   = 0
+            tp_closed = 0
+            mh_closed = 0
+            skipped   = 0
+
+            for pos in open_positions:
+                pos_id      = str(pos.get("id") or "")
+                copy_bot_id = str(pos.get("copy_bot_id") or "")
+
+                try:
+                    # ── 3a. Look up bot ───────────────────────────────────────
+                    bot = bot_map.get(copy_bot_id)
+                    if bot is None:
+                        # Bot disabled or deleted — leave position open
+                        skipped += 1
+                        continue
+
+                    # ── 3b. Read exit settings ────────────────────────────────
+                    exit_mode       = str(
+                        bot.get("exit_mode") or "mirror_only"
+                    ).strip().lower()
+                    take_profit_pct = float_or_none(bot.get("take_profit_pct"))
+                    max_hold_min    = float_or_none(bot.get("max_hold_minutes"))
+
+                    raw_json = pos.get("raw_json") or {}
+                    is_live  = bool(raw_json.get("live", False))
+
+                    logging.info(
+                        "COPY_EXIT_MODE pos=%s bot=%s exit_mode=%s "
+                        "take_profit_pct=%s max_hold_min=%s is_live=%s",
+                        pos_id[:8], copy_bot_id[:8], exit_mode,
+                        take_profit_pct, max_hold_min, is_live,
+                    )
+
+                    # ── 3c. mirror_only gate ──────────────────────────────────
+                    if exit_mode == "mirror_only":
+                        skipped += 1
+                        continue
+
+                    # ── 3d. Hold age ──────────────────────────────────────────
+                    opened_dt = _parse_ts(pos.get("opened_at"))
+                    hold_min: float | None = None
+                    if opened_dt:
+                        hold_min = round(
+                            (datetime.now(timezone.utc) - opened_dt).total_seconds() / 60,
+                            1,
+                        )
+
+                    # ── 3e. Fetch current mark price ──────────────────────────
+                    mark_price = await asyncio.to_thread(
+                        _copy_auto_exit_fetch_mark_price_sync, pos
+                    )
+
+                    entry_price = float_or_none(pos.get("entry_price")) or 0.0
+
+                    # ── 3f. Profit % ──────────────────────────────────────────
+                    profit_pct: float | None = None
+                    if mark_price is not None and entry_price > 0:
+                        profit_pct = (mark_price - entry_price) / entry_price * 100.0
+
+                    # ── 3g. Log TP check ──────────────────────────────────────
+                    logging.warning(
+                        "COPY_EXIT_TP_CHECK pos=%s slug=%s exit_mode=%s "
+                        "entry=%.4f mark=%s profit_pct=%s tp_target=%s "
+                        "hold_min=%s max_hold_min=%s",
+                        pos_id[:8],
+                        pos.get("market_slug") or "?",
+                        exit_mode,
+                        entry_price,
+                        f"{mark_price:.4f}" if mark_price is not None else "N/A",
+                        f"{profit_pct:.1f}%" if profit_pct is not None else "N/A",
+                        take_profit_pct,
+                        f"{hold_min:.1f}" if hold_min is not None else "N/A",
+                        max_hold_min,
+                    )
+
+                    checked += 1
+
+                    # ── 3h. Take-profit check ─────────────────────────────────
+                    close_reason: str | None = None
+
+                    if exit_mode in ("auto_profit", "auto_profit_max_hold"):
+                        if (
+                            take_profit_pct is not None
+                            and profit_pct is not None
+                            and profit_pct >= take_profit_pct
+                        ):
+                            close_reason = "auto_profit"
+                            logging.warning(
+                                "COPY_EXIT_TP_HIT pos=%s slug=%s "
+                                "profit_pct=%.1f%% tp_target=%.1f%% "
+                                "entry=%.4f mark=%.4f",
+                                pos_id[:8],
+                                pos.get("market_slug") or "?",
+                                profit_pct,
+                                take_profit_pct,
+                                entry_price,
+                                mark_price,
+                            )
+
+                    # ── 3i. Max-hold check ────────────────────────────────────
+                    if exit_mode == "auto_profit_max_hold" and close_reason is None:
+                        if (
+                            max_hold_min is not None
+                            and hold_min is not None
+                            and hold_min >= max_hold_min
+                        ):
+                            close_reason = "max_hold"
+                            logging.warning(
+                                "COPY_EXIT_MAX_HOLD_HIT pos=%s slug=%s "
+                                "hold_min=%.1f max_hold_min=%.1f",
+                                pos_id[:8],
+                                pos.get("market_slug") or "?",
+                                hold_min,
+                                max_hold_min,
+                            )
+
+                    if close_reason is None:
+                        skipped += 1
+                        continue
+
+                    # ── 3j. Live block ────────────────────────────────────────
+                    if is_live:
+                        logging.warning(
+                            "COPY_EXIT_SKIP_LIVE_UNSUPPORTED pos=%s slug=%s reason=%s "
+                            "— live auto-exit is not yet implemented; "
+                            "position remains open until source wallet SELL or settlement",
+                            pos_id[:8],
+                            pos.get("market_slug") or "?",
+                            close_reason,
+                        )
+                        skipped += 1
+                        continue
+
+                    # ── 3k. Close position (PAPER only) ──────────────────────
+                    exit_price = mark_price if mark_price is not None else entry_price
+                    ok = await asyncio.to_thread(
+                        _copy_auto_exit_close_position_sync,
+                        pos,
+                        exit_price,
+                        close_reason,
+                    )
+                    if ok:
+                        if close_reason == "auto_profit":
+                            tp_closed += 1
+                        else:
+                            mh_closed += 1
+                    # else: already-closed case logged inside helper
+
+                except Exception:
+                    logging.exception("COPY_AUTO_EXIT_POSITION_FAIL pos=%s", pos_id)
+
+            logging.warning(
+                "COPY_AUTO_EXIT_TICK_DONE scanned=%s checked=%s "
+                "tp_closed=%s mh_closed=%s skipped=%s",
+                len(open_positions), checked,
+                tp_closed, mh_closed, skipped,
+            )
+
+        except Exception:
+            logging.exception("COPY_AUTO_EXIT_LOOP_ERROR")
+
+        await asyncio.sleep(COPY_AUTO_EXIT_LOOP_INTERVAL)
+
+
 # ── Settlement loop ───────────────────────────────────────────────────────────
 
 async def copy_settlement_loop() -> None:
@@ -10278,10 +10699,12 @@ async def main():
     #   Logs COPY_BRAIN_ALIVE every 10s so the build is always visible in Railway.
     # copy_trade_loop: shared-brain decision + paper/live execution.
     # copy_settlement_loop: resolves expired paper positions via Gamma API.
+    # copy_auto_exit_loop: TP / max-hold auto-close for OPEN copied positions.
     # leaderboard_ingest_loop: scrapes Polymarket leaderboard → candidate_wallets.
     tasks.append(asyncio.create_task(_run_forever("copy_diag_loop", copy_diag_loop)))
     tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
+    tasks.append(asyncio.create_task(_run_forever("copy_auto_exit_loop", copy_auto_exit_loop)))
     tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
     # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
     tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))

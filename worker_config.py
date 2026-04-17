@@ -334,6 +334,11 @@ COPY_DATA_API_BASE = "https://data-api.polymarket.com"
 COPY_SETTLEMENT_LOOP_INTERVAL = int(os.getenv("COPY_SETTLEMENT_LOOP_INTERVAL", "90"))
 COPY_SETTLEMENT_BATCH_SIZE = int(os.getenv("COPY_SETTLEMENT_BATCH_SIZE", "100"))
 
+# COPY_AUTO_EXIT_LOOP_INTERVAL: seconds between auto-profit / max-hold scans.
+#   Default 60s — scans OPEN copied_positions for TP / max-hold triggers.
+#   Completely independent from settlement; does not touch copy trading ingestion.
+COPY_AUTO_EXIT_LOOP_INTERVAL = int(os.getenv("COPY_AUTO_EXIT_LOOP_INTERVAL", "60"))
+
 # ── 19. Live copy-trading pilot config ────────────────────────────────────────
 #
 # ALL of these must be satisfied before any live copy order is submitted.
