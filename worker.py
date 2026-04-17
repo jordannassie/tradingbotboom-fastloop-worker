@@ -8996,13 +8996,15 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
                 pass
         return None
 
+    _hdrs = {"User-Agent": "FastLoopWorker/1.0"}
+
     # ── Attempt 1: by token_id ────────────────────────────────────────────
     if token_id:
         try:
-            url  = f"{GAMMA_API_BASE}/markets?clob_token_ids={token_id}"
-            resp = requests.get(url, timeout=8, headers={"User-Agent": "FastLoopWorker/1.0"})
-            resp.raise_for_status()
-            data    = resp.json()
+            url = f"{GAMMA_API_BASE}/markets?clob_token_ids={token_id}"
+            req = request.Request(url, headers=_hdrs)
+            with request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
             markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
             for m in markets:
                 price = _extract_price(m)
@@ -9014,10 +9016,10 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
     # ── Attempt 2: by condition_id ────────────────────────────────────────
     if condition_id:
         try:
-            url  = f"{GAMMA_API_BASE}/markets?condition_id={condition_id}"
-            resp = requests.get(url, timeout=8, headers={"User-Agent": "FastLoopWorker/1.0"})
-            resp.raise_for_status()
-            data    = resp.json()
+            url = f"{GAMMA_API_BASE}/markets?condition_id={condition_id}"
+            req = request.Request(url, headers=_hdrs)
+            with request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
             markets = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
             for m in markets:
                 price = _extract_price(m)
@@ -9613,9 +9615,9 @@ def _fetch_leaderboard_page_sync(offset: int, limit: int) -> list[dict]:
         f"&offset={offset}"
     )
     try:
-        resp = requests.get(url, timeout=15, headers={"Accept": "application/json"})
-        resp.raise_for_status()
-        raw = resp.json()
+        req = request.Request(url, headers={"Accept": "application/json", "User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read())
         if isinstance(raw, list):
             return raw
         # Common wrapped shapes
@@ -10219,9 +10221,9 @@ def _ema5m_fetch_closes_sync() -> list[float] | None:
     Returns None on any network or parse error.
     """
     try:
-        resp = requests.get(_BINANCE_5M_URL, timeout=10)
-        resp.raise_for_status()
-        rows = resp.json()
+        req = request.Request(_BINANCE_5M_URL, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read())
         # Binance kline row: [open_time, open, high, low, CLOSE, vol, close_time, ...]
         # rows[-1] is the current open (unfinalised) candle — drop it.
         closes = [float(row[4]) for row in rows[:-1]]
@@ -10279,12 +10281,15 @@ def _ema5m_fetch_market_prices_sync(slug: str) -> tuple[float, float]:
     so the paper position is still created with a sensible entry price.
     """
     try:
-        url  = f"{GAMMA_API_BASE}/events/slug/{slug}"
-        resp = requests.get(url, timeout=8)
-        if resp.status_code == 404:
-            return 0.50, 0.50
-        resp.raise_for_status()
-        event   = resp.json()
+        url = f"{GAMMA_API_BASE}/events/slug/{slug}"
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        try:
+            with request.urlopen(req, timeout=8) as resp:
+                event = json.loads(resp.read())
+        except HTTPError as exc:
+            if exc.code == 404:
+                return 0.50, 0.50
+            raise
         markets = event.get("markets") or []
         yes_price = no_price = 0.50
         for m in markets:
