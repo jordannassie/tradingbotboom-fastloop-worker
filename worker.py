@@ -145,6 +145,7 @@ logging.warning(
     "g6_condition_id_for_sell=FIXED "
     "live_sell_clob_decoupled_from_db_close=FIXED "
     "copy_closes_default=TRUE "
+    "ema_5m_btc_strategy=ADDED "
     "— if you see COPY_LIVE_GATE_L4_FAIL alongside this, "
     "two containers are running simultaneously"
 )
@@ -9754,6 +9755,276 @@ async def _run_leaderboard_scan() -> None:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ── EMA_5M_BTC  —  5-minute BTC EMA paper strategy ───────────────────────────
+#
+# Isolated from all copy-trading and existing BTC strategy logic.
+# Does NOT modify heartbeat_loop, copy_trade_loop, wallet logic, or any
+# existing strategy.  Only reads from Binance + Gamma, writes to paper_positions.
+#
+# Data flow:
+#   Binance 5m klines (REST, no auth)
+#     → compute EMA 9 + EMA 200 from closed candle closes
+#     → YES if close > EMA9 and close > EMA200
+#     → NO  if close < EMA9 and close < EMA200
+#     → NONE otherwise (no trade)
+#   Gamma API → YES/NO market prices for current btc-updown-5m-{ts} slug
+#   paper_positions (Supabase) → OPEN row if signal is YES or NO
+#
+# Duplicate prevention: has_open_paper_position_for_strategy() called before
+# every insert; one open position per (slug, strategy_id, bot_id) at most.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BINANCE_5M_URL = (
+    "https://api.binance.com/api/v3/klines"
+    "?symbol=BTCUSDT&interval=5m&limit=250"
+)
+
+
+def _ema5m_fetch_closes_sync() -> list[float] | None:
+    """
+    Fetch BTC/USDT 5-minute klines from the Binance public REST API.
+
+    Returns a list of closing prices, oldest first, newest last.
+    The last row returned by Binance is the currently-forming (not yet closed)
+    candle and is always excluded — only fully closed candles are returned.
+
+    Returns None on any network or parse error.
+    """
+    try:
+        resp = requests.get(_BINANCE_5M_URL, timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+        # Binance kline row: [open_time, open, high, low, CLOSE, vol, close_time, ...]
+        # rows[-1] is the current open (unfinalised) candle — drop it.
+        closes = [float(row[4]) for row in rows[:-1]]
+        return closes
+    except Exception:
+        logging.exception("EMA_FETCH_CANDLES_FAIL")
+        return None
+
+
+def _ema5m_compute(closes: list[float], period: int) -> float | None:
+    """
+    Standard exponential moving average.
+
+    Seeds from the simple average of the first `period` values, then applies
+    the standard multiplier k = 2 / (period + 1) to each subsequent close.
+    Returns None when fewer data points exist than the period requires.
+    """
+    if len(closes) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period          # SMA seed
+    for price in closes[period:]:
+        ema = price * k + ema * (1.0 - k)
+    return round(ema, 4)
+
+
+def _ema5m_signal(closes: list[float]) -> tuple[str, float | None, float | None]:
+    """
+    Compute EMA9 and EMA200 and derive the trading signal.
+
+    Returns (signal, ema9, ema200) where signal ∈ {"YES", "NO", "NONE"}.
+
+    Rules:
+      YES  — last close > EMA9  AND  last close > EMA200  (BTC trending up)
+      NO   — last close < EMA9  AND  last close < EMA200  (BTC trending down)
+      NONE — price is between the two EMAs, or data insufficient
+    """
+    ema9   = _ema5m_compute(closes, 9)
+    ema200 = _ema5m_compute(closes, 200)
+    if ema9 is None or ema200 is None or not closes:
+        return "NONE", ema9, ema200
+    price = closes[-1]
+    if price > ema9 and price > ema200:
+        return "YES", ema9, ema200
+    if price < ema9 and price < ema200:
+        return "NO", ema9, ema200
+    return "NONE", ema9, ema200
+
+
+def _ema5m_fetch_market_prices_sync(slug: str) -> tuple[float, float]:
+    """
+    Fetch current YES / NO token prices from the Gamma API for a given slug.
+
+    Returns (yes_price, no_price).  Defaults to (0.50, 0.50) on any failure
+    so the paper position is still created with a sensible entry price.
+    """
+    try:
+        url  = f"{GAMMA_API_BASE}/events/slug/{slug}"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 404:
+            return 0.50, 0.50
+        resp.raise_for_status()
+        event   = resp.json()
+        markets = event.get("markets") or []
+        yes_price = no_price = 0.50
+        for m in markets:
+            outcome = str(m.get("outcome") or "").upper()
+            try:
+                # outcomePrices is a list — index 0 = YES probability
+                op = m.get("outcomePrices") or []
+                lp = m.get("lastPrice")
+                if outcome == "YES":
+                    yes_price = float(op[0]) if op else float(lp or 0.50)
+                elif outcome == "NO":
+                    no_price  = float(op[0]) if op else float(lp or 0.50)
+            except (TypeError, ValueError, IndexError):
+                pass
+        return yes_price, no_price
+    except Exception:
+        logging.exception("EMA_MARKET_PRICE_FAIL slug=%s", slug)
+        return 0.50, 0.50
+
+
+async def ema_5m_btc_loop() -> None:
+    """
+    EMA_5M_BTC paper strategy main loop.
+
+    Runs every EMA_5M_LOOP_INTERVAL seconds.  On each tick:
+      1. Compute the current btc-updown-5m-{ts} slug from wall-clock time.
+      2. Skip if fewer than EMA_5M_ENTRY_CUTOFF_SECONDS remain in the period.
+      3. Fetch 249 closed BTC/USDT 5m candles from Binance.
+      4. Compute EMA 9 and EMA 200 from the closing prices.
+      5. Derive signal (YES / NO / NONE).
+      6. Skip if already have an OPEN position for this slug + strategy.
+      7. Fetch current YES / NO prices from Gamma.
+      8. Insert a paper_positions row.
+
+    All state is in the DB — the loop is stateless between restarts.
+    Duplicate entries are prevented at the DB level via the has_open check.
+    """
+    if not EMA_5M_ENABLED:
+        logging.warning(
+            "EMA_5M_BTC_DISABLED — set EMA_5M_ENABLED=true to activate; "
+            "sleeping indefinitely"
+        )
+        while True:
+            await asyncio.sleep(3600)
+        return  # unreachable; satisfies type checkers
+
+    logging.warning(
+        "EMA_5M_BTC_BOOT slug_prefix=%s size_usd=%.2f "
+        "loop_interval=%ss entry_cutoff=%ss bot_id=%s strategy_id=%s",
+        EMA_5M_SLUG_PREFIX,
+        EMA_5M_TRADE_SIZE_USD,
+        EMA_5M_LOOP_INTERVAL,
+        EMA_5M_ENTRY_CUTOFF_SECONDS,
+        EMA_5M_BOT_ID,
+        EMA_5M_STRATEGY_ID,
+    )
+
+    while True:
+        try:
+            now       = int(time())
+            period    = 300                                  # 5 minutes in seconds
+            start_ts  = (now // period) * period
+            end_ts    = start_ts + period
+            remaining = end_ts - now
+            slug      = f"{EMA_5M_SLUG_PREFIX}-{start_ts}"
+
+            # ── Entry cutoff ─────────────────────────────────────────────────
+            if remaining < EMA_5M_ENTRY_CUTOFF_SECONDS:
+                logging.info(
+                    "EMA_STRATEGY_SKIP slug=%s reason=entry_cutoff "
+                    "remaining_s=%s cutoff_s=%s",
+                    slug, remaining, EMA_5M_ENTRY_CUTOFF_SECONDS,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── Fetch closed candles (blocking I/O in thread) ────────────────
+            closes = await asyncio.to_thread(_ema5m_fetch_closes_sync)
+            if not closes or len(closes) < 201:
+                logging.warning(
+                    "EMA_STRATEGY_SKIP slug=%s reason=insufficient_candles "
+                    "candles=%s need=201",
+                    slug, len(closes) if closes else 0,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── Compute signal ────────────────────────────────────────────────
+            signal, ema9, ema200 = _ema5m_signal(closes)
+            btc_price = closes[-1]
+
+            logging.warning(
+                "EMA_STRATEGY_BAR slug=%s candles=%s btc_price=%.2f "
+                "ema9=%.2f ema200=%.2f signal=%s",
+                slug, len(closes), btc_price,
+                ema9 or 0.0, ema200 or 0.0, signal,
+            )
+
+            if signal == "NONE":
+                logging.warning(
+                    "EMA_STRATEGY_SIGNAL slug=%s signal=NONE "
+                    "btc_price=%.2f ema9=%.2f ema200=%.2f — no trade this bar",
+                    slug, btc_price, ema9 or 0.0, ema200 or 0.0,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            logging.warning(
+                "EMA_STRATEGY_SIGNAL slug=%s signal=%s "
+                "btc_price=%.2f ema9=%.2f ema200=%.2f",
+                slug, signal, btc_price, ema9 or 0.0, ema200 or 0.0,
+            )
+
+            # ── Duplicate entry prevention ────────────────────────────────────
+            already_open = await has_open_paper_position_for_strategy(
+                slug, EMA_5M_STRATEGY_ID, EMA_5M_BOT_ID
+            )
+            if already_open:
+                logging.warning(
+                    "EMA_STRATEGY_SKIP slug=%s reason=already_open signal=%s "
+                    "— position already exists for this market",
+                    slug, signal,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── Fetch market prices (thread) ──────────────────────────────────
+            yes_price, no_price = await asyncio.to_thread(
+                _ema5m_fetch_market_prices_sync, slug
+            )
+            side        = "yes" if signal == "YES" else "no"
+            entry_price = yes_price if side == "yes" else no_price
+            # Guard against degenerate prices (market not active yet / Gamma fault)
+            if not (0.01 < entry_price < 0.99):
+                entry_price = 0.50
+            shares = round(EMA_5M_TRADE_SIZE_USD / entry_price, 4)
+
+            logging.warning(
+                "EMA_STRATEGY_ENTRY slug=%s signal=%s side=%s "
+                "entry_price=%.4f size_usd=%.2f shares=%.4f "
+                "ema9=%.2f ema200=%.2f btc_price=%.2f",
+                slug, signal, side,
+                entry_price, EMA_5M_TRADE_SIZE_USD, shares,
+                ema9 or 0.0, ema200 or 0.0, btc_price,
+            )
+
+            # ── Place paper position ──────────────────────────────────────────
+            await insert_paper_position_row(
+                EMA_5M_BOT_ID,
+                EMA_5M_STRATEGY_ID,
+                slug,
+                side,
+                entry_price,
+                EMA_5M_TRADE_SIZE_USD,
+                shares,
+                start_ts,
+            )
+
+        except Exception:
+            logging.exception("EMA_5M_LOOP_ERROR")
+
+        await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 async def main():
     # ── Unmistakable startup marker in the running event loop ─────────────────
     # Fires from main() — same scope as heartbeat_loop and all other tasks.
@@ -9783,6 +10054,8 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
     tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
+    # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
+    tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)

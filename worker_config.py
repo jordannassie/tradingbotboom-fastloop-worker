@@ -390,3 +390,32 @@ LEADERBOARD_CATEGORY        = os.getenv("LEADERBOARD_CATEGORY",            "cryp
 LEADERBOARD_TIMEFRAME       = os.getenv("LEADERBOARD_TIMEFRAME",           "1d")
 LEADERBOARD_MIN_COPY_SCORE  = float(os.getenv("LEADERBOARD_MIN_COPY_SCORE", "50.0"))
 LEADERBOARD_ENRICH_LIMIT    = int(os.getenv("LEADERBOARD_ENRICH_LIMIT",    "50"))
+
+# ── 21. EMA_5M_BTC strategy config ────────────────────────────────────────────
+#
+# PAPER-only strategy.  Trades Polymarket btc-updown-5m-* markets using
+# 9-period and 200-period EMAs computed from Binance 5-minute BTC/USDT candles.
+#
+# EMA_5M_ENABLED              Toggle the loop on/off. Default: true.
+# EMA_5M_LOOP_INTERVAL        Seconds between each evaluation tick.
+#                               Default: 60.  One check per minute is enough
+#                               since a new signal can only arise when the
+#                               latest closed 5m candle changes.
+# EMA_5M_TRADE_SIZE_USD       Paper position size in USD. Default: 10.
+# EMA_5M_SLUG_PREFIX          Polymarket market slug prefix to trade.
+#                               Default: btc-updown-5m.
+# EMA_5M_ENTRY_CUTOFF_SECONDS Do not enter a market within this many seconds
+#                               of its close.  Default: 30.
+# EMA_5M_BOT_ID               Identifier used in paper_positions.bot_id.
+#                               Must be unique — do not reuse an existing BOT_ID.
+#                               Default: ema5mbtc.
+
+EMA_5M_ENABLED              = os.getenv("EMA_5M_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes",
+)
+EMA_5M_LOOP_INTERVAL        = int(os.getenv("EMA_5M_LOOP_INTERVAL",        "60"))
+EMA_5M_TRADE_SIZE_USD       = float(os.getenv("EMA_5M_TRADE_SIZE_USD",     "10.0"))
+EMA_5M_SLUG_PREFIX          = os.getenv("EMA_5M_SLUG_PREFIX",              "btc-updown-5m")
+EMA_5M_ENTRY_CUTOFF_SECONDS = int(os.getenv("EMA_5M_ENTRY_CUTOFF_SECONDS", "30"))
+EMA_5M_BOT_ID               = os.getenv("EMA_5M_BOT_ID",                   "ema5mbtc")
+EMA_5M_STRATEGY_ID          = "EMA_5M_BTC"  # constant — not configurable
