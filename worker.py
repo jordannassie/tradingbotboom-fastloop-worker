@@ -5317,6 +5317,7 @@ async def paper_settlement_loop():
                         STRATEGY_REJECTION_WICK_BOT_ID,
                         STRATEGY_FOLLOW_THROUGH_BOT_ID,
                         BOT_ID,
+                        EMA_5M_BOT_ID,   # btc_5m_ema settled via BTC price move
                     ],
                 )
                 .eq("status", "OPEN")
@@ -5389,7 +5390,12 @@ async def paper_settlement_loop():
                 logging.exception("Failed updating paper_positions row id=%s", row_id)
                 continue
             else:
-                update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
+                if bot_id == EMA_5M_BOT_ID:
+                    # EMA strategy uses its own isolated accounting path with
+                    # EMA_BALANCE_BEFORE / EMA_POSITION_CLOSE_PNL / EMA_BALANCE_AFTER logs.
+                    _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
+                else:
+                    update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
             trade_payload = {
                 "bot_id": bot_id,
@@ -10299,16 +10305,16 @@ def _ema5m_fetch_market_prices_sync(slug: str) -> tuple[float, float]:
         return 0.50, 0.50
 
 
-def _ema5m_get_paper_exposure_sync() -> float:
+def _ema5m_get_paper_exposure_sync() -> tuple[int, float]:
     """
-    Return the total USD exposure currently OPEN in paper_positions for bot_id=btc_5m_ema.
+    Return (open_position_count, total_exposure_usd) for OPEN btc_5m_ema paper positions.
 
-    Only sums rows where bot_id = EMA_5M_BOT_ID and status = 'OPEN'.
-    Completely isolated from copy-trading exposure — does not read copied_positions
-    or any copy-trading table.
+    Only queries paper_positions WHERE bot_id = EMA_5M_BOT_ID AND status = 'OPEN'.
+    Completely isolated from copy-trading — does not read copied_positions or any
+    copy-trading table.
 
-    Returns 0.0 on any DB error so a transient failure does not permanently block
-    new entries (fail-open for exposure query, not for exposure cap).
+    Returns (0, 0.0) on any DB error so a transient failure does not permanently
+    block new entries (fail-open for exposure query, cap still enforced on projected).
     """
     try:
         resp = (
@@ -10318,11 +10324,70 @@ def _ema5m_get_paper_exposure_sync() -> float:
             .eq("status", "OPEN")
             .execute()
         )
-        rows = resp.data or []
-        return round(sum(float(r.get("size_usd") or 0.0) for r in rows), 4)
+        rows  = resp.data or []
+        count = len(rows)
+        total = round(sum(float(r.get("size_usd") or 0.0) for r in rows), 4)
+        return count, total
     except Exception:
         logging.exception("EMA_EXPOSURE_QUERY_FAIL bot_id=%s", EMA_5M_BOT_ID)
-        return 0.0
+        return 0, 0.0
+
+
+def _ema5m_apply_realized_pnl_sync(
+    pnl_usd: float,
+    pos_id: str,
+    slug: str,
+) -> None:
+    """
+    Apply realized PnL from a closed btc_5m_ema paper position to bot_settings.
+
+    Wraps update_bot_settings_with_realized_pnl with EMA-specific WARNING logs:
+      EMA_BALANCE_BEFORE  — balance and cumulative PnL before this close
+      EMA_POSITION_CLOSE_PNL — the PnL delta for this specific position
+      EMA_BALANCE_AFTER   — balance and cumulative PnL after this close
+
+    Completely isolated from copy trading — only touches bot_id='btc_5m_ema'.
+    """
+    short_id = pos_id[:8] if pos_id else "?"
+
+    # Read current balance so we can log BEFORE state
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("paper_balance_usd, paper_pnl_usd")
+            .eq("bot_id", EMA_5M_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        row            = (resp.data or [None])[0]
+        balance_before = float(row.get("paper_balance_usd") or 0.0) if row else 0.0
+        pnl_before     = float(row.get("paper_pnl_usd")     or 0.0) if row else 0.0
+    except Exception:
+        balance_before = 0.0
+        pnl_before     = 0.0
+
+    logging.warning(
+        "EMA_BALANCE_BEFORE bot_id=%s pos=%s slug=%s "
+        "paper_balance_usd=%.4f paper_pnl_usd=%.4f",
+        EMA_5M_BOT_ID, short_id, slug,
+        balance_before, pnl_before,
+    )
+    logging.warning(
+        "EMA_POSITION_CLOSE_PNL bot_id=%s pos=%s slug=%s pnl_usd=%+.4f",
+        EMA_5M_BOT_ID, short_id, slug, pnl_usd,
+    )
+
+    # Apply the delta via the shared helper (handles insert-if-row-missing)
+    update_bot_settings_with_realized_pnl(EMA_5M_BOT_ID, pnl_usd)
+
+    logging.warning(
+        "EMA_BALANCE_AFTER bot_id=%s pos=%s slug=%s "
+        "pnl_delta=%+.4f paper_balance_usd=%.4f paper_pnl_usd=%.4f",
+        EMA_5M_BOT_ID, short_id, slug,
+        pnl_usd,
+        balance_before + pnl_usd,
+        pnl_before     + pnl_usd,
+    )
 
 
 def _ema5m_upsert_telemetry_sync(
@@ -10331,6 +10396,8 @@ def _ema5m_upsert_telemetry_sync(
     ema9: float | None,
     ema200: float | None,
     last_close: float | None,
+    open_exposure_usd: float | None = None,
+    open_position_count: int | None = None,
 ) -> None:
     """
     Write EMA signal telemetry to bot_settings.strategy_settings for bot_id=EMA_5M_BOT_ID.
@@ -10338,30 +10405,35 @@ def _ema5m_upsert_telemetry_sync(
     Called on EVERY tick — even when the strategy is disabled or signal is NONE —
     so the BTCBOT card always shows the latest EMA values without any trade being placed.
 
-    JSON shape written (matches what the card polls for):
+    JSON shape written to strategy_settings (all fields the BTCBOT card uses):
       {
-        "ema9":                  <float | null>,
-        "ema200":                <float | null>,
-        "last_close":            <float | null>,
-        "signal":                "YES" | "NO" | "NONE",
-        "updated_at":            "<iso-timestamp>",
-        "market_slug":           "<current slug>",
-        "paper_max_exposure_usd": 100.0,   (preserved from existing row, default on create)
-        "live_max_exposure_usd":  0.0      (preserved from existing row, default on create)
+        "ema9":                    <float | null>,
+        "ema200":                  <float | null>,
+        "last_close":              <float | null>,
+        "signal":                  "YES" | "NO" | "NONE",
+        "updated_at":              "<iso-timestamp>",
+        "market_slug":             "<current slug>",
+        "open_exposure_usd":       <float>,    live open notional (btc_5m_ema only)
+        "open_position_count":     <int>,      live open count
+        "realized_pnl_usd":        <float>,    cumulative P/L from paper_pnl_usd column
+        "paper_balance_usd_snapshot": <float>, snapshot of current paper balance
+        "paper_max_exposure_usd":  100.0,      (preserved from existing row)
+        "live_max_exposure_usd":   0.0         (preserved from existing row)
       }
 
-    Uses update-then-insert pattern.
+    Uses read-then-update-or-insert pattern.
 
-    Auto-create safe defaults (row did not exist):
-      is_enabled            = false   ← SAFE: must be explicitly enabled via card
-      mode                  = PAPER
-      arm_live              = false
-      trade_size_usd        = 10.0
-      paper_balance_usd     = 100.0
-      paper_max_exposure_usd = 100.0  (stored in strategy_settings JSON)
-      live_max_exposure_usd  = 0.0    (stored in strategy_settings JSON)
+    Auto-create safe defaults (row does not yet exist):
+      is_enabled              = false   ← SAFE: must be explicitly enabled via card
+      mode                    = PAPER
+      arm_live                = false
+      trade_size_usd          = 10.0
+      paper_balance_usd       = 100.0
+      paper_max_exposure_usd  = 100.0  (in strategy_settings JSON)
+      live_max_exposure_usd   = 0.0    (in strategy_settings JSON)
     """
-    telemetry = {
+    # Base telemetry — always updated
+    telemetry: dict = {
         "ema9":        ema9,
         "ema200":      ema200,
         "last_close":  last_close,
@@ -10369,12 +10441,18 @@ def _ema5m_upsert_telemetry_sync(
         "updated_at":  utc_now_iso(),
         "market_slug": slug,
     }
+    # Exposure metrics from this tick (optional — only present when loop fetched them)
+    if open_exposure_usd is not None:
+        telemetry["open_exposure_usd"] = open_exposure_usd
+    if open_position_count is not None:
+        telemetry["open_position_count"] = open_position_count
+
     try:
-        # Read the existing row first so we can preserve operator-set exposure caps
-        # that live inside strategy_settings (they must not be overwritten by telemetry).
+        # Read the existing row — we need strategy_settings (to preserve operator caps)
+        # and the accounting columns (paper_pnl_usd, paper_balance_usd) for the snapshot.
         existing_resp = (
             supabase.table("bot_settings")
-            .select("strategy_settings")
+            .select("strategy_settings, paper_pnl_usd, paper_balance_usd")
             .eq("bot_id", EMA_5M_BOT_ID)
             .limit(1)
             .execute()
@@ -10383,22 +10461,21 @@ def _ema5m_upsert_telemetry_sync(
 
         if existing_row is None:
             # ── Row does not exist — create with safe defaults ────────────────
-            # is_enabled=False: operator must explicitly enable via card/DB.
-            # Exposure caps stored in strategy_settings so they survive the
-            # row existing before any custom columns are added.
             new_ss = {
                 **telemetry,
-                "paper_max_exposure_usd": 100.0,
-                "live_max_exposure_usd":  0.0,
+                "realized_pnl_usd":           0.0,
+                "paper_balance_usd_snapshot":  100.0,
+                "paper_max_exposure_usd":      100.0,
+                "live_max_exposure_usd":       0.0,
             }
             supabase.table("bot_settings").insert({
-                "bot_id":              EMA_5M_BOT_ID,
-                "is_enabled":          False,
-                "mode":                "PAPER",
-                "arm_live":            False,
-                "trade_size_usd":      10.0,
-                "paper_balance_usd":   100.0,
-                "strategy_settings":   new_ss,
+                "bot_id":            EMA_5M_BOT_ID,
+                "is_enabled":        False,
+                "mode":              "PAPER",
+                "arm_live":          False,
+                "trade_size_usd":    10.0,
+                "paper_balance_usd": 100.0,
+                "strategy_settings": new_ss,
             }).execute()
             logging.warning(
                 "EMA_STRATEGY_STATE_WRITE bot_id=%s signal=%s "
@@ -10407,14 +10484,21 @@ def _ema5m_upsert_telemetry_sync(
             )
             return
 
-        # ── Row exists — preserve existing strategy_settings, merge telemetry ──
+        # ── Row exists — enrich telemetry with live accounting snapshot ───────
+        realized_pnl = float_or_none(existing_row.get("paper_pnl_usd"))
+        balance_snap = float_or_none(existing_row.get("paper_balance_usd"))
+        if realized_pnl is not None:
+            telemetry["realized_pnl_usd"] = realized_pnl
+        if balance_snap is not None:
+            telemetry["paper_balance_usd_snapshot"] = balance_snap
+
+        # Merge: operator-set caps/values survive, telemetry fields are overwritten.
         raw_ss = existing_row.get("strategy_settings") or {}
         if isinstance(raw_ss, str):
             try:
                 raw_ss = json.loads(raw_ss)
             except json.JSONDecodeError:
                 raw_ss = {}
-        # Merge: keep operator-set caps, overwrite only the telemetry fields.
         merged_ss = {**raw_ss, **telemetry}
 
         supabase.table("bot_settings").update(
@@ -10423,8 +10507,10 @@ def _ema5m_upsert_telemetry_sync(
 
         logging.warning(
             "EMA_STRATEGY_STATE_WRITE bot_id=%s signal=%s "
-            "ema9=%s ema200=%s last_close=%s slug=%s",
+            "ema9=%s ema200=%s last_close=%s slug=%s "
+            "open_exposure_usd=%s realized_pnl_usd=%s paper_balance_usd=%s",
             EMA_5M_BOT_ID, signal, ema9, ema200, last_close, slug,
+            open_exposure_usd, realized_pnl, balance_snap,
         )
     except Exception:
         logging.warning(
@@ -10540,10 +10626,27 @@ async def ema_5m_btc_loop() -> None:
                 slug, signal, btc_price, ema9 or 0.0, ema200 or 0.0,
             )
 
+            # ── 5.5. Fetch open exposure (one query per tick, reused for both ─────
+            #        telemetry and the cap gate at step 11b)
+            open_pos_count, current_exposure = await asyncio.to_thread(
+                _ema5m_get_paper_exposure_sync
+            )
+            logging.warning(
+                "EMA_EXPOSURE_SUMMARY bot_id=%s slug=%s "
+                "open_positions=%s open_exposure_usd=%.2f "
+                "cap=%.2f remaining_cap=%.2f",
+                EMA_5M_BOT_ID, slug,
+                open_pos_count, current_exposure,
+                paper_max_exposure,
+                max(0.0, paper_max_exposure - current_exposure),
+            )
+
             # ── 6. Write telemetry (always — card reads this regardless of is_enabled) ──
             await asyncio.to_thread(
                 _ema5m_upsert_telemetry_sync,
                 slug, signal, ema9, ema200, btc_price,
+                current_exposure,   # open_exposure_usd for strategy_settings
+                open_pos_count,     # open_position_count for strategy_settings
             )
 
             # ── 7. Disabled gate ──────────────────────────────────────────────
@@ -10597,9 +10700,7 @@ async def ema_5m_btc_loop() -> None:
                 continue
 
             # ── 11b. Exposure cap check (btc_5m_ema bucket only) ─────────────
-            # Queries paper_positions WHERE bot_id='btc_5m_ema' AND status='OPEN'.
-            # Completely isolated from copy-trading exposure/cap logic.
-            current_exposure  = await asyncio.to_thread(_ema5m_get_paper_exposure_sync)
+            # current_exposure already fetched at step 5.5 — no extra DB query.
             projected_exposure = current_exposure + trade_size
 
             logging.warning(
