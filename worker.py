@@ -9878,26 +9878,97 @@ def _ema5m_fetch_market_prices_sync(slug: str) -> tuple[float, float]:
         return 0.50, 0.50
 
 
+def _ema5m_upsert_telemetry_sync(
+    slug: str,
+    signal: str,
+    ema9: float | None,
+    ema200: float | None,
+    last_close: float | None,
+) -> None:
+    """
+    Write EMA signal telemetry to bot_settings.strategy_settings for bot_id=EMA_5M_BOT_ID.
+
+    Called on EVERY tick — even when the strategy is disabled or signal is NONE —
+    so the BTCBOT card always shows the latest EMA values without any trade being placed.
+
+    JSON shape written (matches what the card polls for):
+      {
+        "ema9":        <float | null>,
+        "ema200":      <float | null>,
+        "last_close":  <float | null>,
+        "signal":      "YES" | "NO" | "NONE",
+        "updated_at":  "<iso-timestamp>",
+        "market_slug": "<current slug>"
+      }
+
+    Uses update-then-insert pattern: if the bot_settings row for EMA_5M_BOT_ID
+    does not yet exist (e.g. first boot before the card is set up), it is created
+    with is_enabled=True so the strategy starts enabled by default.
+    """
+    telemetry = {
+        "ema9":        ema9,
+        "ema200":      ema200,
+        "last_close":  last_close,
+        "signal":      signal,
+        "updated_at":  utc_now_iso(),
+        "market_slug": slug,
+    }
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .update({"strategy_settings": telemetry, "updated_at": utc_now_iso()})
+            .eq("bot_id", EMA_5M_BOT_ID)
+            .execute()
+        )
+        if not (resp.data):
+            # Row doesn't exist yet — create it with sensible defaults so the
+            # card can read it immediately without manual DB setup.
+            supabase.table("bot_settings").insert({
+                "bot_id":            EMA_5M_BOT_ID,
+                "is_enabled":        True,
+                "strategy_settings": telemetry,
+            }).execute()
+        logging.warning(
+            "EMA_STRATEGY_STATE_WRITE bot_id=%s signal=%s "
+            "ema9=%s ema200=%s last_close=%s slug=%s",
+            EMA_5M_BOT_ID, signal, ema9, ema200, last_close, slug,
+        )
+    except Exception:
+        logging.warning(
+            "EMA_STRATEGY_STATE_WRITE_FAIL bot_id=%s slug=%s signal=%s",
+            EMA_5M_BOT_ID, slug, signal,
+        )
+        logging.exception(
+            "EMA_STRATEGY_STATE_WRITE_FAIL detail bot_id=%s slug=%s",
+            EMA_5M_BOT_ID, slug,
+        )
+
+
 async def ema_5m_btc_loop() -> None:
     """
     EMA_5M_BTC paper strategy main loop.
 
-    Runs every EMA_5M_LOOP_INTERVAL seconds.  On each tick:
-      1. Compute the current btc-updown-5m-{ts} slug from wall-clock time.
-      2. Skip if fewer than EMA_5M_ENTRY_CUTOFF_SECONDS remain in the period.
-      3. Fetch 249 closed BTC/USDT 5m candles from Binance.
-      4. Compute EMA 9 and EMA 200 from the closing prices.
-      5. Derive signal (YES / NO / NONE).
-      6. Skip if already have an OPEN position for this slug + strategy.
-      7. Fetch current YES / NO prices from Gamma.
-      8. Insert a paper_positions row.
+    Wired to bot_settings row  bot_id = EMA_5M_BOT_ID ("btc_5m_ema").
 
-    All state is in the DB — the loop is stateless between restarts.
-    Duplicate entries are prevented at the DB level via the has_open check.
+    Per-tick flow:
+      1.  Read  bot_settings for EMA_5M_BOT_ID (is_enabled, mode, trade_size_usd, arm_live).
+      2.  Compute current btc-updown-5m-{ts} slug.
+      3.  Fetch 249 closed BTC/USDT 5m candles from Binance.
+      4.  Compute EMA 9 and EMA 200 from closing prices.
+      5.  Derive signal: YES / NO / NONE.
+      6.  Write telemetry to bot_settings.strategy_settings (ALWAYS, even if disabled).
+      7.  Skip trade entry if is_enabled=False  → log EMA_STRATEGY_DISABLED.
+      8.  Skip trade entry if signal == NONE.
+      9.  Skip trade entry if entry cutoff reached.
+      10. Skip trade entry if mode == LIVE  → log EMA_STRATEGY_LIVE_BLOCKED.
+      11. Skip trade entry if position already open for this slug  → log EMA_STRATEGY_SKIP.
+      12. Fetch YES/NO prices from Gamma, insert paper_positions row.
+
+    All state is in the DB — loop is stateless between restarts.
     """
     if not EMA_5M_ENABLED:
         logging.warning(
-            "EMA_5M_BTC_DISABLED — set EMA_5M_ENABLED=true to activate; "
+            "EMA_5M_BTC_DISABLED env — set EMA_5M_ENABLED=true to activate; "
             "sleeping indefinitely"
         )
         while True:
@@ -9905,36 +9976,40 @@ async def ema_5m_btc_loop() -> None:
         return  # unreachable; satisfies type checkers
 
     logging.warning(
-        "EMA_5M_BTC_BOOT slug_prefix=%s size_usd=%.2f "
-        "loop_interval=%ss entry_cutoff=%ss bot_id=%s strategy_id=%s",
-        EMA_5M_SLUG_PREFIX,
-        EMA_5M_TRADE_SIZE_USD,
-        EMA_5M_LOOP_INTERVAL,
-        EMA_5M_ENTRY_CUTOFF_SECONDS,
+        "EMA_5M_BTC_BOOT bot_id=%s strategy_id=%s slug_prefix=%s "
+        "loop_interval=%ss entry_cutoff=%ss "
+        "— runtime settings read from bot_settings each tick",
         EMA_5M_BOT_ID,
         EMA_5M_STRATEGY_ID,
+        EMA_5M_SLUG_PREFIX,
+        EMA_5M_LOOP_INTERVAL,
+        EMA_5M_ENTRY_CUTOFF_SECONDS,
     )
 
     while True:
         try:
+            # ── 1. Read settings from bot_settings ───────────────────────────
+            settings   = read_strategy_settings(EMA_5M_BOT_ID)
+            is_enabled = bool(settings.get("is_enabled", False))
+            mode       = str(settings.get("mode") or "PAPER").upper()
+            trade_size = float(settings.get("trade_size_usd") or EMA_5M_TRADE_SIZE_USD)
+            arm_live   = bool(settings.get("arm_live", False))
+
+            logging.warning(
+                "EMA_STRATEGY_SETTINGS_LOADED bot_id=%s is_enabled=%s "
+                "mode=%s trade_size_usd=%.2f arm_live=%s",
+                EMA_5M_BOT_ID, is_enabled, mode, trade_size, arm_live,
+            )
+
+            # ── 2. Compute current market slug ────────────────────────────────
             now       = int(time())
-            period    = 300                                  # 5 minutes in seconds
+            period    = 300                          # 5-minute window in seconds
             start_ts  = (now // period) * period
             end_ts    = start_ts + period
             remaining = end_ts - now
             slug      = f"{EMA_5M_SLUG_PREFIX}-{start_ts}"
 
-            # ── Entry cutoff ─────────────────────────────────────────────────
-            if remaining < EMA_5M_ENTRY_CUTOFF_SECONDS:
-                logging.info(
-                    "EMA_STRATEGY_SKIP slug=%s reason=entry_cutoff "
-                    "remaining_s=%s cutoff_s=%s",
-                    slug, remaining, EMA_5M_ENTRY_CUTOFF_SECONDS,
-                )
-                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
-                continue
-
-            # ── Fetch closed candles (blocking I/O in thread) ────────────────
+            # ── 3. Fetch closed candles (blocking I/O in thread) ─────────────
             closes = await asyncio.to_thread(_ema5m_fetch_closes_sync)
             if not closes or len(closes) < 201:
                 logging.warning(
@@ -9945,7 +10020,7 @@ async def ema_5m_btc_loop() -> None:
                 await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
                 continue
 
-            # ── Compute signal ────────────────────────────────────────────────
+            # ── 4 + 5. Compute EMA9, EMA200 and derive signal ────────────────
             signal, ema9, ema200 = _ema5m_signal(closes)
             btc_price = closes[-1]
 
@@ -9955,63 +10030,94 @@ async def ema_5m_btc_loop() -> None:
                 slug, len(closes), btc_price,
                 ema9 or 0.0, ema200 or 0.0, signal,
             )
-
-            if signal == "NONE":
-                logging.warning(
-                    "EMA_STRATEGY_SIGNAL slug=%s signal=NONE "
-                    "btc_price=%.2f ema9=%.2f ema200=%.2f — no trade this bar",
-                    slug, btc_price, ema9 or 0.0, ema200 or 0.0,
-                )
-                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
-                continue
-
             logging.warning(
                 "EMA_STRATEGY_SIGNAL slug=%s signal=%s "
                 "btc_price=%.2f ema9=%.2f ema200=%.2f",
                 slug, signal, btc_price, ema9 or 0.0, ema200 or 0.0,
             )
 
-            # ── Duplicate entry prevention ────────────────────────────────────
+            # ── 6. Write telemetry (always — card reads this regardless of is_enabled) ──
+            await asyncio.to_thread(
+                _ema5m_upsert_telemetry_sync,
+                slug, signal, ema9, ema200, btc_price,
+            )
+
+            # ── 7. Disabled gate ──────────────────────────────────────────────
+            if not is_enabled:
+                logging.warning(
+                    "EMA_STRATEGY_DISABLED bot_id=%s slug=%s signal=%s "
+                    "— is_enabled=False in bot_settings; "
+                    "telemetry written to card, no trade placed",
+                    EMA_5M_BOT_ID, slug, signal,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── 8. NONE signal gate ───────────────────────────────────────────
+            if signal == "NONE":
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── 9. Entry cutoff gate ──────────────────────────────────────────
+            if remaining < EMA_5M_ENTRY_CUTOFF_SECONDS:
+                logging.warning(
+                    "EMA_STRATEGY_SKIP slug=%s reason=entry_cutoff "
+                    "remaining_s=%s cutoff_s=%s",
+                    slug, remaining, EMA_5M_ENTRY_CUTOFF_SECONDS,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── 10. Live mode gate (not yet implemented) ──────────────────────
+            if mode == "LIVE":
+                logging.warning(
+                    "EMA_STRATEGY_LIVE_BLOCKED bot_id=%s slug=%s signal=%s "
+                    "— mode=LIVE in bot_settings but live execution is not yet "
+                    "implemented for EMA_5M_BTC; set mode=PAPER to trade",
+                    EMA_5M_BOT_ID, slug, signal,
+                )
+                await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
+                continue
+
+            # ── 11. Duplicate entry prevention ────────────────────────────────
             already_open = await has_open_paper_position_for_strategy(
                 slug, EMA_5M_STRATEGY_ID, EMA_5M_BOT_ID
             )
             if already_open:
                 logging.warning(
                     "EMA_STRATEGY_SKIP slug=%s reason=already_open signal=%s "
-                    "— position already exists for this market",
+                    "— OPEN position already exists for this market+strategy",
                     slug, signal,
                 )
                 await asyncio.sleep(EMA_5M_LOOP_INTERVAL)
                 continue
 
-            # ── Fetch market prices (thread) ──────────────────────────────────
+            # ── 12. Fetch market prices and place PAPER position ──────────────
             yes_price, no_price = await asyncio.to_thread(
                 _ema5m_fetch_market_prices_sync, slug
             )
             side        = "yes" if signal == "YES" else "no"
             entry_price = yes_price if side == "yes" else no_price
-            # Guard against degenerate prices (market not active yet / Gamma fault)
             if not (0.01 < entry_price < 0.99):
                 entry_price = 0.50
-            shares = round(EMA_5M_TRADE_SIZE_USD / entry_price, 4)
+            shares = round(trade_size / entry_price, 4)
 
             logging.warning(
-                "EMA_STRATEGY_ENTRY slug=%s signal=%s side=%s "
+                "EMA_STRATEGY_PAPER_ENTRY slug=%s signal=%s side=%s "
                 "entry_price=%.4f size_usd=%.2f shares=%.4f "
                 "ema9=%.2f ema200=%.2f btc_price=%.2f",
                 slug, signal, side,
-                entry_price, EMA_5M_TRADE_SIZE_USD, shares,
+                entry_price, trade_size, shares,
                 ema9 or 0.0, ema200 or 0.0, btc_price,
             )
 
-            # ── Place paper position ──────────────────────────────────────────
             await insert_paper_position_row(
                 EMA_5M_BOT_ID,
                 EMA_5M_STRATEGY_ID,
                 slug,
                 side,
                 entry_price,
-                EMA_5M_TRADE_SIZE_USD,
+                trade_size,
                 shares,
                 start_ts,
             )

@@ -417,5 +417,5 @@ EMA_5M_LOOP_INTERVAL        = int(os.getenv("EMA_5M_LOOP_INTERVAL",        "60")
 EMA_5M_TRADE_SIZE_USD       = float(os.getenv("EMA_5M_TRADE_SIZE_USD",     "10.0"))
 EMA_5M_SLUG_PREFIX          = os.getenv("EMA_5M_SLUG_PREFIX",              "btc-updown-5m")
 EMA_5M_ENTRY_CUTOFF_SECONDS = int(os.getenv("EMA_5M_ENTRY_CUTOFF_SECONDS", "30"))
-EMA_5M_BOT_ID               = os.getenv("EMA_5M_BOT_ID",                   "ema5mbtc")
+EMA_5M_BOT_ID               = os.getenv("EMA_5M_BOT_ID",                   "btc_5m_ema")
 EMA_5M_STRATEGY_ID          = "EMA_5M_BTC"  # constant — not configurable
