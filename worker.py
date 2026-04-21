@@ -6015,43 +6015,52 @@ def get_unevaluated_trades_for_bot(
 
         trade_ids = [t["source_trade_id"] for t in all_trades]
 
-        # Fetch already-attempted source_trade_ids for this bot.
-        # CHUNKED to prevent httpx.InvalidURL: URL component 'query' too long.
-        # The Supabase REST client builds a GET URL with `in.(id,id,...)` for
-        # `.in_()` calls.  With 1000 UUIDs (36 chars each + commas) the query
-        # string can exceed 37 KB, well past typical server/client URL limits.
-        # Chunking at 50 UUIDs keeps each GET param under ~2 KB.
-        _ATTEMPT_CHUNK = 50
-        _total_chunks  = max(1, -(-len(trade_ids) // _ATTEMPT_CHUNK))  # ceiling div
-        attempt_rows: list[dict] = []
-        for _ci, _chunk_start in enumerate(range(0, len(trade_ids), _ATTEMPT_CHUNK), 1):
-            _chunk = trade_ids[_chunk_start:_chunk_start + _ATTEMPT_CHUNK]
-            try:
-                _cr = (
-                    supabase.table("copy_attempts")
-                    .select("source_trade_id, skip_reason, source_side, copied")
-                    .eq("copy_bot_id", bot_id)
-                    .in_("source_trade_id", _chunk)
-                    .execute()
-                )
-                _chunk_rows = _cr.data or []
-                attempt_rows.extend(_chunk_rows)
-                logging.info(
-                    "COPY_UNEVALUATED_CHUNK bot=%s chunk=%s/%s "
-                    "trades_in_chunk=%s attempts_found=%s",
-                    _label, _ci, _total_chunks, len(_chunk), len(_chunk_rows),
-                )
-            except Exception as _chunk_exc:
-                logging.warning(
-                    "COPY_UNEVALUATED_CHUNK_FAIL bot=%s chunk=%s/%s err=%s "
-                    "— chunk skipped; affected trades may be re-evaluated this tick",
-                    _label, _ci, _total_chunks, _chunk_exc,
-                )
+        # Fetch already-attempted source_trade_ids for this bot + wallet.
+        #
+        # ROOT CAUSE (original bug): .in_("source_trade_id", trade_ids) built a
+        # GET URL with all UUIDs in the query string — >37 KB with 1 000 IDs —
+        # causing httpx.InvalidURL.
+        #
+        # ROOT CAUSE (Phase 3 partial fix): chunking at 50 IDs still left URL
+        # length risk for wallets with long Polymarket hex trade IDs (~66 chars
+        # each: 50 × 66 chars + overhead can breach httpx/rfc3986 limits on
+        # certain builds).
+        #
+        # FINAL FIX: scalar-only filters — no .in_() list param, no URL-size
+        # risk regardless of wallet activity or trade-ID length.
+        # Logical equivalence: all copy_attempts for this bot + wallet within the
+        # same lookback window cover exactly the trades we are about to evaluate.
+        _attempts_fetch_limit = min(max(len(trade_ids) * 3, 200), 3000)
+        try:
+            _att_resp = (
+                supabase.table("copy_attempts")
+                .select("source_trade_id, skip_reason, source_side, copied")
+                .eq("copy_bot_id", bot_id)
+                .eq("wallet_address", wallet_address)
+                .gte("created_at", cutoff)
+                .order("created_at", desc=True)
+                .limit(_attempts_fetch_limit)
+                .execute()
+            )
+            attempt_rows: list[dict] = _att_resp.data or []
+        except Exception as _att_exc:
+            logging.warning(
+                "COPY_UNEVALUATED_ATTEMPTED_FETCH_CHUNK_FAIL bot=%s wallet=%s err=%s "
+                "— attempts fetch failed; all %s trades treated as unevaluated this tick",
+                _label, wallet_address[:10], _att_exc, len(trade_ids),
+            )
+            attempt_rows = []
+        logging.info(
+            "COPY_UNEVALUATED_ATTEMPTED_FETCH_SUMMARY bot=%s wallet=%s "
+            "trades_in_window=%s attempt_rows=%s limit=%s",
+            _label, wallet_address[:10],
+            len(trade_ids), len(attempt_rows), _attempts_fetch_limit,
+        )
         logging.info(
             "COPY_UNEVALUATED_SUMMARY bot=%s wallet=%s "
-            "total_trades=%s chunks=%s attempt_rows_fetched=%s",
+            "total_trades=%s attempt_rows=%s",
             _label, wallet_address[:10],
-            len(trade_ids), _total_chunks, len(attempt_rows),
+            len(trade_ids), len(attempt_rows),
         )
 
         # Group attempts by source_trade_id to handle trades with multiple rows.
@@ -6370,19 +6379,35 @@ def get_live_open_positions_count(live_bot_ids: list[str]) -> int:
     """
     Count OPEN copied_positions that belong to LIVE-mode copy bots.
 
+    Scoped to raw_json->>'mode' = 'LIVE' rows only so that paper positions
+    accumulated by the same bot (when it was running in paper mode) do not
+    inflate the live open count and falsely trigger Gate L9.
+
     Returns 999 on any DB failure as a fail-safe to block further live orders.
     """
     if not live_bot_ids:
         return 0
+    logging.info(
+        "COPY_LIVE_OPEN_COUNT_SCOPE scope=live_mode_only "
+        "live_bots=%s filters=status=OPEN+raw_json_mode=LIVE",
+        len(live_bot_ids),
+    )
     try:
         resp = (
             supabase.table("copied_positions")
             .select("id")
             .in_("copy_bot_id", live_bot_ids)
             .eq("status", "OPEN")
+            .filter("raw_json->>mode", "eq", "LIVE")
             .execute()
         )
-        return len(resp.data or [])
+        count = len(resp.data or [])
+        logging.info(
+            "COPY_LIVE_OPEN_COUNT_RESULT scope=live_mode_only "
+            "live_bots=%s open_live_count=%s",
+            len(live_bot_ids), count,
+        )
+        return count
     except Exception:
         logging.exception("COPY_LIVE_OPEN_POS_COUNT_FAIL")
         return 999  # fail-safe: block orders when count is unknown
@@ -6540,6 +6565,55 @@ def evaluate_and_execute_live_copy_trade(
         submitted_size, submitted_price,
     )
 
+    # ── Token-ID resolution (pre-gate) ───────────────────────────────────────
+    # wallet_trade.token_id may be null when the Polymarket Data API omits it
+    # for recent trades, or when the 5m market token rotated between the
+    # source wallet's trade and our evaluation window.
+    #
+    # For BTC/ETH/SOL/XRP up-down 5m markets the worker already holds the
+    # current YES/NO tokens in the globals current_yes_token / current_no_token
+    # (kept live by rotate_loop + market_listener WebSocket).  If the trade's
+    # market_slug matches the current market slug we can inject the correct token
+    # before any gate inspects wallet_trade.token_id.
+    #
+    # No change is made if token_id is already populated — this is additive only.
+    if not wallet_trade.get("token_id"):
+        _wt_slug    = str(wallet_trade.get("market_slug") or "")
+        _wt_outcome = str(wallet_trade.get("outcome") or "").upper()
+        logging.info(
+            "COPY_LIVE_TOKEN_RESOLVE_ATTEMPT bot=%s trade=%s "
+            "slug=%s outcome=%s current_slug=%s "
+            "has_yes_token=%s has_no_token=%s",
+            _bot_name, _trade_id,
+            _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
+            bool(current_yes_token), bool(current_no_token),
+        )
+        _resolved_token: str | None = None
+        if _wt_slug and current_slug and _wt_slug == current_slug:
+            if _wt_outcome in ("YES", "UP") and current_yes_token:
+                _resolved_token = current_yes_token
+            elif _wt_outcome in ("NO", "DOWN") and current_no_token:
+                _resolved_token = current_no_token
+
+        if _resolved_token:
+            # Shallow-copy the dict so the caller's reference is unchanged.
+            wallet_trade = {**wallet_trade, "token_id": _resolved_token}
+            logging.info(
+                "COPY_LIVE_TOKEN_RESOLVE_OK bot=%s trade=%s "
+                "slug=%s outcome=%s resolved_token=%s",
+                _bot_name, _trade_id,
+                _wt_slug, _wt_outcome, str(_resolved_token)[:20],
+            )
+        else:
+            logging.warning(
+                "COPY_LIVE_TOKEN_RESOLVE_FAIL bot=%s trade=%s "
+                "slug=%s outcome=%s current_slug=%s "
+                "— slug mismatch or outcome not recognised; "
+                "trade will proceed to gate checks without token_id",
+                _bot_name, _trade_id,
+                _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
+            )
+
     # ── Gate L8: global live hourly cap ──────────────────────────────────────
     # 0 = unlimited. SELL/close orders are exempt — exits must not be capped.
     if COPY_LIVE_MAX_TRADES_PER_HOUR > 0 and trade_side != "SELL":
@@ -6585,6 +6659,35 @@ def evaluate_and_execute_live_copy_trade(
                 _bot_name, _trade_id,
                 current_open_exposure, submitted_size, projected_exposure, live_max_exposure,
             )
+
+    # ── Gate LB: token_id required for live BUY ──────────────────────────────
+    # The shared brain allows market_slug as a fallback for paper matching.
+    # Live BUY CLOB orders always need a token_id; missing token_id here means
+    # the market is not CLOB-tradeable.  L10 (below) still guards SELL orders.
+    if trade_side in ("BUY", "") and not wallet_trade.get("token_id"):
+        logging.warning(
+            "COPY_LIVE_GATE_TOKEN_ID_FAIL bot=%s trade=%s "
+            "reason=live_token_id_missing slug=%s",
+            _bot_name, _trade_id,
+            str(wallet_trade.get("market_slug") or "?"),
+        )
+        return False, "live_token_id_missing", None, None, {}
+
+    # ── Gate LC: max-hold required for live BUY ──────────────────────────────
+    # Without max-hold, a live position that cannot be TP-closed stays open
+    # indefinitely.  Block live BUY entries unless the bot has max-hold fully
+    # configured.  SELL/mirror orders are exempt.
+    if trade_side in ("BUY", ""):
+        _live_fast   = _read_bot_fast_settings(copy_bot)
+        _exit_mode   = _live_fast["exit_mode"]
+        _max_hold_m  = _live_fast["max_hold_minutes"]
+        if "max_hold" not in _exit_mode or not (_max_hold_m and _max_hold_m > 0):
+            logging.warning(
+                "COPY_LIVE_GATE_MAX_HOLD_FAIL bot=%s trade=%s "
+                "reason=live_max_hold_required exit_mode=%s max_hold_minutes=%s",
+                _bot_name, _trade_id, _exit_mode, _max_hold_m,
+            )
+            return False, "live_max_hold_required", None, None, {}
 
     # ── Gate L10: token_id required for CLOB ─────────────────────────────────
     # The shared brain allows market_slug as fallback for paper matching.

@@ -365,6 +365,7 @@ COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",     
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
 
+
 # ── 20. Leaderboard wallet discovery config ────────────────────────────────────
 #
 # LEADERBOARD_INGEST_ENABLED   Toggle the leaderboard ingest loop on/off.
