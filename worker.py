@@ -6602,30 +6602,33 @@ def evaluate_and_execute_live_copy_trade(
     # wallet's trade and our evaluation window.
     #
     # Resolution order (additive — no change if token_id already present):
-    #   Source 1: current_slug globals — fastest, no DB round-trip.
-    #             Applies only when market_slug == current_slug (current 5m window).
-    #   Source 2: market_cache DB lookup — covers 15m markets, non-current 5m
-    #             slugs, and any other market the worker has already seen.
-    #             Uses exact slug match only; never borrows a token from a
-    #             different market.
+    #   Source 1: current_slug globals   — zero-latency; current BTC 5m window only.
+    #   Source 2: market_cache DB lookup — any slug previously seen by the worker.
+    #   Source 3: Gamma API exact-slug   — authoritative fallback; populates
+    #             market_cache on success so future ticks skip the API call.
     #
-    # If both sources fail the trade continues without token_id and Gate LB /
-    # Gate L10 will block it as before.
+    # All sources use exact slug match. No token is ever borrowed from a different
+    # market. If all sources fail, Gate LB / Gate L10 block the trade as before.
     if not wallet_trade.get("token_id"):
-        _wt_slug    = str(wallet_trade.get("market_slug") or "")
-        _wt_outcome = str(wallet_trade.get("outcome") or "").upper()
+        _wt_slug      = str(wallet_trade.get("market_slug") or "")
+        _wt_outcome   = str(wallet_trade.get("outcome") or "").upper()
+        _wt_cond_id   = wallet_trade.get("condition_id")
+        _sources_tried: list[str] = []
         logging.info(
             "COPY_LIVE_TOKEN_RESOLVE_ATTEMPT bot=%s trade=%s "
             "slug=%s outcome=%s current_slug=%s "
+            "token_id_present=%s condition_id_present=%s "
             "has_yes_token=%s has_no_token=%s",
             _bot_name, _trade_id,
             _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
+            bool(wallet_trade.get("token_id")), bool(_wt_cond_id),
             bool(current_yes_token), bool(current_no_token),
         )
         _resolved_token: str | None = None
         _resolve_source = "none"
 
-        # Source 1: current slug globals (no DB call)
+        # Source 1: current slug globals (zero-latency, no DB/API call)
+        _sources_tried.append("current_slug")
         if _wt_slug and current_slug and _wt_slug == current_slug:
             if _wt_outcome in ("YES", "UP") and current_yes_token:
                 _resolved_token = current_yes_token
@@ -6634,8 +6637,9 @@ def evaluate_and_execute_live_copy_trade(
                 _resolved_token = current_no_token
                 _resolve_source = "current_slug"
 
-        # Source 2: market_cache exact-slug lookup (covers 15m, rotated 5m, etc.)
+        # Source 2: market_cache exact-slug lookup
         if not _resolved_token and _wt_slug:
+            _sources_tried.append("market_cache")
             try:
                 _mc_resp = (
                     supabase.table("market_cache")
@@ -6656,9 +6660,56 @@ def evaluate_and_execute_live_copy_trade(
             except Exception as _mc_exc:
                 logging.warning(
                     "COPY_LIVE_TOKEN_MARKET_CACHE_FAIL bot=%s trade=%s "
-                    "slug=%s err=%s — market_cache lookup failed; "
-                    "falling through to gate check",
+                    "slug=%s err=%s",
                     _bot_name, _trade_id, _wt_slug, _mc_exc,
+                )
+
+        # Source 3: Gamma API exact-slug fetch (authoritative; populates cache)
+        if not _resolved_token and _wt_slug:
+            _sources_tried.append("gamma_api")
+            try:
+                _gd = _fetch_gamma_market_data_sync(
+                    condition_id=_wt_cond_id,
+                    market_slug=_wt_slug,
+                    token_id=None,
+                )
+                if _gd:
+                    _g_yes = _gd.get("yes_token_id") or ""
+                    _g_no  = _gd.get("no_token_id")  or ""
+                    if _wt_outcome in ("YES", "UP") and _g_yes:
+                        _resolved_token = str(_g_yes)
+                        _resolve_source = "gamma_api"
+                    elif _wt_outcome in ("NO", "DOWN") and _g_no:
+                        _resolved_token = str(_g_no)
+                        _resolve_source = "gamma_api"
+                    # Populate market_cache so future ticks skip this API call.
+                    if _g_yes or _g_no:
+                        try:
+                            supabase.table("market_cache").upsert(
+                                {
+                                    "market_slug":   _wt_slug,
+                                    "yes_token_id":  _g_yes or None,
+                                    "no_token_id":   _g_no  or None,
+                                },
+                                on_conflict="market_slug",
+                            ).execute()
+                            logging.info(
+                                "COPY_LIVE_TOKEN_GAMMA_CACHE_POPULATED "
+                                "slug=%s yes=%s no=%s",
+                                _wt_slug,
+                                str(_g_yes)[:16] if _g_yes else "none",
+                                str(_g_no)[:16]  if _g_no  else "none",
+                            )
+                        except Exception as _cp_exc:
+                            logging.warning(
+                                "COPY_LIVE_TOKEN_GAMMA_CACHE_FAIL slug=%s err=%s",
+                                _wt_slug, _cp_exc,
+                            )
+            except Exception as _gamma_exc:
+                logging.warning(
+                    "COPY_LIVE_TOKEN_GAMMA_API_FAIL bot=%s trade=%s "
+                    "slug=%s err=%s",
+                    _bot_name, _trade_id, _wt_slug, _gamma_exc,
                 )
 
         if _resolved_token:
@@ -6674,10 +6725,13 @@ def evaluate_and_execute_live_copy_trade(
             logging.warning(
                 "COPY_LIVE_TOKEN_RESOLVE_FAIL bot=%s trade=%s "
                 "slug=%s outcome=%s current_slug=%s "
-                "— no token found via current_slug globals or market_cache; "
-                "trade will proceed to gate checks without token_id",
+                "token_id_present=%s condition_id_present=%s "
+                "sources_tried=%s "
+                "— all resolution sources exhausted; gates will block this trade",
                 _bot_name, _trade_id,
                 _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
+                bool(wallet_trade.get("token_id")), bool(_wt_cond_id),
+                _sources_tried,
             )
 
     # ── Gate L8: global live hourly cap ──────────────────────────────────────
@@ -6729,13 +6783,17 @@ def evaluate_and_execute_live_copy_trade(
     # ── Gate LB: token_id required for live BUY ──────────────────────────────
     # The shared brain allows market_slug as a fallback for paper matching.
     # Live BUY CLOB orders always need a token_id; missing token_id here means
-    # the market is not CLOB-tradeable.  L10 (below) still guards SELL orders.
+    # all resolution sources were exhausted.  L10 (below) still guards SELLs.
     if trade_side in ("BUY", "") and not wallet_trade.get("token_id"):
         logging.warning(
-            "COPY_LIVE_GATE_TOKEN_ID_FAIL bot=%s trade=%s "
-            "reason=live_token_id_missing slug=%s",
+            "COPY_LIVE_SKIP_TOKEN_ID_MISSING bot=%s trade=%s "
+            "reason=live_token_id_missing slug=%s outcome=%s "
+            "token_id_present=%s condition_id_present=%s",
             _bot_name, _trade_id,
             str(wallet_trade.get("market_slug") or "?"),
+            str(wallet_trade.get("outcome") or "?"),
+            bool(wallet_trade.get("token_id")),
+            bool(wallet_trade.get("condition_id")),
         )
         return False, "live_token_id_missing", None, None, {}
 
@@ -6757,12 +6815,18 @@ def evaluate_and_execute_live_copy_trade(
 
     # ── Gate L10: token_id required for CLOB ─────────────────────────────────
     # The shared brain allows market_slug as fallback for paper matching.
-    # Live CLOB orders always need a token_id.
+    # Live CLOB orders (BUY and SELL) always need a token_id.
     token_id = wallet_trade.get("token_id")
     if not token_id:
         logging.warning(
-            "COPY_LIVE_GATE_L10_FAIL bot=%s trade=%s reason=token_id_missing_for_clob",
-            _bot_name, _trade_id,
+            "COPY_LIVE_SKIP_INSUFFICIENT_MARKET_DATA bot=%s trade=%s "
+            "reason=token_id_missing_for_clob side=%s slug=%s outcome=%s "
+            "token_id_present=%s condition_id_present=%s",
+            _bot_name, _trade_id, trade_side,
+            str(wallet_trade.get("market_slug") or "?"),
+            str(wallet_trade.get("outcome") or "?"),
+            bool(wallet_trade.get("token_id")),
+            bool(wallet_trade.get("condition_id")),
         )
         return False, "insufficient_market_data", None, None, {}
 
