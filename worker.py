@@ -5780,19 +5780,47 @@ def insert_wallet_trade_if_new(trade_row: dict) -> bool:
     Insert a wallet_trade row if (wallet_address, source_trade_id) is new.
     Returns True if inserted, False if duplicate or error.
     wallet_trades is append-only — we never update existing rows.
+
+    Uses upsert with ignore_duplicates=True so Supabase returns HTTP 200
+    with empty data on conflict instead of a noisy HTTP 409.  The empty-data
+    path is detected and logged as WALLET_TRADE_DUPLICATE_SKIPPED.
     """
+    _wallet_short = str(trade_row.get("wallet_address") or "")[:16]
+    _trade_id     = str(trade_row.get("source_trade_id") or "")[:24]
+    _slug         = trade_row.get("market_slug") or "?"
+    _side         = trade_row.get("side") or "?"
     try:
-        resp = supabase.table("wallet_trades").insert(trade_row).execute()
-        return bool(resp.data)
+        resp = (
+            supabase.table("wallet_trades")
+            .upsert(
+                trade_row,
+                on_conflict="wallet_address,source_trade_id",
+                ignore_duplicates=True,
+            )
+            .execute()
+        )
+        if not resp.data:
+            # Duplicate: row already exists — expected, safe, intentional.
+            logging.info(
+                "WALLET_TRADE_DUPLICATE_SKIPPED wallet=%s trade_id=%s "
+                "slug=%s side=%s reason=already_exists",
+                _wallet_short, _trade_id, _slug, _side,
+            )
+            return False
+        return True
     except Exception as exc:
         exc_str = str(exc).lower()
         if any(kw in exc_str for kw in ("duplicate", "unique", "23505", "conflict")):
-            return False  # expected dedup — not an error
+            # Safety-net: upsert still raised a conflict exception.
+            logging.info(
+                "WALLET_TRADE_DUPLICATE_SKIPPED wallet=%s trade_id=%s "
+                "slug=%s side=%s reason=already_exists",
+                _wallet_short, _trade_id, _slug, _side,
+            )
+            return False
         logging.warning(
             "COPY_INSERT_WALLET_TRADE_FAIL wallet=%s trade_id=%s err=%s",
-            str(trade_row.get("wallet_address", ""))[:10],
-            str(trade_row.get("source_trade_id", ""))[:20],
-            exc,
+            _wallet_short, _trade_id, exc,
         )
         return False
 
