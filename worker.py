@@ -7005,6 +7005,29 @@ def evaluate_and_execute_live_copy_trade(
         # This starts the cooldown window so the next loop tick won't pile up.
         _live_exit_attempt_ts[str(token_id)] = _now_ts
 
+    # ── BUY-only pre-submit guard: min $1 marketable amount ──────────────────
+    # Polymarket rejects marketable BUY orders where price × shares < $1.
+    # Replicate the slippage-adjusted price formula used in submit_copy_live_order
+    # so we can pre-flight this check before any API call or order signing.
+    if order_side == "BUY":
+        _buy_limit_price = min(source_price * (1.0 + max_slippage), 0.99)
+        _buy_proj_shares = final_size / _buy_limit_price if _buy_limit_price > 0 else 0.0
+        _buy_proj_amount = _buy_limit_price * _buy_proj_shares
+        if _buy_proj_amount < 1.0:
+            logging.warning(
+                "COPY_LIVE_ENTRY_BELOW_MIN_AMOUNT bot=%s slug=%s "
+                "token_id=%s side=BUY price=%.4f size_usd=%.2f "
+                "projected_amount=%.4f "
+                "— skipping CLOB submit; CLOB rejects with "
+                "'invalid amount for a marketable BUY order'",
+                _bot_name,
+                str(wallet_trade.get("market_slug") or "?"),
+                str(token_id),
+                source_price, final_size,
+                _buy_proj_amount,
+            )
+            return False, "live_entry_below_min_amount", final_size, source_price, {}
+
     # Pre-submission log: full token_id + exact OrderArgs context, entry vs exit.
     # NOTE: for SELL (exit) orders the 'size' passed to submit_copy_live_order is
     # a USD amount (from compute_copy_size) which is divided by the slippage-
