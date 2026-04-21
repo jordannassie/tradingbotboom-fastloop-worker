@@ -365,6 +365,11 @@ COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",     
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
 
+# Seconds to suppress duplicate SELL exit submissions for the same CLOB token.
+# Prevents "not enough balance" rejections caused by a pending exit order still
+# reserving CLOB collateral from a previous loop tick.  Override via env var.
+COPY_LIVE_EXIT_COOLDOWN_SEC    = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_SEC",     "90"))
+
 
 # ── 20. Leaderboard wallet discovery config ────────────────────────────────────
 #

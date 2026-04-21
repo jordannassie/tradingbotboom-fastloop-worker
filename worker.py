@@ -6356,6 +6356,12 @@ def _get_copy_buy_lock(mode: str) -> asyncio.Lock:
 # Separate from copy_bot_trade_timestamps (which is per-bot).
 copy_live_trade_timestamps: deque = deque()
 
+# In-memory TTL: token_id → Unix timestamp of the last live SELL exit submission.
+# Used to suppress duplicate SELL exit submits while a previous attempt's order
+# is still pending on the CLOB and reserving collateral/balance.
+# Entries are never actively pruned (bounded by COPY_LIVE_MAX_OPEN_POSITIONS = 3).
+_live_exit_attempt_ts: dict[str, float] = {}
+
 
 def _prune_live_copy_history() -> None:
     """Prune in-memory live copy timestamps older than 1 hour."""
@@ -6942,6 +6948,53 @@ def evaluate_and_execute_live_copy_trade(
     order_side   = trade_side if trade_side in ("BUY", "SELL") else "BUY"
     source_price = submitted_price  # validated by shared brain
     _order_kind  = "exit" if order_side == "SELL" else "entry"
+
+    # ── SELL-only pre-submit guards (BUY entry path is unaffected) ────────────
+    if order_side == "SELL":
+        _now_ts = time()
+
+        # Guard SE-1: pending exit cooldown.
+        # If a SELL for this token was submitted within COPY_LIVE_EXIT_COOLDOWN_SEC
+        # the previous order is likely still pending on the CLOB, reserving
+        # collateral.  Submitting again causes "not enough balance / allowance"
+        # rejections.  Skip until the cooldown window has elapsed.
+        _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
+        _elapsed   = int(_now_ts - _last_exit)
+        if _elapsed < COPY_LIVE_EXIT_COOLDOWN_SEC:
+            logging.warning(
+                "COPY_LIVE_EXIT_ALREADY_PENDING bot=%s trade=%s slug=%s "
+                "token_id=%s side=SELL size_usd=%.2f "
+                "elapsed_sec=%s cooldown_sec=%s "
+                "— skipping; previous exit may still be reserving CLOB balance",
+                _bot_name, _trade_id,
+                str(wallet_trade.get("market_slug") or "?"),
+                str(token_id)[:20], final_size,
+                _elapsed, COPY_LIVE_EXIT_COOLDOWN_SEC,
+            )
+            return False, "live_exit_already_pending", final_size, source_price, {}
+
+        # Guard SE-2: projected share size below CLOB minimum (MIN_ORDER_SHARES = 5).
+        # Replicate the slippage-adjusted price formula from submit_copy_live_order
+        # so we can pre-flight this check before any API call or order signing.
+        _sell_limit_price  = max(source_price * (1.0 - max_slippage), 0.01)
+        _sell_proj_shares  = final_size / _sell_limit_price if _sell_limit_price > 0 else 0.0
+        if _sell_proj_shares < MIN_ORDER_SHARES:
+            logging.warning(
+                "COPY_LIVE_EXIT_BELOW_MIN_SIZE bot=%s trade=%s slug=%s "
+                "token_id=%s side=SELL price=%.4f size_usd=%.2f "
+                "projected_shares=%.4f min_shares=%.1f "
+                "— skipping CLOB submit; CLOB would reject with 'Size lower than minimum'",
+                _bot_name, _trade_id,
+                str(wallet_trade.get("market_slug") or "?"),
+                str(token_id)[:20],
+                _sell_limit_price, final_size,
+                _sell_proj_shares, MIN_ORDER_SHARES,
+            )
+            return False, "live_exit_below_min_size", final_size, source_price, {}
+
+        # Both guards passed — record this attempt timestamp before submitting.
+        # This starts the cooldown window so the next loop tick won't pile up.
+        _live_exit_attempt_ts[str(token_id)] = _now_ts
 
     # Pre-submission log: full token_id + exact OrderArgs context, entry vs exit.
     # NOTE: for SELL (exit) orders the 'size' passed to submit_copy_live_order is
