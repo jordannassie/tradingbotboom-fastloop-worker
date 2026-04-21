@@ -6379,38 +6379,68 @@ def get_live_open_positions_count(live_bot_ids: list[str]) -> int:
     """
     Count OPEN copied_positions that belong to LIVE-mode copy bots.
 
-    Scoped to raw_json->>'mode' = 'LIVE' rows only so that paper positions
-    accumulated by the same bot (when it was running in paper mode) do not
-    inflate the live open count and falsely trigger Gate L9.
+    Primary query scopes to raw_json->>'mode' = 'LIVE' rows so that paper
+    positions accumulated before arm_live was set do not inflate the count.
 
-    Returns 999 on any DB failure as a fail-safe to block further live orders.
+    If the JSON-path filter raises (e.g. PostgREST version or JSONB mismatch),
+    falls back to an unfiltered query rather than returning 999.  The fallback
+    count may include paper rows and is logged with a warning so the operator
+    can investigate.  Returns 999 only if both queries fail.
     """
     if not live_bot_ids:
         return 0
-    logging.info(
-        "COPY_LIVE_OPEN_COUNT_SCOPE scope=live_mode_only "
-        "live_bots=%s filters=status=OPEN+raw_json_mode=LIVE",
-        len(live_bot_ids),
-    )
+
+    # ── Primary: raw_json->>'mode' = 'LIVE' scoped count ──────────────────────
     try:
         resp = (
             supabase.table("copied_positions")
-            .select("id")
+            .select("id, market_slug")
             .in_("copy_bot_id", live_bot_ids)
             .eq("status", "OPEN")
             .filter("raw_json->>mode", "eq", "LIVE")
             .execute()
         )
-        count = len(resp.data or [])
+        rows  = resp.data or []
+        count = len(rows)
         logging.info(
             "COPY_LIVE_OPEN_COUNT_RESULT scope=live_mode_only "
             "live_bots=%s open_live_count=%s",
             len(live_bot_ids), count,
         )
+        if count >= COPY_LIVE_MAX_OPEN_POSITIONS:
+            _slugs = [r.get("market_slug") or r.get("id") for r in rows]
+            logging.warning(
+                "COPY_LIVE_OPEN_POSITIONS_BLOCKING live_bots=%s count=%s max=%s "
+                "blocking_positions=%s — check DB for stale open rows",
+                len(live_bot_ids), count, COPY_LIVE_MAX_OPEN_POSITIONS, _slugs,
+            )
         return count
+    except Exception as _mode_exc:
+        logging.warning(
+            "COPY_LIVE_OPEN_COUNT_MODE_FILTER_FAIL live_bots=%s err=%s "
+            "— retrying without mode filter; result may include paper positions",
+            len(live_bot_ids), _mode_exc,
+        )
+
+    # ── Fallback: unfiltered count (paper + live positions) ───────────────────
+    try:
+        resp_fb = (
+            supabase.table("copied_positions")
+            .select("id")
+            .in_("copy_bot_id", live_bot_ids)
+            .eq("status", "OPEN")
+            .execute()
+        )
+        count_fb = len(resp_fb.data or [])
+        logging.warning(
+            "COPY_LIVE_OPEN_COUNT_FALLBACK scope=all_modes "
+            "live_bots=%s open_count=%s — includes paper rows if any",
+            len(live_bot_ids), count_fb,
+        )
+        return count_fb
     except Exception:
         logging.exception("COPY_LIVE_OPEN_POS_COUNT_FAIL")
-        return 999  # fail-safe: block orders when count is unknown
+        return 999  # fail-safe: block orders when count is completely unknown
 
 
 def get_live_open_exposure(live_bot_ids: list[str]) -> float:
@@ -6544,10 +6574,14 @@ def _check_live_account_ready() -> "tuple[bool, str]":
     """
     if not live_signer_address:
         return False, "proxy_wallet_not_initialized"
-    if live_allowance_cache is None or live_allowance_cache <= 0:
-        return False, "usdc_allowance_zero_or_unknown"
-    if live_balance_cache is None or live_balance_cache <= 0:
-        return False, "usdc_balance_zero_or_unknown"
+    # None means the live_balance_loop hasn't refreshed yet — allow through so a
+    # cold-start worker can still attempt live orders; the CLOB will reject if the
+    # account truly has no funds.  Only block if the cache was fetched and is
+    # explicitly zero (approval revoked / account empty).
+    if live_allowance_cache is not None and live_allowance_cache <= 0:
+        return False, "usdc_allowance_zero"
+    if live_balance_cache is not None and live_balance_cache <= 0:
+        return False, "usdc_balance_zero"
     return True, ""
 
 
@@ -6682,6 +6716,18 @@ def evaluate_and_execute_live_copy_trade(
                     elif _wt_outcome in ("NO", "DOWN") and _g_no:
                         _resolved_token = str(_g_no)
                         _resolve_source = "gamma_api"
+                    else:
+                        # Gamma found the market but has no clobTokenId for this
+                        # outcome — market may be resolved, not yet in CLOB, or
+                        # outcome label doesn't match YES/NO/UP/DOWN.
+                        logging.warning(
+                            "COPY_LIVE_TOKEN_GAMMA_NO_CLOB_TOKEN bot=%s trade=%s "
+                            "slug=%s outcome=%s gamma_yes_present=%s gamma_no_present=%s "
+                            "gamma_resolved=%s gamma_active=%s",
+                            _bot_name, _trade_id, _wt_slug, _wt_outcome,
+                            bool(_g_yes), bool(_g_no),
+                            _gd.get("resolved"), _gd.get("active"),
+                        )
                     # Populate market_cache so future ticks skip this API call.
                     if _g_yes or _g_no:
                         try:
@@ -6896,10 +6942,19 @@ def evaluate_and_execute_live_copy_trade(
         max_slippage,
     )
     if not ok:
+        _err_detail = (
+            raw_response.get("errorMsg")
+            or raw_response.get("error")
+            or raw_response.get("message")
+            or raw_response.get("errorCode")
+            or str(raw_response)[:300]
+        )
         logging.warning(
-            "COPY_LIVE_ORDER_FAIL bot=%s trade=%s "
-            "reason=order_submission_failed raw_response=%r",
-            _bot_name, _trade_id, str(raw_response)[:200],
+            "COPY_LIVE_ORDER_SUBMIT_FAIL bot=%s trade=%s "
+            "token_id=%s side=%s size=%.2f price=%.4f error=%s",
+            _bot_name, _trade_id,
+            str(token_id)[:20], order_side, final_size, source_price,
+            str(_err_detail)[:200],
         )
         return False, "order_submission_failed", final_size, source_price, raw_response
 
