@@ -6963,22 +6963,30 @@ def evaluate_and_execute_live_copy_trade(
         _now_ts = time()
 
         # Guard SE-1: pending exit cooldown.
-        # If a SELL for this token was submitted within COPY_LIVE_EXIT_COOLDOWN_SEC
-        # the previous order is likely still pending on the CLOB, reserving
+        # If a SELL for this token was submitted within the cooldown window the
+        # previous order is likely still pending on the CLOB, reserving
         # collateral.  Submitting again causes "not enough balance / allowance"
         # rejections.  Skip until the cooldown window has elapsed.
+        # Fast 5-minute up/down markets (btc/eth/sol/xrp-updown-5m) use a
+        # shorter window so timely exits are not blocked.
+        _exit_slug     = str(wallet_trade.get("market_slug") or "")
+        _is_fast_market = _exit_slug in COPY_LIVE_EXIT_FAST_MARKET_SLUGS
+        _exit_cooldown  = (
+            COPY_LIVE_EXIT_COOLDOWN_FAST_SEC if _is_fast_market
+            else COPY_LIVE_EXIT_COOLDOWN_SEC
+        )
         _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
         _elapsed   = int(_now_ts - _last_exit)
-        if _elapsed < COPY_LIVE_EXIT_COOLDOWN_SEC:
+        if _elapsed < _exit_cooldown:
             logging.warning(
                 "COPY_LIVE_EXIT_ALREADY_PENDING bot=%s trade=%s slug=%s "
                 "token_id=%s side=SELL size_usd=%.2f "
-                "elapsed_sec=%s cooldown_sec=%s "
+                "elapsed_sec=%s cooldown_sec=%s fast_market=%s "
                 "— skipping; previous exit may still be reserving CLOB balance",
                 _bot_name, _trade_id,
-                str(wallet_trade.get("market_slug") or "?"),
+                _exit_slug or "?",
                 str(token_id)[:20], final_size,
-                _elapsed, COPY_LIVE_EXIT_COOLDOWN_SEC,
+                _elapsed, _exit_cooldown, _is_fast_market,
             )
             return False, "live_exit_already_pending", final_size, source_price, {}
 
@@ -10406,14 +10414,20 @@ def _try_pre_expiry_live_exit_sync(
 
     # Guard: reuse SE-1 exit cooldown (avoids stacking if this position's
     # SELL is still pending from an earlier copy_trade_loop SELL mirror).
+    # Fast 5-minute up/down markets use a shorter window.
     _now_ts    = time()
     _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
-    if _now_ts - _last_exit < COPY_LIVE_EXIT_COOLDOWN_SEC:
+    _pre_is_fast    = str(pos_slug) in COPY_LIVE_EXIT_FAST_MARKET_SLUGS
+    _pre_cooldown   = (
+        COPY_LIVE_EXIT_COOLDOWN_FAST_SEC if _pre_is_fast
+        else COPY_LIVE_EXIT_COOLDOWN_SEC
+    )
+    if _now_ts - _last_exit < _pre_cooldown:
         logging.warning(
             "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
-            "reason=exit_cooldown_active elapsed_sec=%s cooldown_sec=%s",
+            "reason=exit_cooldown_active elapsed_sec=%s cooldown_sec=%s fast_market=%s",
             pos_id[:8], pos_slug,
-            int(_now_ts - _last_exit), COPY_LIVE_EXIT_COOLDOWN_SEC,
+            int(_now_ts - _last_exit), _pre_cooldown, _pre_is_fast,
         )
         _pre_expiry_attempted_positions.add(pos_id)
         return True

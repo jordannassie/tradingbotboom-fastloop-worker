@@ -370,6 +370,18 @@ COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR", 
 # reserving CLOB collateral from a previous loop tick.  Override via env var.
 COPY_LIVE_EXIT_COOLDOWN_SEC    = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_SEC",     "90"))
 
+# Shorter cooldown for fast 5-minute up/down markets where the 90s default
+# blocks timely exits.  Applied when the market slug is in the fast-market set.
+COPY_LIVE_EXIT_COOLDOWN_FAST_SEC = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_FAST_SEC", "20"))
+
+# Slugs that use COPY_LIVE_EXIT_COOLDOWN_FAST_SEC instead of the default.
+COPY_LIVE_EXIT_FAST_MARKET_SLUGS: frozenset[str] = frozenset({
+    "btc-updown-5m",
+    "eth-updown-5m",
+    "sol-updown-5m",
+    "xrp-updown-5m",
+})
+
 
 # ── 20. Leaderboard wallet discovery config ────────────────────────────────────
 #
