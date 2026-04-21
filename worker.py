@@ -8802,13 +8802,14 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                     # If already at or above cap, all new BUY attempts this
                     # cycle are skipped immediately.  SELL/CLOSE trades are
                     # never affected by this flag.
+                    # Uses the same RPC as the DB trigger for consistency.
                     _paper_cap_locked = False
                     if not _effective_live:
                         _loop_cap = float(
                             global_settings.get("paper_max_exposure_usd") or 0
                         )
                         if _loop_cap > 0:
-                            _loop_exposure = _get_paper_exposure_simple()
+                            _loop_exposure = get_copy_open_exposure_for_mode("paper")
                             if _loop_exposure >= _loop_cap:
                                 _paper_cap_locked = True
                                 logging.warning(
@@ -8917,17 +8918,50 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     )
                                 else:
                                     # BUY: paper-specific exposure hard guard.
-                                    # Re-reads live DB so stale values can't bypass cap.
+                                    # Uses get_copy_open_exposure_for_mode (RPC) so
+                                    # the pre-check scope exactly matches the DB
+                                    # trigger scope — eliminating COPY_BUY_ALLOWED
+                                    # followed by exposure_cap_exceeded mismatches.
                                     _pg_cap  = float(
                                         global_settings.get("paper_max_exposure_usd") or 0
                                     )
-                                    _pg_exp  = _get_paper_exposure_simple()
+                                    logging.info(
+                                        "COPY_PAPER_EXPOSURE_SCOPE mode=paper "
+                                        "wallet=%s bot=%s "
+                                        "scope=rpc:copy_open_exposure_for_mode "
+                                        "filter=p_mode=paper cap=%.2f",
+                                        wallet_label, bot_label, _pg_cap,
+                                    )
+                                    _pg_exp  = get_copy_open_exposure_for_mode("paper")
                                     _pg_proj = round(
                                         _pg_exp + (submitted_size or 0.0), 4
+                                    )
+                                    logging.info(
+                                        "COPY_PAPER_EXPOSURE_RESULT mode=paper "
+                                        "wallet=%s bot=%s "
+                                        "current=%.4f proposed=%.4f "
+                                        "projected=%.4f cap=%.2f",
+                                        wallet_label, bot_label,
+                                        _pg_exp, submitted_size or 0.0,
+                                        _pg_proj,
+                                        _pg_cap if _pg_cap > 0 else float("inf"),
                                     )
                                     _should_open = (
                                         _pg_cap <= 0           # unlimited
                                         or _pg_proj <= _pg_cap # within cap
+                                    )
+                                    logging.log(
+                                        logging.WARNING if not _should_open
+                                        else logging.INFO,
+                                        "COPY_PAPER_PREGUARD_DECISION mode=paper "
+                                        "wallet=%s bot=%s "
+                                        "current=%.4f proposed=%.4f "
+                                        "projected=%.4f cap=%.2f decision=%s",
+                                        wallet_label, bot_label,
+                                        _pg_exp, submitted_size or 0.0,
+                                        _pg_proj,
+                                        _pg_cap if _pg_cap > 0 else float("inf"),
+                                        "blocked" if not _should_open else "allowed",
                                     )
                                     if not _should_open:
                                         logging.warning(
