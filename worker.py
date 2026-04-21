@@ -6251,7 +6251,7 @@ def get_copy_open_exposure_for_mode(mode: str) -> float:
     """
     try:
         resp = supabase.rpc(
-            "copy_open_exposure_for_mode", {"mode": mode.lower()}
+            "copy_open_exposure_for_mode", {"p_mode": mode.lower()}
         ).execute()
         val = resp.data
 
@@ -6567,16 +6567,19 @@ def evaluate_and_execute_live_copy_trade(
 
     # ── Token-ID resolution (pre-gate) ───────────────────────────────────────
     # wallet_trade.token_id may be null when the Polymarket Data API omits it
-    # for recent trades, or when the 5m market token rotated between the
-    # source wallet's trade and our evaluation window.
+    # for recent trades, or when a market token rotated between the source
+    # wallet's trade and our evaluation window.
     #
-    # For BTC/ETH/SOL/XRP up-down 5m markets the worker already holds the
-    # current YES/NO tokens in the globals current_yes_token / current_no_token
-    # (kept live by rotate_loop + market_listener WebSocket).  If the trade's
-    # market_slug matches the current market slug we can inject the correct token
-    # before any gate inspects wallet_trade.token_id.
+    # Resolution order (additive — no change if token_id already present):
+    #   Source 1: current_slug globals — fastest, no DB round-trip.
+    #             Applies only when market_slug == current_slug (current 5m window).
+    #   Source 2: market_cache DB lookup — covers 15m markets, non-current 5m
+    #             slugs, and any other market the worker has already seen.
+    #             Uses exact slug match only; never borrows a token from a
+    #             different market.
     #
-    # No change is made if token_id is already populated — this is additive only.
+    # If both sources fail the trade continues without token_id and Gate LB /
+    # Gate L10 will block it as before.
     if not wallet_trade.get("token_id"):
         _wt_slug    = str(wallet_trade.get("market_slug") or "")
         _wt_outcome = str(wallet_trade.get("outcome") or "").upper()
@@ -6589,26 +6592,58 @@ def evaluate_and_execute_live_copy_trade(
             bool(current_yes_token), bool(current_no_token),
         )
         _resolved_token: str | None = None
+        _resolve_source = "none"
+
+        # Source 1: current slug globals (no DB call)
         if _wt_slug and current_slug and _wt_slug == current_slug:
             if _wt_outcome in ("YES", "UP") and current_yes_token:
                 _resolved_token = current_yes_token
+                _resolve_source = "current_slug"
             elif _wt_outcome in ("NO", "DOWN") and current_no_token:
                 _resolved_token = current_no_token
+                _resolve_source = "current_slug"
+
+        # Source 2: market_cache exact-slug lookup (covers 15m, rotated 5m, etc.)
+        if not _resolved_token and _wt_slug:
+            try:
+                _mc_resp = (
+                    supabase.table("market_cache")
+                    .select("yes_token_id, no_token_id")
+                    .eq("market_slug", _wt_slug)
+                    .limit(1)
+                    .execute()
+                )
+                _mc_rows = _mc_resp.data or []
+                if _mc_rows:
+                    _mc = _mc_rows[0]
+                    if _wt_outcome in ("YES", "UP") and (_mc.get("yes_token_id") or ""):
+                        _resolved_token = str(_mc["yes_token_id"])
+                        _resolve_source = "market_cache"
+                    elif _wt_outcome in ("NO", "DOWN") and (_mc.get("no_token_id") or ""):
+                        _resolved_token = str(_mc["no_token_id"])
+                        _resolve_source = "market_cache"
+            except Exception as _mc_exc:
+                logging.warning(
+                    "COPY_LIVE_TOKEN_MARKET_CACHE_FAIL bot=%s trade=%s "
+                    "slug=%s err=%s — market_cache lookup failed; "
+                    "falling through to gate check",
+                    _bot_name, _trade_id, _wt_slug, _mc_exc,
+                )
 
         if _resolved_token:
             # Shallow-copy the dict so the caller's reference is unchanged.
             wallet_trade = {**wallet_trade, "token_id": _resolved_token}
             logging.info(
                 "COPY_LIVE_TOKEN_RESOLVE_OK bot=%s trade=%s "
-                "slug=%s outcome=%s resolved_token=%s",
+                "slug=%s outcome=%s resolved_token=%s source=%s",
                 _bot_name, _trade_id,
-                _wt_slug, _wt_outcome, str(_resolved_token)[:20],
+                _wt_slug, _wt_outcome, str(_resolved_token)[:20], _resolve_source,
             )
         else:
             logging.warning(
                 "COPY_LIVE_TOKEN_RESOLVE_FAIL bot=%s trade=%s "
                 "slug=%s outcome=%s current_slug=%s "
-                "— slug mismatch or outcome not recognised; "
+                "— no token found via current_slug globals or market_cache; "
                 "trade will proceed to gate checks without token_id",
                 _bot_name, _trade_id,
                 _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
