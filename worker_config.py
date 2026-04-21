@@ -424,3 +424,107 @@ EMA_5M_SLUG_PREFIX          = os.getenv("EMA_5M_SLUG_PREFIX",              "btc-
 EMA_5M_ENTRY_CUTOFF_SECONDS = int(os.getenv("EMA_5M_ENTRY_CUTOFF_SECONDS", "30"))
 EMA_5M_BOT_ID               = os.getenv("EMA_5M_BOT_ID",                   "btc_5m_ema")
 EMA_5M_STRATEGY_ID          = "EMA_5M_BTC"  # constant — not configurable
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — FAST-TURNOVER COPY ENGINE CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# These constants define the RECOMMENDED paper rollout profile for fast-copy
+# testing.  They are NOT enforced globally — they are reference values for
+# operators to use when configuring individual copy_bots rows in Supabase.
+#
+# Apply to copy_bots rows via the Supabase table editor (or SQL UPDATE).
+# Do NOT set these in Railway env vars — they are per-bot DB settings.
+#
+# ── PAPER FAST-COPY TEST PROFILE ─────────────────────────────────────────────
+# Recommended per-bot settings for a safe paper fast-copy rollout:
+#
+#   max_wallets_per_bot      = 5–10   (track 5–10 source wallets per copy bot)
+#   max_open_positions       = 1      (at most 1 open position per wallet)
+#   default_position_size    = 5.0    (small fixed size — $5 paper per trade)
+#   fast_markets_only        = true   (only copy FAST_MARKET trades)
+#   require_fast_copy        = true   (only copy FAST_COPY wallets)
+#   block_blocked_markets    = true   (always block sports/politics)
+#   max_entry_age_minutes    = 4      (skip BUY if trade > 4 min old)
+#   exit_mode                = auto_profit_max_hold
+#   take_profit_pct          = 25     (close at +25% profit)
+#   max_hold_minutes         = 60     (force-close after 60 minutes)
+#
+# These are named reference constants only — do not use them in code directly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PAPER_FAST_COPY_PROFILE_MAX_OPEN_POSITIONS  = 1
+PAPER_FAST_COPY_PROFILE_POSITION_SIZE_USD   = 5.0
+PAPER_FAST_COPY_PROFILE_MAX_ENTRY_AGE_MIN   = 4
+PAPER_FAST_COPY_PROFILE_TAKE_PROFIT_PCT     = 25.0
+PAPER_FAST_COPY_PROFILE_MAX_HOLD_MINUTES    = 60.0
+PAPER_FAST_COPY_PROFILE_EXIT_MODE          = "auto_profit_max_hold"
+
+
+# ── COPY CLOSE REASON CONSTANTS ───────────────────────────────────────────────
+# Standard close_reason values written to copied_positions.raw_json["close_reason"]
+# and (when the column exists) to copied_positions.close_reason.
+# These are used by all three close paths (source-exit, auto-exit, settlement).
+# Adding a new path? Use one of these constants — do not free-form the string.
+
+CLOSE_REASON_SOURCE_WALLET_EXIT   = "source_wallet_exit"
+CLOSE_REASON_AUTO_PROFIT          = "auto_profit"
+CLOSE_REASON_MAX_HOLD             = "max_hold"
+CLOSE_REASON_SETTLED_MARKET       = "settled_market"
+CLOSE_REASON_MANUAL_RESET         = "manual_reset"
+CLOSE_REASON_CLOSE_FAILED_RETRY   = "close_failed_retrying"
+CLOSE_REASON_CLOSE_FAILED_FINAL   = "close_failed_final"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — SUPABASE MIGRATION REFERENCE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Run these SQL statements in the Supabase SQL editor BEFORE enabling Phase 2
+# features.  All statements use ADD COLUMN IF NOT EXISTS — safe to re-run.
+#
+# MIGRATION BLOCK (copy and paste into Supabase SQL editor):
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# -- market_cache: market classification
+# ALTER TABLE public.market_cache
+#   ADD COLUMN IF NOT EXISTS market_class text NOT NULL DEFAULT 'UNKNOWN';
+# CREATE INDEX IF NOT EXISTS idx_market_cache_class
+#   ON public.market_cache (market_class);
+#
+# -- wallet_metrics: fast-turnover scoring fields
+# ALTER TABLE public.wallet_metrics
+#   ADD COLUMN IF NOT EXISTS wallet_class          text    NOT NULL DEFAULT 'UNSCORABLE',
+#   ADD COLUMN IF NOT EXISTS median_hold_minutes   numeric,
+#   ADD COLUMN IF NOT EXISTS pct_under_15min       numeric,
+#   ADD COLUMN IF NOT EXISTS pct_under_30min       numeric,
+#   ADD COLUMN IF NOT EXISTS recent_closed_count   int     NOT NULL DEFAULT 0;
+# CREATE INDEX IF NOT EXISTS idx_wallet_metrics_class
+#   ON public.wallet_metrics (wallet_class);
+#
+# -- copy_bots: per-bot fast-copy feature flags (all optional, all safe defaults)
+# ALTER TABLE public.copy_bots
+#   ADD COLUMN IF NOT EXISTS block_blocked_markets  boolean NOT NULL DEFAULT true,
+#   ADD COLUMN IF NOT EXISTS fast_markets_only      boolean NOT NULL DEFAULT false,
+#   ADD COLUMN IF NOT EXISTS require_fast_copy      boolean NOT NULL DEFAULT false,
+#   ADD COLUMN IF NOT EXISTS max_entry_age_minutes  int     NOT NULL DEFAULT 0;
+#
+# -- copied_positions: standardized close reason column
+# ALTER TABLE public.copied_positions
+#   ADD COLUMN IF NOT EXISTS close_reason text;
+# CREATE INDEX IF NOT EXISTS idx_copied_positions_close_reason
+#   ON public.copied_positions (close_reason)
+#   WHERE close_reason IS NOT NULL;
+#
+# ── VERIFY MIGRATION ─────────────────────────────────────────────────────────
+# SELECT column_name, data_type, column_default
+# FROM information_schema.columns
+# WHERE table_name IN ('market_cache','wallet_metrics','copy_bots','copied_positions')
+#   AND column_name IN (
+#     'market_class','wallet_class','median_hold_minutes','pct_under_15min',
+#     'pct_under_30min','recent_closed_count','block_blocked_markets',
+#     'fast_markets_only','require_fast_copy','max_entry_age_minutes','close_reason'
+#   )
+# ORDER BY table_name, column_name;
+# ══════════════════════════════════════════════════════════════════════════════

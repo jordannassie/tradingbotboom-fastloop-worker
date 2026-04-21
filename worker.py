@@ -5796,6 +5796,87 @@ def insert_wallet_trade_if_new(trade_row: dict) -> bool:
         return False
 
 
+# ── Market classification ─────────────────────────────────────────────────────
+#
+# classify_market() assigns a class to a Polymarket market based on slug/title
+# alone — no DB query required.  The class is stored in market_cache.market_class
+# (column must be added via migration; see Phase 2 migration notes below).
+#
+# Classes:
+#   FAST_MARKET    — short-duration crypto up/down prediction markets
+#   SLOW_MARKET    — long-dated / monthly resolution markets
+#   BLOCKED_MARKET — sports, esports, politics (blocked for copy trading)
+#   UNKNOWN        — anything not confidently classified
+#
+# Rules are intentionally conservative: when in doubt, return UNKNOWN rather
+# than FAST so the new gates in evaluate_copy_trade_shared don't over-block.
+#
+# Phase 2 migration: ALTER TABLE market_cache ADD COLUMN IF NOT EXISTS
+#   market_class text DEFAULT 'UNKNOWN';
+
+_FAST_MARKET_SLUG_PREFIXES: tuple[str, ...] = (
+    "btc-updown-", "eth-updown-", "sol-updown-", "xrp-updown-",
+    "btc-up-", "eth-up-", "sol-up-", "xrp-up-",
+    "bitcoin-up", "ethereum-up", "solana-up",
+)
+_FAST_MARKET_SLUG_CONTAINS: tuple[str, ...] = (
+    "updown", "up-down", "higher-or-lower", "above-or-below",
+    "will-btc", "will-eth", "will-sol", "will-xrp",
+    "btc-price", "eth-price", "sol-price",
+)
+_SLOW_MARKET_KEYWORDS: tuple[str, ...] = (
+    "in january", "in february", "in march", "in april", "in may", "in june",
+    "in july", "in august", "in september", "in october", "in november", "in december",
+    "by january", "by february", "by march", "by april", "by may", "by june",
+    "by july", "by august", "by september", "by october", "by november", "by december",
+    "by end of", "will reach", "in 2025", "in 2026", "in 2027", "end of year",
+    "q1 ", "q2 ", "q3 ", "q4 ", "quarterly", "monthly", "annual", "year-end",
+    "ath by", "all-time high by", "hit $", "reach $", "exceed $",
+)
+_BLOCKED_MARKET_KEYWORDS: tuple[str, ...] = (
+    "nba", "nfl", "nhl", "mlb", "soccer", "football-", "basketball", "baseball",
+    "hockey", "tennis", "golf-", "boxing", "mma", "ufc", "csgo", "dota", "-lol-",
+    "esport", "fortnite", "election", "president", "senate", "congress", "vote",
+    "republican", "democrat", "trump", "harris", "premier-league", "world-cup",
+    "super-bowl", "champions-league", "nba-finals", "world-series",
+)
+
+
+def classify_market(
+    market_slug: "str | None",
+    market_title: "str | None",
+) -> str:
+    """
+    Classify a Polymarket market into FAST_MARKET | SLOW_MARKET | BLOCKED_MARKET | UNKNOWN.
+
+    Conservative: prefers UNKNOWN over incorrect FAST classification.
+    Uses slug + title only — no DB or API calls.
+    """
+    slug  = (market_slug  or "").lower().strip()
+    title = (market_title or "").lower().strip()
+    combined = slug + " " + title
+
+    # BLOCKED — checked first (highest priority)
+    for kw in _BLOCKED_MARKET_KEYWORDS:
+        if kw in combined:
+            return "BLOCKED_MARKET"
+
+    # SLOW — long-dated resolution keywords
+    for kw in _SLOW_MARKET_KEYWORDS:
+        if kw in combined:
+            return "SLOW_MARKET"
+
+    # FAST — must match slug prefix or explicit updown-style slug pattern
+    for prefix in _FAST_MARKET_SLUG_PREFIXES:
+        if slug.startswith(prefix):
+            return "FAST_MARKET"
+    for kw in _FAST_MARKET_SLUG_CONTAINS:
+        if kw in slug:
+            return "FAST_MARKET"
+
+    return "UNKNOWN"
+
+
 def upsert_market_cache(trade_row: dict) -> None:
     """
     Upsert market_cache from a normalized wallet_trade dict.
@@ -5803,6 +5884,10 @@ def upsert_market_cache(trade_row: dict) -> None:
 
     When we see the same market_slug from a YES trade and later a NO trade,
     the upserts progressively fill in yes_token_id then no_token_id.
+
+    Phase 1 addition: also writes market_class computed from classify_market().
+    If the market_class column does not yet exist in the DB, falls back to
+    an upsert without it — no crash, just an INFO log.
     """
     market_slug = trade_row.get("market_slug")
     if not market_slug:
@@ -5822,10 +5907,36 @@ def upsert_market_cache(trade_row: dict) -> None:
     elif token_id and outcome == "NO":
         payload["no_token_id"] = token_id
 
+    # Compute and include market classification (Phase 1 addition).
+    market_class = classify_market(
+        trade_row.get("market_slug"),
+        trade_row.get("market_title"),
+    )
+
     try:
-        supabase.table("market_cache").upsert(payload, on_conflict="market_slug").execute()
+        supabase.table("market_cache").upsert(
+            {**payload, "market_class": market_class},
+            on_conflict="market_slug",
+        ).execute()
     except Exception as exc:
-        logging.warning("COPY_UPSERT_MARKET_CACHE_FAIL slug=%s err=%s", market_slug, exc)
+        exc_str = str(exc).lower()
+        # If the column doesn't exist yet, fall back gracefully.
+        if any(kw in exc_str for kw in ("market_class", "column", "schema", "42703")):
+            logging.info(
+                "COPY_MARKET_CLASS_COL_MISSING slug=%s class=%s "
+                "— market_class column not yet in DB; upserting without it. "
+                "Run Phase 2 migration to add the column.",
+                market_slug, market_class,
+            )
+            try:
+                supabase.table("market_cache").upsert(payload, on_conflict="market_slug").execute()
+            except Exception as exc2:
+                logging.warning("COPY_UPSERT_MARKET_CACHE_FAIL slug=%s err=%s", market_slug, exc2)
+        else:
+            logging.warning(
+                "COPY_UPSERT_MARKET_CACHE_FAIL slug=%s class=%s err=%s",
+                market_slug, market_class, exc,
+            )
 
 
 def get_unevaluated_trades_for_bot(
@@ -6628,6 +6739,82 @@ def log_per_bot_position_audit(all_bots: list[dict]) -> None:
             )
 
 
+def _db_close_position_with_retry(
+    pos_id: str,
+    updates: dict,
+    extra_filters: "dict | None" = None,
+    max_attempts: int = 2,
+) -> "tuple[bool, int]":
+    """
+    Safe wrapper for a copied_positions DB close/update with lightweight retry.
+
+    Phase 1 scaffold: performs up to max_attempts=2 attempts with a short sleep
+    between tries. Returns (success, rows_updated).
+
+    extra_filters: additional .eq() conditions added to the UPDATE query.
+      Pass {"status": "OPEN"} for a concurrency guard — ensures another path
+      hasn't already closed the position between load and this write.
+
+    This wrapper is the clean insertion point for Phase 3 retry queue logic:
+      - Increase max_attempts for transient network errors
+      - Add exponential backoff
+      - Push failed pos_ids to a dead-letter table for manual review
+
+    Log tags emitted:
+      COPY_CLOSE_DB_ATTEMPT   — about to execute DB update (attempt N)
+      COPY_CLOSE_DB_OK        — update confirmed (rows_updated > 0)
+      COPY_CLOSE_DB_ZERO_ROWS — update matched 0 rows (likely already closed)
+      COPY_CLOSE_DB_RETRY     — retrying after transient error
+      COPY_CLOSE_DB_FAIL      — all attempts exhausted, update failed
+    """
+    import time as _time_mod
+
+    rows_updated = 0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logging.info(
+                "COPY_CLOSE_DB_ATTEMPT pos=%s attempt=%s/%s filters=%s",
+                pos_id[:8], attempt, max_attempts,
+                list(extra_filters.keys()) if extra_filters else [],
+            )
+            q = supabase.table("copied_positions").update(updates).eq("id", pos_id)
+            if extra_filters:
+                for k, v in extra_filters.items():
+                    q = q.eq(k, v)
+            resp = q.execute()
+            rows_updated = len(resp.data) if resp.data else 0
+
+            if rows_updated > 0:
+                logging.info(
+                    "COPY_CLOSE_DB_OK pos=%s attempt=%s rows_updated=%s",
+                    pos_id[:8], attempt, rows_updated,
+                )
+                return True, rows_updated
+
+            # 0 rows — position already closed by another path (settlement, reset, etc.)
+            logging.warning(
+                "COPY_CLOSE_DB_ZERO_ROWS pos=%s attempt=%s/%s "
+                "— update matched 0 rows; position may already be closed",
+                pos_id[:8], attempt, max_attempts,
+            )
+            # Don't retry on zero-rows — another path won the race; not a transient error.
+            return False, 0
+
+        except Exception as exc:
+            logging.warning(
+                "COPY_CLOSE_DB_RETRY pos=%s attempt=%s/%s err=%s",
+                pos_id[:8], attempt, max_attempts, exc,
+            )
+            if attempt < max_attempts:
+                _time_mod.sleep(0.4)
+
+    logging.warning(
+        "COPY_CLOSE_DB_FAIL pos=%s — all %s attempts exhausted",
+        pos_id[:8], max_attempts,
+    )
+    return False, rows_updated
+
+
 def close_matching_open_positions_on_exit(
     copy_bot: dict,
     wallet_trade: dict,
@@ -6826,58 +7013,76 @@ def close_matching_open_positions_on_exit(
             is_live_position = bool((pos.get("raw_json") or {}).get("live"))
 
             # ── SELL_MIRROR_DB_ATTEMPT ────────────────────────────────────────
+            _now_ts = utc_now_iso()
             logging.warning(
                 "SELL_MIRROR_DB_ATTEMPT pos=%s bot=%s slug=%s outcome=%s "
                 "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
-                "— writing CLOSED to DB now",
+                "match_field=%s — writing CLOSED to DB now",
                 pos_id[:12], bot_label, pos_slug, pos_outcome,
                 entry_price, exit_price, size, pnl, is_live_position,
+                match_field,
             )
 
             updates = {
                 "status":    "CLOSED",
                 "exit_price": exit_price,
                 "pnl":        pnl,
-                "closed_at":  utc_now_iso(),
+                "closed_at":  _now_ts,
                 "raw_json": {
                     **(pos.get("raw_json") or {}),
+                    # Standardized top-level close_reason (Phase 2)
+                    "close_reason": CLOSE_REASON_SOURCE_WALLET_EXIT,
+                    # Detailed sub-object (preserved for backward compatibility)
                     "close": {
-                        "reason":          "source_wallet_exit",
+                        "reason":          CLOSE_REASON_SOURCE_WALLET_EXIT,
                         "source_trade_id": wallet_trade.get("source_trade_id"),
                         "exit_price":      exit_price,
                         "pnl":             pnl,
-                        "closed_at":       utc_now_iso(),
+                        "closed_at":       _now_ts,
+                        "match_field":     match_field,
                     },
                 },
             }
-            update_resp = (
-                supabase.table("copied_positions")
-                .update(updates)
-                .eq("id", pos_id)
-                .execute()
-            )
-            updated_rows = len(update_resp.data) if update_resp.data else 0
 
-            # ── SELL_MIRROR_DB_OK ─────────────────────────────────────────────
-            logging.warning(
-                "SELL_MIRROR_DB_OK pos=%s bot=%s slug=%s outcome=%s "
-                "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
-                "rows_updated=%s",
-                pos_id[:12], bot_label, pos_slug, pos_outcome,
-                entry_price, exit_price, size, pnl, is_live_position,
-                updated_rows,
-            )
-            # keep legacy tag for backwards compat
-            logging.info(
-                "COPY_EXIT_MIRROR_CLOSED pos=%s bot=%s slug=%s outcome=%s "
-                "entry=%.4f exit=%.4f size=%.2f pnl=%+.4f live=%s",
-                pos_id[:8], bot_label, pos_slug, pos_outcome,
-                entry_price, exit_price, size, pnl, is_live_position,
+            # Use retry scaffold — Phase 1/2: max 2 attempts.
+            # No concurrency guard (.eq status=OPEN) here because the source-wallet
+            # exit path is the authoritative close and should always win.
+            _close_ok, _rows_updated = _db_close_position_with_retry(
+                pos_id, updates, max_attempts=2,
             )
 
-            if pnl != 0.0 and not is_live_position:
-                _update_copy_paper_bankroll(pnl, pos_id, close_path="exit_mirror")
-            closed_count += 1
+            if _close_ok:
+                # ── SELL_MIRROR_DB_OK ──────────────────────────────────────
+                logging.warning(
+                    "SELL_MIRROR_DB_OK pos=%s bot=%s slug=%s outcome=%s "
+                    "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
+                    "rows_updated=%s match_field=%s close_reason=%s",
+                    pos_id[:12], bot_label, pos_slug, pos_outcome,
+                    entry_price, exit_price, size, pnl, is_live_position,
+                    _rows_updated, match_field, CLOSE_REASON_SOURCE_WALLET_EXIT,
+                )
+                # Legacy tag kept for backward compatibility with Railway search filters
+                logging.info(
+                    "COPY_EXIT_MIRROR_CLOSED pos=%s bot=%s slug=%s outcome=%s "
+                    "entry=%.4f exit=%.4f size=%.2f pnl=%+.4f live=%s match=%s",
+                    pos_id[:8], bot_label, pos_slug, pos_outcome,
+                    entry_price, exit_price, size, pnl, is_live_position, match_field,
+                )
+                # Best-effort write to dedicated close_reason column (Phase 2 migration)
+                _try_write_close_reason_col(pos_id, CLOSE_REASON_SOURCE_WALLET_EXIT)
+                if pnl != 0.0 and not is_live_position:
+                    _update_copy_paper_bankroll(pnl, pos_id, close_path="exit_mirror")
+                closed_count += 1
+            else:
+                # 0 rows updated — position was already closed by another path.
+                # Not a DB error; the retry wrapper already logged COPY_CLOSE_DB_ZERO_ROWS.
+                logging.warning(
+                    "SELL_MIRROR_DB_NOOP pos=%s bot=%s slug=%s "
+                    "— DB update returned 0 rows; position already closed by another path "
+                    "(settlement, auto-exit, or paper reset). No retry needed.",
+                    pos_id[:12], bot_label, pos_slug,
+                )
+                skipped_count += 1
 
         except Exception:
             failed_count += 1
@@ -7009,6 +7214,106 @@ def _parse_ts(s) -> "datetime | None":
         return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
     try:
         return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ── Wallet fast-turnover classification ───────────────────────────────────────
+#
+# _classify_wallet_class() assigns a copy-trading suitability class based on
+# hold-time distribution and recent performance.
+#
+# Classes:
+#   FAST_COPY      — short hold times (< 30 min), positive or neutral PnL
+#   CONVICTION_COPY — long hold times, good win rate
+#   MIXED          — does not fit cleanly into either; may still be tradeable
+#   AVOID          — consistently losing wallet
+#   UNSCORABLE     — insufficient closed trade data (< 3 positions)
+#
+# Phase 2 migration: ALTER TABLE wallet_metrics ADD COLUMN IF NOT EXISTS
+#   wallet_class     text    DEFAULT 'UNSCORABLE',
+#   median_hold_minutes numeric,
+#   pct_under_15min    numeric,
+#   pct_under_30min    numeric,
+#   recent_closed_count int;
+
+
+def _compute_median(values: "list[float]") -> "float | None":
+    """Return the median of a non-empty list, or None if empty."""
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _classify_wallet_class(
+    avg_hold_minutes: float,
+    median_hold_minutes: "float | None",
+    pct_under_15min: float,
+    pct_under_30min: float,
+    pnl_30d: float,
+    win_rate: float,
+    closed_count: int,
+) -> str:
+    """
+    Classify a wallet's copy-trading suitability.
+
+    Returns one of: FAST_COPY | CONVICTION_COPY | MIXED | AVOID | UNSCORABLE
+
+    All thresholds are intentionally conservative — uncertain cases fall through
+    to MIXED rather than FAST_COPY so gates don't over-restrict.
+    """
+    # UNSCORABLE: too little data for reliable classification
+    if closed_count < 3:
+        return "UNSCORABLE"
+
+    # AVOID: consistently negative performance
+    if pnl_30d < -20.0 and win_rate < 0.35:
+        return "AVOID"
+    if win_rate < 0.30 and closed_count >= 10:
+        return "AVOID"
+
+    # FAST_COPY: dominant short-hold behaviour with neutral/positive PnL
+    _median_fast = median_hold_minutes is not None and median_hold_minutes < 25.0
+    _pct_fast    = pct_under_30min >= 0.60
+    _avg_fast    = avg_hold_minutes < 25.0
+    _profitable  = pnl_30d >= 0.0
+
+    if (_pct_fast or _avg_fast or _median_fast) and _profitable:
+        return "FAST_COPY"
+
+    # CONVICTION_COPY: long-hold, solid win rate
+    if avg_hold_minutes >= 60.0 and win_rate >= 0.50 and pnl_30d >= 0.0:
+        return "CONVICTION_COPY"
+
+    # AVOID: low win rate with negative PnL (less extreme than above)
+    if win_rate < 0.40 and pnl_30d < 0.0:
+        return "AVOID"
+
+    return "MIXED"
+
+
+def _get_wallet_class_from_metrics(wallet_address: str) -> "str | None":
+    """
+    Look up wallet_class from wallet_metrics for the given address.
+
+    Returns None if the row, column, or table doesn't exist yet.
+    Fail-safe: never raises; always returns None on error.
+    """
+    try:
+        resp = (
+            supabase.table("wallet_metrics")
+            .select("wallet_class")
+            .eq("wallet_address", wallet_address)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows:
+            return rows[0].get("wallet_class")
+        return None
     except Exception:
         return None
 
@@ -7154,7 +7459,7 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
         wins = sum(1 for v in pnl_all_vals if v > 0)
         win_rate = round(wins / len(pnl_all_vals), 4) if pnl_all_vals else 0.0
 
-        # avg_hold_minutes — from opened_at/closed_at diffs
+        # avg_hold_minutes + fast-turnover distribution metrics
         hold_mins: list[float] = []
         for p in closed_pos:
             opened_dt = _parse_ts(p.get("opened_at"))
@@ -7162,6 +7467,18 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
             if opened_dt and closed_dt and closed_dt > opened_dt:
                 hold_mins.append((closed_dt - opened_dt).total_seconds() / 60.0)
         avg_hold_minutes = round(sum(hold_mins) / len(hold_mins), 2) if hold_mins else 0.0
+
+        # Phase 1 fast-turnover additions (safe if hold_mins is empty)
+        median_hold_minutes: float | None = _compute_median(hold_mins)
+        recent_closed_count = len(closed_pos)
+        pct_under_15min = (
+            round(sum(1 for h in hold_mins if h < 15.0) / len(hold_mins), 4)
+            if hold_mins else 0.0
+        )
+        pct_under_30min = (
+            round(sum(1 for h in hold_mins if h < 30.0) / len(hold_mins), 4)
+            if hold_mins else 0.0
+        )
 
         # max_drawdown (%) — peak-to-trough of cumulative PnL curve
         max_drawdown = 0.0
@@ -7206,7 +7523,19 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
             last_trade_at=last_trade_at,
         )
 
+        # ── wallet_class (Phase 1 fast-turnover classification) ────────────
+        wallet_class = _classify_wallet_class(
+            avg_hold_minutes=avg_hold_minutes,
+            median_hold_minutes=median_hold_minutes,
+            pct_under_15min=pct_under_15min,
+            pct_under_30min=pct_under_30min,
+            pnl_30d=pnl_30d,
+            win_rate=win_rate,
+            closed_count=recent_closed_count,
+        )
+
         # ── Upsert wallet_metrics ─────────────────────────────────────────
+        # Base payload — columns that are guaranteed to exist.
         metrics: dict = {
             "wallet_address":   wallet_address,
             "trade_count":      trade_count,
@@ -7222,22 +7551,72 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
             "category_focus":   category_focus,
             "updated_at":       now_utc.isoformat(),
         }
-        supabase.table("wallet_metrics").upsert(
-            metrics, on_conflict="wallet_address"
-        ).execute()
+
+        # Phase 1 extended fields — only included if columns exist in DB.
+        # Attempt upsert with extended payload first; fall back gracefully.
+        _extended_fields: dict = {
+            "wallet_class":          wallet_class,
+            "median_hold_minutes":   round(median_hold_minutes, 2) if median_hold_minutes is not None else None,
+            "pct_under_15min":       pct_under_15min,
+            "pct_under_30min":       pct_under_30min,
+            "recent_closed_count":   recent_closed_count,
+        }
+        _extended_payload = {**metrics, **_extended_fields}
+
+        _upsert_ok = False
+        try:
+            supabase.table("wallet_metrics").upsert(
+                _extended_payload, on_conflict="wallet_address"
+            ).execute()
+            _upsert_ok = True
+        except Exception as _ext_exc:
+            _exc_str = str(_ext_exc).lower()
+            # Column missing — fall back to base payload without Phase 1 fields.
+            if any(kw in _exc_str for kw in ("column", "schema", "42703", "wallet_class",
+                                              "median_hold", "pct_under", "recent_closed")):
+                logging.info(
+                    "COPY_METRICS_EXTENDED_COL_MISSING wallet=%s "
+                    "— Phase 1 extended columns not yet in DB; upserting base fields only. "
+                    "Run Phase 2 migration to add wallet_class, median_hold_minutes, "
+                    "pct_under_15min, pct_under_30min, recent_closed_count.",
+                    wallet_address[:10],
+                )
+                try:
+                    supabase.table("wallet_metrics").upsert(
+                        metrics, on_conflict="wallet_address"
+                    ).execute()
+                    _upsert_ok = True
+                except Exception as _base_exc:
+                    logging.exception(
+                        "COPY_UPDATE_METRICS_BASE_FAIL wallet=%s err=%s",
+                        wallet_address[:10], _base_exc,
+                    )
+            else:
+                logging.exception(
+                    "COPY_UPDATE_METRICS_FAIL_EXTENDED wallet=%s err=%s",
+                    wallet_address[:10], _ext_exc,
+                )
 
         logging.info(
             "COPY_METRICS_UPDATED wallet=%s trades=%s volume=%.2f "
             "pnl_30d=%.4f win_rate=%.3f avg_hold=%.1fmin "
-            "max_dd=%.1f%% copy_score=%.1f",
+            "median_hold=%s pct_u15=%.0f%% pct_u30=%.0f%% "
+            "closed_count=%s max_dd=%.1f%% copy_score=%.1f "
+            "wallet_class=%s upsert_ok=%s",
             wallet_address[:10],
             trade_count,
             volume,
             pnl_30d,
             win_rate,
             avg_hold_minutes,
+            f"{median_hold_minutes:.1f}" if median_hold_minutes is not None else "N/A",
+            pct_under_15min * 100,
+            pct_under_30min * 100,
+            recent_closed_count,
             max_drawdown,
             copy_score,
+            wallet_class,
+            _upsert_ok,
         )
 
     except Exception:
@@ -7245,6 +7624,34 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
 
 
 # ── Copy bot evaluation ───────────────────────────────────────────────────────
+
+
+def _read_bot_fast_settings(bot: dict) -> dict:
+    """
+    Read all Phase 1/2 fast-copy feature flags from a copy_bot row with safe defaults.
+
+    All fields are optional in the DB — this function never raises.
+    Callers can safely do: settings = _read_bot_fast_settings(bot); settings["exit_mode"]
+
+    Returned keys and defaults:
+      block_blocked_markets  bool    True   — always block BLOCKED_MARKET BUYs
+      fast_markets_only      bool    False  — only copy FAST_MARKET trades
+      require_fast_copy      bool    False  — only copy FAST_COPY wallets
+      max_entry_age_minutes  int     0      — 0 = disabled; >0 = max BUY age in minutes
+      exit_mode              str     "mirror_only"
+      take_profit_pct        float|None  None
+      max_hold_minutes       float|None  None
+    """
+    return {
+        "block_blocked_markets": bool(bot.get("block_blocked_markets", True)),
+        "fast_markets_only":     bool(bot.get("fast_markets_only",    False)),
+        "require_fast_copy":     bool(bot.get("require_fast_copy",    False)),
+        "max_entry_age_minutes": int(bot.get("max_entry_age_minutes") or 0),
+        "exit_mode":             str(bot.get("exit_mode") or "mirror_only").strip().lower(),
+        "take_profit_pct":       float_or_none(bot.get("take_profit_pct")),
+        "max_hold_minutes":      float_or_none(bot.get("max_hold_minutes")),
+    }
+
 
 def _copy_bot_prune_history(bot_id: str) -> None:
     """Prune in-memory trade timestamps older than 1 hour for a copy bot."""
@@ -7434,6 +7841,114 @@ def evaluate_copy_trade_shared(
 
     submitted_size = compute_copy_size(copy_bot, wallet_trade, global_settings)
 
+    # ══ PHASE 1 ADDITIVE GATES (G8–G13) ══════════════════════════════════════
+    # All new gates below:
+    #   • Only apply to BUY trades — SELL/close mirroring is NEVER blocked here.
+    #   • Default to PASS when bot config flag is absent (backward-compatible).
+    #   • Default to PASS when market/wallet data is unavailable (fail-open).
+    #   • All skip reasons are new — do not clash with existing G1–G7 reasons.
+    #
+    # Bot config flags read (via copy_bots.*):
+    #   fast_markets_only  bool  — only copy trades on FAST_MARKET markets
+    #   block_blocked_markets bool — skip BLOCKED_MARKET (default True for BUYs)
+    #   require_fast_copy  bool  — only copy wallets classified as FAST_COPY
+    #   max_entry_age_minutes int — skip BUY if trade is older than this (0=off)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if trade_side != "SELL":
+        # Compute market class once for all market-related gates.
+        _market_class = classify_market(
+            wallet_trade.get("market_slug"),
+            wallet_trade.get("market_title"),
+        )
+
+        # G8: market_blocked — BLOCKED_MARKET markets are always skipped for BUY.
+        # Controlled by copy_bots.block_blocked_markets (default True).
+        _block_blocked = bool(copy_bot.get("block_blocked_markets", True))
+        if _block_blocked and _market_class == "BLOCKED_MARKET":
+            logging.warning(
+                "COPY_GATE_G8_FAIL bot=%s wallet=%s trade=%s "
+                "reason=market_blocked slug=%s class=%s",
+                _bot_label, _wallet_lbl,
+                str(wallet_trade.get("source_trade_id", "?"))[:20],
+                wallet_trade.get("market_slug") or "?",
+                _market_class,
+            )
+            return False, "market_blocked", None, None
+
+        # G9: market_not_fast — SLOW_MARKET markets skipped when fast_markets_only=True.
+        _fast_markets_only = bool(copy_bot.get("fast_markets_only", False))
+        if _fast_markets_only and _market_class == "SLOW_MARKET":
+            logging.info(
+                "COPY_GATE_G9_FAIL bot=%s wallet=%s trade=%s "
+                "reason=market_not_fast slug=%s class=%s fast_markets_only=True",
+                _bot_label, _wallet_lbl,
+                str(wallet_trade.get("source_trade_id", "?"))[:20],
+                wallet_trade.get("market_slug") or "?",
+                _market_class,
+            )
+            return False, "market_not_fast", None, None
+
+        # G10/G11: wallet class gates — only run when require_fast_copy=True.
+        _require_fast_copy = bool(copy_bot.get("require_fast_copy", False))
+        if _require_fast_copy:
+            _wallet_class = _get_wallet_class_from_metrics(
+                str(wallet_trade.get("wallet_address") or "")
+            )
+
+            # G10: missing_fast_metrics — no wallet_metrics row at all.
+            if _wallet_class is None:
+                logging.info(
+                    "COPY_GATE_G10_FAIL bot=%s wallet=%s trade=%s "
+                    "reason=missing_fast_metrics require_fast_copy=True "
+                    "— no wallet_metrics row; cannot verify wallet class",
+                    _bot_label, _wallet_lbl,
+                    str(wallet_trade.get("source_trade_id", "?"))[:20],
+                )
+                return False, "missing_fast_metrics", None, None
+
+            # G11: wallet_unscorable — data exists but class is UNSCORABLE.
+            if _wallet_class == "UNSCORABLE":
+                logging.info(
+                    "COPY_GATE_G11_FAIL bot=%s wallet=%s trade=%s "
+                    "reason=wallet_unscorable wallet_class=UNSCORABLE require_fast_copy=True",
+                    _bot_label, _wallet_lbl,
+                    str(wallet_trade.get("source_trade_id", "?"))[:20],
+                )
+                return False, "wallet_unscorable", None, None
+
+            # G12: wallet_not_fast_copy — wallet is classed but not FAST_COPY.
+            if _wallet_class != "FAST_COPY":
+                logging.info(
+                    "COPY_GATE_G12_FAIL bot=%s wallet=%s trade=%s "
+                    "reason=wallet_not_fast_copy wallet_class=%s require_fast_copy=True",
+                    _bot_label, _wallet_lbl,
+                    str(wallet_trade.get("source_trade_id", "?"))[:20],
+                    _wallet_class,
+                )
+                return False, "wallet_not_fast_copy", None, None
+
+        # G13: entry_too_late — BUY on FAST_MARKET is too old to copy.
+        # max_entry_age_minutes=0 (default) disables this gate entirely.
+        _max_age_min = int(copy_bot.get("max_entry_age_minutes") or 0)
+        if _max_age_min > 0 and _market_class == "FAST_MARKET":
+            _traded_at_str = str(wallet_trade.get("traded_at") or "")
+            _traded_at_dt  = _parse_ts(_traded_at_str)
+            if _traded_at_dt is not None:
+                _age_min = (datetime.now(timezone.utc) - _traded_at_dt).total_seconds() / 60.0
+                if _age_min > _max_age_min:
+                    logging.info(
+                        "COPY_GATE_G13_FAIL bot=%s wallet=%s trade=%s "
+                        "reason=entry_too_late age_min=%.1f max=%s slug=%s class=%s",
+                        _bot_label, _wallet_lbl,
+                        str(wallet_trade.get("source_trade_id", "?"))[:20],
+                        _age_min, _max_age_min,
+                        wallet_trade.get("market_slug") or "?",
+                        _market_class,
+                    )
+                    return False, "entry_too_late", None, None
+
+    # ── All gates passed ──────────────────────────────────────────────────────
     logging.info(
         "COPY_SHARED_BRAIN_OK mode=%s bot=%s wallet=%s trade=%s "
         "side=%s size=%.4f price=%.4f",
@@ -8643,6 +9158,7 @@ def close_copied_position(
 
     closed_at = resolution_data.get("closed_time") or utc_now_iso()
 
+    _settle_now = utc_now_iso()
     updates = {
         "status": "CLOSED",
         "exit_price": exit_price,
@@ -8650,13 +9166,16 @@ def close_copied_position(
         "closed_at": closed_at,
         "raw_json": {
             **(pos.get("raw_json") or {}),
+            # Standardized top-level close_reason (Phase 2)
+            "close_reason": CLOSE_REASON_SETTLED_MARKET,
+            # Detailed settlement sub-object (preserved for backward compatibility)
             "settlement": {
                 "resolved": resolution_data.get("resolved"),
                 "resolution_outcome": resolution_data.get("resolution_outcome"),
                 "exit_price": exit_price,
                 "pnl": pnl,
                 "settled_by": "copy_settlement_loop",
-                "settled_at": utc_now_iso(),
+                "settled_at": _settle_now,
             },
         },
     }
@@ -8664,7 +9183,7 @@ def close_copied_position(
         supabase.table("copied_positions").update(updates).eq("id", pos_id).execute()
         logging.info(
             "COPY_POSITION_CLOSED pos=%s slug=%s outcome=%s resolution=%s "
-            "exit_price=%s entry_price=%s size=%s pnl=%s",
+            "exit_price=%s entry_price=%s size=%s pnl=%s close_reason=%s",
             pos_id[:8],
             pos.get("market_slug") or "?",
             pos.get("outcome"),
@@ -8673,7 +9192,10 @@ def close_copied_position(
             entry_price,
             size,
             pnl,
+            CLOSE_REASON_SETTLED_MARKET,
         )
+        # Best-effort write to dedicated close_reason column (Phase 2 migration)
+        _try_write_close_reason_col(pos_id, CLOSE_REASON_SETTLED_MARKET)
         # Update copy_paper bankroll — paper positions only.
         # Live positions are tracked separately (real balance, not paper).
         # Default to paper=True so pre-mode-tag positions are also credited.
@@ -8831,7 +9353,7 @@ def _execute_paper_reset() -> int:
         batch = to_cancel_ids[i : i + _CANCEL_BATCH]
         try:
             supabase.table("copied_positions").update(
-                {"status": "CANCELLED", "closed_at": now_ts}
+                {"status": "CANCELLED", "closed_at": now_ts, "close_reason": CLOSE_REASON_MANUAL_RESET}
             ).in_("id", batch).execute()
             cancelled_count += len(batch)
             logging.info(
@@ -8996,10 +9518,13 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
                 pass
         return None
 
-    _hdrs = {"User-Agent": "FastLoopWorker/1.0"}
+    _hdrs    = {"User-Agent": "FastLoopWorker/1.0"}
+    _pos_tag = str(pos.get("id") or "?")[:8]
+    _attempts_tried: list[str] = []
 
     # ── Attempt 1: by token_id ────────────────────────────────────────────
     if token_id:
+        _attempts_tried.append("token_id")
         try:
             url = f"{GAMMA_API_BASE}/markets?clob_token_ids={token_id}"
             req = request.Request(url, headers=_hdrs)
@@ -9009,12 +9534,26 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
             for m in markets:
                 price = _extract_price(m)
                 if price is not None:
+                    logging.info(
+                        "COPY_MARK_PRICE_OK pos=%s slug=%s outcome=%s "
+                        "price=%.4f source=token_id",
+                        _pos_tag, market_slug or "?", outcome, price,
+                    )
                     return price
-        except Exception:
-            pass
+            logging.info(
+                "COPY_MARK_PRICE_MISS pos=%s slug=%s source=token_id "
+                "— no usable price in %s market objects",
+                _pos_tag, market_slug or "?", len(markets),
+            )
+        except Exception as exc:
+            logging.info(
+                "COPY_MARK_PRICE_FAIL pos=%s slug=%s source=token_id err=%s",
+                _pos_tag, market_slug or "?", exc,
+            )
 
     # ── Attempt 2: by condition_id ────────────────────────────────────────
     if condition_id:
+        _attempts_tried.append("condition_id")
         try:
             url = f"{GAMMA_API_BASE}/markets?condition_id={condition_id}"
             req = request.Request(url, headers=_hdrs)
@@ -9024,22 +9563,94 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
             for m in markets:
                 price = _extract_price(m)
                 if price is not None:
+                    logging.info(
+                        "COPY_MARK_PRICE_OK pos=%s slug=%s outcome=%s "
+                        "price=%.4f source=condition_id",
+                        _pos_tag, market_slug or "?", outcome, price,
+                    )
                     return price
-        except Exception:
-            pass
+            logging.info(
+                "COPY_MARK_PRICE_MISS pos=%s slug=%s source=condition_id "
+                "— no usable price in %s market objects",
+                _pos_tag, market_slug or "?", len(markets),
+            )
+        except Exception as exc:
+            logging.info(
+                "COPY_MARK_PRICE_FAIL pos=%s slug=%s source=condition_id err=%s",
+                _pos_tag, market_slug or "?", exc,
+            )
 
     # ── Attempt 3: by slug ────────────────────────────────────────────────
     if market_slug:
+        _attempts_tried.append("slug")
         try:
             yes_p, no_p = _ema5m_fetch_market_prices_sync(market_slug)
             if outcome == "YES" and yes_p not in (None, 0.50):
+                logging.info(
+                    "COPY_MARK_PRICE_OK pos=%s slug=%s outcome=YES "
+                    "price=%.4f source=slug",
+                    _pos_tag, market_slug, yes_p,
+                )
                 return yes_p
             if outcome == "NO" and no_p not in (None, 0.50):
+                logging.info(
+                    "COPY_MARK_PRICE_OK pos=%s slug=%s outcome=NO "
+                    "price=%.4f source=slug",
+                    _pos_tag, market_slug, no_p,
+                )
                 return no_p
-        except Exception:
-            pass
+            logging.info(
+                "COPY_MARK_PRICE_MISS pos=%s slug=%s outcome=%s source=slug "
+                "yes_p=%s no_p=%s — prices are None or 0.50 (ambiguous)",
+                _pos_tag, market_slug, outcome, yes_p, no_p,
+            )
+        except Exception as exc:
+            logging.info(
+                "COPY_MARK_PRICE_FAIL pos=%s slug=%s source=slug err=%s",
+                _pos_tag, market_slug or "?", exc,
+            )
 
+    # All attempts exhausted — log clearly so operators know why close may not fire
+    logging.warning(
+        "COPY_MARK_PRICE_UNAVAILABLE pos=%s slug=%s outcome=%s "
+        "token_id=%s condition_id=%s attempts=%s "
+        "— could not fetch mark price from Gamma API; "
+        "TP exit blocked; max-hold exit will use entry_price if triggered",
+        _pos_tag,
+        market_slug or "?",
+        outcome,
+        str(token_id or "NONE")[:16],
+        str(condition_id or "NONE")[:16],
+        _attempts_tried or ["none_tried"],
+    )
     return None
+
+
+def _try_write_close_reason_col(pos_id: str, close_reason: str) -> None:
+    """
+    Attempt to write the standardized close_reason to the dedicated column on
+    copied_positions.  Fails silently if the column does not yet exist.
+
+    This is a best-effort write — the canonical close_reason lives in
+    raw_json["close_reason"] which is always written by the main close update.
+    The dedicated column is for SQL queries and dashboards after the migration.
+
+    Run the Phase 2 migration before this has any effect:
+      ALTER TABLE copied_positions ADD COLUMN IF NOT EXISTS close_reason text;
+    """
+    try:
+        supabase.table("copied_positions").update(
+            {"close_reason": close_reason}
+        ).eq("id", pos_id).execute()
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if any(kw in exc_str for kw in ("close_reason", "column", "42703", "schema")):
+            pass  # column not yet migrated — expected pre-migration
+        else:
+            logging.info(
+                "COPY_CLOSE_REASON_COL_WRITE_FAIL pos=%s reason=%s err=%s",
+                pos_id[:8], close_reason, exc,
+            )
 
 
 def _copy_auto_exit_close_position_sync(
@@ -9057,11 +9668,16 @@ def _copy_auto_exit_close_position_sync(
     load and this update, the DB update matches 0 rows and we log
     COPY_EXIT_ALREADY_CLOSED cleanly.
 
-    reason: "auto_profit" | "max_hold"
+    reason: CLOSE_REASON_AUTO_PROFIT | CLOSE_REASON_MAX_HOLD
+      (constants defined in worker_config.py)
+
+    Phase 2: writes standardized close_reason at top level of raw_json
+    and attempts to write the dedicated close_reason column.
     """
     pos_id      = str(pos.get("id") or "")
     entry_price = float_or_none(pos.get("entry_price")) or 0.0
     size        = float_or_none(pos.get("size")) or 0.0
+    _now_ts     = utc_now_iso()
 
     pnl = (
         round(size * (exit_price - entry_price) / entry_price, 6)
@@ -9073,14 +9689,17 @@ def _copy_auto_exit_close_position_sync(
         "status":     "CLOSED",
         "exit_price": exit_price,
         "pnl":        pnl,
-        "closed_at":  utc_now_iso(),
+        "closed_at":  _now_ts,
         "raw_json": {
             **(pos.get("raw_json") or {}),
+            # Standardized top-level close_reason (Phase 2) — read by all paths
+            "close_reason": reason,
+            # Detailed sub-object for this close path (preserved from Phase 1)
             "auto_exit": {
                 "reason":     reason,
                 "exit_price": exit_price,
                 "pnl":        pnl,
-                "closed_at":  utc_now_iso(),
+                "closed_at":  _now_ts,
             },
         },
     }
@@ -9095,8 +9714,6 @@ def _copy_auto_exit_close_position_sync(
         )
 
         if not (resp.data):
-            # 0 rows updated — position was already closed by another path
-            # (settlement loop, source-wallet SELL, paper reset, etc.)
             logging.warning(
                 "COPY_EXIT_ALREADY_CLOSED pos=%s reason=%s "
                 "— DB update matched 0 OPEN rows; position already closed elsewhere",
@@ -9112,6 +9729,9 @@ def _copy_auto_exit_close_position_sync(
             reason,
             entry_price, exit_price, size, pnl,
         )
+
+        # Best-effort write to dedicated close_reason column (Phase 2 migration)
+        _try_write_close_reason_col(pos_id, reason)
 
         raw_json = pos.get("raw_json") or {}
         is_paper = raw_json.get("paper", True)
@@ -9206,18 +9826,22 @@ async def copy_auto_exit_loop() -> None:
                     take_profit_pct = float_or_none(bot.get("take_profit_pct"))
                     max_hold_min    = float_or_none(bot.get("max_hold_minutes"))
 
-                    raw_json = pos.get("raw_json") or {}
-                    is_live  = bool(raw_json.get("live", False))
-
-                    logging.info(
-                        "COPY_EXIT_MODE pos=%s bot=%s exit_mode=%s "
-                        "take_profit_pct=%s max_hold_min=%s is_live=%s",
-                        pos_id[:8], copy_bot_id[:8], exit_mode,
-                        take_profit_pct, max_hold_min, is_live,
-                    )
+                    raw_json   = pos.get("raw_json") or {}
+                    is_live    = bool(raw_json.get("live", False))
+                    entry_price = float_or_none(pos.get("entry_price")) or 0.0
+                    pos_slug    = pos.get("market_slug") or "?"
+                    pos_wallet  = str(pos.get("wallet_address") or "?")[:12]
+                    opened_at_str = pos.get("opened_at") or "?"
 
                     # ── 3c. mirror_only gate ──────────────────────────────────
                     if exit_mode == "mirror_only":
+                        logging.info(
+                            "COPY_AUTO_EXIT_POSITION_EVAL pos=%s bot=%s wallet=%s "
+                            "slug=%s opened_at=%s exit_mode=mirror_only "
+                            "entry=%.4f is_live=%s action=skip_mirror_only",
+                            pos_id[:8], copy_bot_id[:8], pos_wallet,
+                            pos_slug, opened_at_str, entry_price, is_live,
+                        )
                         skipped += 1
                         continue
 
@@ -9235,21 +9859,47 @@ async def copy_auto_exit_loop() -> None:
                         _copy_auto_exit_fetch_mark_price_sync, pos
                     )
 
-                    entry_price = float_or_none(pos.get("entry_price")) or 0.0
-
                     # ── 3f. Profit % ──────────────────────────────────────────
                     profit_pct: float | None = None
                     if mark_price is not None and entry_price > 0:
                         profit_pct = (mark_price - entry_price) / entry_price * 100.0
 
-                    # ── 3g. Log TP check ──────────────────────────────────────
+                    # ── 3g. Per-position structured diagnostic log ─────────────
+                    # COPY_AUTO_EXIT_POSITION_EVAL consolidates all evaluation
+                    # inputs in one searchable log line for every non-mirror position.
+                    _tp_condition_met  = (
+                        take_profit_pct is not None
+                        and profit_pct   is not None
+                        and profit_pct >= take_profit_pct
+                    )
+                    _mh_condition_met = (
+                        max_hold_min is not None
+                        and hold_min is not None
+                        and hold_min >= max_hold_min
+                    )
+                    logging.warning(
+                        "COPY_AUTO_EXIT_POSITION_EVAL "
+                        "pos=%s bot=%s wallet=%s slug=%s "
+                        "opened_at=%s hold_min=%s "
+                        "entry=%.4f mark=%s profit_pct=%s "
+                        "exit_mode=%s take_profit_pct=%s max_hold_min=%s "
+                        "tp_condition=%s mh_condition=%s is_live=%s",
+                        pos_id[:8], copy_bot_id[:8], pos_wallet, pos_slug,
+                        opened_at_str,
+                        f"{hold_min:.1f}" if hold_min is not None else "N/A",
+                        entry_price,
+                        f"{mark_price:.4f}" if mark_price is not None else "N/A",
+                        f"{profit_pct:.1f}%" if profit_pct is not None else "N/A",
+                        exit_mode, take_profit_pct, max_hold_min,
+                        _tp_condition_met, _mh_condition_met, is_live,
+                    )
+
+                    # Legacy per-strategy check log kept for Railway search compatibility
                     logging.warning(
                         "COPY_EXIT_TP_CHECK pos=%s slug=%s exit_mode=%s "
                         "entry=%.4f mark=%s profit_pct=%s tp_target=%s "
                         "hold_min=%s max_hold_min=%s",
-                        pos_id[:8],
-                        pos.get("market_slug") or "?",
-                        exit_mode,
+                        pos_id[:8], pos_slug, exit_mode,
                         entry_price,
                         f"{mark_price:.4f}" if mark_price is not None else "N/A",
                         f"{profit_pct:.1f}%" if profit_pct is not None else "N/A",
@@ -9261,21 +9911,27 @@ async def copy_auto_exit_loop() -> None:
                     checked += 1
 
                     # ── 3h. Take-profit check ─────────────────────────────────
+                    # HARDENED (Phase 2): TP requires a real mark_price.
+                    # If the Gamma API returned None, we cannot verify the
+                    # profit target was reached — skip TP exit this tick.
+                    # max_hold is still evaluated independently below.
                     close_reason: str | None = None
 
                     if exit_mode in ("auto_profit", "auto_profit_max_hold"):
-                        if (
-                            take_profit_pct is not None
-                            and profit_pct is not None
-                            and profit_pct >= take_profit_pct
-                        ):
-                            close_reason = "auto_profit"
+                        if mark_price is None:
+                            logging.warning(
+                                "COPY_EXIT_TP_SKIP_NO_PRICE pos=%s slug=%s "
+                                "— mark_price unavailable; TP exit skipped this tick. "
+                                "Will retry next auto-exit loop cycle.",
+                                pos_id[:8], pos_slug,
+                            )
+                        elif _tp_condition_met:
+                            close_reason = CLOSE_REASON_AUTO_PROFIT
                             logging.warning(
                                 "COPY_EXIT_TP_HIT pos=%s slug=%s "
                                 "profit_pct=%.1f%% tp_target=%.1f%% "
                                 "entry=%.4f mark=%.4f",
-                                pos_id[:8],
-                                pos.get("market_slug") or "?",
+                                pos_id[:8], pos_slug,
                                 profit_pct,
                                 take_profit_pct,
                                 entry_price,
@@ -9283,23 +9939,41 @@ async def copy_auto_exit_loop() -> None:
                             )
 
                     # ── 3i. Max-hold check ────────────────────────────────────
+                    # HARDENED (Phase 2): max_hold fires even when mark_price is
+                    # unavailable — the position must be closed after max hold time
+                    # regardless of price. Entry_price is used as the exit_price
+                    # fallback (net-zero PnL) and logged clearly.
                     if exit_mode == "auto_profit_max_hold" and close_reason is None:
-                        if (
-                            max_hold_min is not None
-                            and hold_min is not None
-                            and hold_min >= max_hold_min
-                        ):
-                            close_reason = "max_hold"
-                            logging.warning(
-                                "COPY_EXIT_MAX_HOLD_HIT pos=%s slug=%s "
-                                "hold_min=%.1f max_hold_min=%.1f",
-                                pos_id[:8],
-                                pos.get("market_slug") or "?",
-                                hold_min,
-                                max_hold_min,
-                            )
+                        if _mh_condition_met:
+                            close_reason = CLOSE_REASON_MAX_HOLD
+                            if mark_price is None:
+                                logging.warning(
+                                    "COPY_EXIT_MAX_HOLD_HIT_NO_PRICE pos=%s slug=%s "
+                                    "hold_min=%.1f max_hold_min=%.1f "
+                                    "— mark_price unavailable; will exit at entry_price "
+                                    "(net-zero PnL) to enforce max-hold discipline",
+                                    pos_id[:8], pos_slug,
+                                    hold_min, max_hold_min,
+                                )
+                            else:
+                                logging.warning(
+                                    "COPY_EXIT_MAX_HOLD_HIT pos=%s slug=%s "
+                                    "hold_min=%.1f max_hold_min=%.1f "
+                                    "entry=%.4f mark=%.4f",
+                                    pos_id[:8], pos_slug,
+                                    hold_min, max_hold_min,
+                                    entry_price, mark_price,
+                                )
 
                     if close_reason is None:
+                        logging.info(
+                            "COPY_AUTO_EXIT_NO_TRIGGER pos=%s slug=%s "
+                            "exit_mode=%s profit_pct=%s hold_min=%s "
+                            "— neither TP nor max-hold condition met",
+                            pos_id[:8], pos_slug, exit_mode,
+                            f"{profit_pct:.1f}%" if profit_pct is not None else "N/A",
+                            f"{hold_min:.1f}" if hold_min is not None else "N/A",
+                        )
                         skipped += 1
                         continue
 
@@ -9309,15 +9983,23 @@ async def copy_auto_exit_loop() -> None:
                             "COPY_EXIT_SKIP_LIVE_UNSUPPORTED pos=%s slug=%s reason=%s "
                             "— live auto-exit is not yet implemented; "
                             "position remains open until source wallet SELL or settlement",
-                            pos_id[:8],
-                            pos.get("market_slug") or "?",
-                            close_reason,
+                            pos_id[:8], pos_slug, close_reason,
                         )
                         skipped += 1
                         continue
 
                     # ── 3k. Close position (PAPER only) ──────────────────────
+                    # For TP: mark_price guaranteed non-None (guard above).
+                    # For max_hold: falls back to entry_price if mark_price is None.
                     exit_price = mark_price if mark_price is not None else entry_price
+                    _using_fallback_price = mark_price is None
+                    logging.warning(
+                        "COPY_AUTO_EXIT_ACTION pos=%s slug=%s reason=%s "
+                        "entry=%.4f exit=%.4f fallback_price=%s "
+                        "— triggering paper close now",
+                        pos_id[:8], pos_slug, close_reason,
+                        entry_price, exit_price, _using_fallback_price,
+                    )
                     ok = await asyncio.to_thread(
                         _copy_auto_exit_close_position_sync,
                         pos,
@@ -9325,7 +10007,7 @@ async def copy_auto_exit_loop() -> None:
                         close_reason,
                     )
                     if ok:
-                        if close_reason == "auto_profit":
+                        if close_reason == CLOSE_REASON_AUTO_PROFIT:
                             tp_closed += 1
                         else:
                             mh_closed += 1
