@@ -6015,16 +6015,44 @@ def get_unevaluated_trades_for_bot(
 
         trade_ids = [t["source_trade_id"] for t in all_trades]
 
-        # Fetch attempts with skip_reason and source_side so we can detect
-        # the "closes_not_enabled" lock-out and re-evaluate if needed.
-        attempted_resp = (
-            supabase.table("copy_attempts")
-            .select("source_trade_id, skip_reason, source_side, copied")
-            .eq("copy_bot_id", bot_id)
-            .in_("source_trade_id", trade_ids)
-            .execute()
+        # Fetch already-attempted source_trade_ids for this bot.
+        # CHUNKED to prevent httpx.InvalidURL: URL component 'query' too long.
+        # The Supabase REST client builds a GET URL with `in.(id,id,...)` for
+        # `.in_()` calls.  With 1000 UUIDs (36 chars each + commas) the query
+        # string can exceed 37 KB, well past typical server/client URL limits.
+        # Chunking at 50 UUIDs keeps each GET param under ~2 KB.
+        _ATTEMPT_CHUNK = 50
+        _total_chunks  = max(1, -(-len(trade_ids) // _ATTEMPT_CHUNK))  # ceiling div
+        attempt_rows: list[dict] = []
+        for _ci, _chunk_start in enumerate(range(0, len(trade_ids), _ATTEMPT_CHUNK), 1):
+            _chunk = trade_ids[_chunk_start:_chunk_start + _ATTEMPT_CHUNK]
+            try:
+                _cr = (
+                    supabase.table("copy_attempts")
+                    .select("source_trade_id, skip_reason, source_side, copied")
+                    .eq("copy_bot_id", bot_id)
+                    .in_("source_trade_id", _chunk)
+                    .execute()
+                )
+                _chunk_rows = _cr.data or []
+                attempt_rows.extend(_chunk_rows)
+                logging.info(
+                    "COPY_UNEVALUATED_CHUNK bot=%s chunk=%s/%s "
+                    "trades_in_chunk=%s attempts_found=%s",
+                    _label, _ci, _total_chunks, len(_chunk), len(_chunk_rows),
+                )
+            except Exception as _chunk_exc:
+                logging.warning(
+                    "COPY_UNEVALUATED_CHUNK_FAIL bot=%s chunk=%s/%s err=%s "
+                    "— chunk skipped; affected trades may be re-evaluated this tick",
+                    _label, _ci, _total_chunks, _chunk_exc,
+                )
+        logging.info(
+            "COPY_UNEVALUATED_SUMMARY bot=%s wallet=%s "
+            "total_trades=%s chunks=%s attempt_rows_fetched=%s",
+            _label, wallet_address[:10],
+            len(trade_ids), _total_chunks, len(attempt_rows),
         )
-        attempt_rows = attempted_resp.data or []
 
         # Group attempts by source_trade_id to handle trades with multiple rows.
         from collections import defaultdict
@@ -7098,12 +7126,22 @@ def close_matching_open_positions_on_exit(
                 str(pos.get("token_id") or "?")[:16],
             )
 
-    # ── SELL_MIRROR_SUMMARY ───────────────────────────────────────────────────
+    # ── SELL_MIRROR_SUMMARY / COPY_SOURCE_EXIT_BATCH_SUMMARY ─────────────────
     logging.warning(
         "SELL_MIRROR_SUMMARY bot=%s wallet=%s trade=%s slug=%s "
         "found=%s closed=%s skipped=%s failed=%s",
         bot_label, wallet_short, trade_id,
         market_slug or "?",
+        len(positions_to_close),
+        closed_count, skipped_count, failed_count,
+    )
+    # Searchable alias used by Phase 3 diagnostics — same data as SELL_MIRROR_SUMMARY.
+    logging.warning(
+        "COPY_SOURCE_EXIT_BATCH_SUMMARY bot=%s wallet=%s trade=%s slug=%s "
+        "match_field=%s found=%s closed=%s skipped=%s failed=%s",
+        bot_label, wallet_short, trade_id,
+        market_slug or "?",
+        match_field if positions_to_close else "N/A",
         len(positions_to_close),
         closed_count, skipped_count, failed_count,
     )
@@ -9613,14 +9651,17 @@ def _copy_auto_exit_fetch_mark_price_sync(pos: dict) -> float | None:
     # All attempts exhausted — log clearly so operators know why close may not fire
     logging.warning(
         "COPY_MARK_PRICE_UNAVAILABLE pos=%s slug=%s outcome=%s "
-        "token_id=%s condition_id=%s attempts=%s "
-        "— could not fetch mark price from Gamma API; "
-        "TP exit blocked; max-hold exit will use entry_price if triggered",
+        "token_id_present=%s condition_id_present=%s attempts_tried=%s "
+        "— could not fetch mark price from any Gamma API source. "
+        "TP exit blocked this tick. "
+        "max-hold exit will use entry_price fallback if max_hold triggered. "
+        "Check: is token_id populated on copied_positions? "
+        "Is the market slug correct? Is Gamma API reachable?",
         _pos_tag,
-        market_slug or "?",
+        market_slug or "NONE",
         outcome,
-        str(token_id or "NONE")[:16],
-        str(condition_id or "NONE")[:16],
+        bool(token_id),
+        bool(condition_id),
         _attempts_tried or ["none_tried"],
     )
     return None
@@ -9637,15 +9678,23 @@ def _try_write_close_reason_col(pos_id: str, close_reason: str) -> None:
 
     Run the Phase 2 migration before this has any effect:
       ALTER TABLE copied_positions ADD COLUMN IF NOT EXISTS close_reason text;
+
+    Log tags:
+      COPY_CLOSE_REASON_WRITE_OK   — dedicated column write succeeded
+      COPY_CLOSE_REASON_COL_WRITE_FAIL — non-schema error during write
     """
     try:
         supabase.table("copied_positions").update(
             {"close_reason": close_reason}
         ).eq("id", pos_id).execute()
+        logging.info(
+            "COPY_CLOSE_REASON_WRITE_OK pos=%s reason=%s",
+            pos_id[:8], close_reason,
+        )
     except Exception as exc:
         exc_str = str(exc).lower()
         if any(kw in exc_str for kw in ("close_reason", "column", "42703", "schema")):
-            pass  # column not yet migrated — expected pre-migration
+            pass  # column not yet migrated — expected pre-migration; raw_json is canonical
         else:
             logging.info(
                 "COPY_CLOSE_REASON_COL_WRITE_FAIL pos=%s reason=%s err=%s",
@@ -9657,6 +9706,7 @@ def _copy_auto_exit_close_position_sync(
     pos: dict,
     exit_price: float,
     reason: str,
+    fallback_price: bool = False,
 ) -> bool:
     """
     Close a single OPEN copied_positions row via auto-exit logic.
@@ -9671,8 +9721,13 @@ def _copy_auto_exit_close_position_sync(
     reason: CLOSE_REASON_AUTO_PROFIT | CLOSE_REASON_MAX_HOLD
       (constants defined in worker_config.py)
 
+    fallback_price: True when mark_price was unavailable and entry_price
+      is used as the exit_price (max_hold path only).  Written into
+      raw_json["auto_exit"]["fallback_close_no_mark_price"] for traceability.
+
     Phase 2: writes standardized close_reason at top level of raw_json
     and attempts to write the dedicated close_reason column.
+    Phase 3: records fallback_close_no_mark_price in raw_json sub-object.
     """
     pos_id      = str(pos.get("id") or "")
     entry_price = float_or_none(pos.get("entry_price")) or 0.0
@@ -9700,6 +9755,9 @@ def _copy_auto_exit_close_position_sync(
                 "exit_price": exit_price,
                 "pnl":        pnl,
                 "closed_at":  _now_ts,
+                # Phase 3: set when mark_price was unavailable and entry_price
+                # was used as a neutral fallback (max_hold path only).
+                "fallback_close_no_mark_price": fallback_price,
             },
         },
     }
@@ -9723,12 +9781,23 @@ def _copy_auto_exit_close_position_sync(
 
         logging.warning(
             "COPY_EXIT_CLOSE_OK pos=%s slug=%s reason=%s "
-            "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f",
+            "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f fallback_price=%s",
             pos_id[:8],
             pos.get("market_slug") or "?",
             reason,
-            entry_price, exit_price, size, pnl,
+            entry_price, exit_price, size, pnl, fallback_price,
         )
+
+        if fallback_price and reason == CLOSE_REASON_MAX_HOLD:
+            logging.warning(
+                "COPY_MAX_HOLD_FALLBACK_CLOSE pos=%s slug=%s "
+                "— position force-closed by max_hold using entry_price=%.4f "
+                "as fallback exit (mark_price was unavailable). "
+                "PnL recorded as %.4f (net-zero). "
+                "raw_json.fallback_close_no_mark_price=true",
+                pos_id[:8], pos.get("market_slug") or "?",
+                entry_price, pnl,
+            )
 
         # Best-effort write to dedicated close_reason column (Phase 2 migration)
         _try_write_close_reason_col(pos_id, reason)
@@ -9955,6 +10024,16 @@ async def copy_auto_exit_loop() -> None:
                                     pos_id[:8], pos_slug,
                                     hold_min, max_hold_min,
                                 )
+                                logging.warning(
+                                    "COPY_MAX_HOLD_FALLBACK_NO_MARK pos=%s slug=%s "
+                                    "hold_min=%.1f token_id=%s condition_id=%s "
+                                    "— all Gamma price sources failed; "
+                                    "entry_price will be used as fallback exit_price",
+                                    pos_id[:8], pos_slug,
+                                    hold_min,
+                                    str(pos.get("token_id") or "NONE")[:16],
+                                    str(pos.get("condition_id") or "NONE")[:16],
+                                )
                             else:
                                 logging.warning(
                                     "COPY_EXIT_MAX_HOLD_HIT pos=%s slug=%s "
@@ -10005,6 +10084,7 @@ async def copy_auto_exit_loop() -> None:
                         pos,
                         exit_price,
                         close_reason,
+                        _using_fallback_price,  # Phase 3: recorded in raw_json
                     )
                     if ok:
                         if close_reason == CLOSE_REASON_AUTO_PROFIT:
