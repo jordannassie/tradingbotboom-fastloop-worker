@@ -6537,15 +6537,31 @@ def submit_copy_live_order(
         signed = client.create_order(order_args)
         resp   = client.post_order(signed, OrderType.GTC)
         raw_response: dict = resp if isinstance(resp, dict) else {"response": str(resp)}
+
+        # Detect CLOB-level rejections that don't raise a Python exception.
+        # The py-clob-client may return {"success": false, "errorMsg": "..."} or
+        # {"error": "..."} for API-level errors (e.g. insufficient balance,
+        # market closed, order size too small, invalid token).
+        _clob_success = raw_response.get("success")
+        _clob_err     = raw_response.get("errorMsg") or raw_response.get("error") or ""
+        if _clob_success is False or (_clob_success is None and _clob_err):
+            logging.warning(
+                "COPY_LIVE_CLOB_REJECT token=%s side=%s price=%.4f shares=%.4f "
+                "error=%s resp_keys=%s",
+                token_id, order_side, actual_price, actual_shares,
+                str(_clob_err)[:200], list(raw_response.keys())[:8],
+            )
+            return False, actual_price, actual_shares, raw_response
+
         logging.info(
             "COPY_LIVE_ORDER_OK token=%s side=%s price=%.4f shares=%.4f resp_keys=%s",
-            token_id[:16], order_side, actual_price, actual_shares,
+            token_id[:20], order_side, actual_price, actual_shares,
             list(raw_response.keys())[:5],
         )
         return True, actual_price, actual_shares, raw_response
     except Exception as exc:
         logging.exception(
-            "COPY_LIVE_ORDER_FAIL token=%s side=%s err=%s", token_id[:16], order_side, exc
+            "COPY_LIVE_ORDER_FAIL token=%s side=%s err=%s", token_id, order_side, exc
         )
         return False, actual_price, actual_shares, {"error": str(exc)}
 
@@ -6925,12 +6941,21 @@ def evaluate_and_execute_live_copy_trade(
     )
     order_side   = trade_side if trade_side in ("BUY", "SELL") else "BUY"
     source_price = submitted_price  # validated by shared brain
+    _order_kind  = "exit" if order_side == "SELL" else "entry"
 
+    # Pre-submission log: full token_id + exact OrderArgs context, entry vs exit.
+    # NOTE: for SELL (exit) orders the 'size' passed to submit_copy_live_order is
+    # a USD amount (from compute_copy_size) which is divided by the slippage-
+    # adjusted price to get shares.  This means the share count may differ from
+    # the shares originally bought if the market price has moved.  Watch for
+    # CLOB rejections citing 'insufficient shares' as a sign of this mismatch.
     logging.info(
-        "COPY_LIVE_ORDER_ATTEMPT bot=%s wallet=%s trade=%s "
-        "token_id=%s side=%s price=%.4f size=%.2f slippage=%.4f",
+        "COPY_LIVE_%s_SUBMIT_ATTEMPT bot=%s wallet=%s trade=%s "
+        "token_id=%s side=%s price=%.4f size_usd=%.2f slippage=%.4f",
+        _order_kind.upper(),
         _bot_name, _wallet, _trade_id,
-        str(token_id)[:20], order_side, source_price, final_size, max_slippage,
+        str(token_id),  # full token_id for unambiguous diagnostics
+        order_side, source_price, final_size, max_slippage,
     )
 
     ok, actual_price, actual_shares, raw_response = submit_copy_live_order(
@@ -6949,12 +6974,19 @@ def evaluate_and_execute_live_copy_trade(
             or raw_response.get("errorCode")
             or str(raw_response)[:300]
         )
+        _fail_tag = (
+            "COPY_LIVE_EXIT_SUBMIT_FAIL"
+            if order_side == "SELL"
+            else "COPY_LIVE_ENTRY_SUBMIT_FAIL"
+        )
         logging.warning(
-            "COPY_LIVE_ORDER_SUBMIT_FAIL bot=%s trade=%s "
-            "token_id=%s side=%s size=%.2f price=%.4f error=%s",
-            _bot_name, _trade_id,
-            str(token_id)[:20], order_side, final_size, source_price,
-            str(_err_detail)[:200],
+            "%s bot=%s trade=%s slug=%s "
+            "token_id=%s side=%s size_usd=%.2f price=%.4f error=%s",
+            _fail_tag, _bot_name, _trade_id,
+            str(wallet_trade.get("market_slug") or "?"),
+            str(token_id),  # full token_id
+            order_side, final_size, source_price,
+            str(_err_detail)[:300],
         )
         return False, "order_submission_failed", final_size, source_price, raw_response
 
@@ -8952,9 +8984,19 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                 elif live_ok:
                                     order_status = "LIVE_MATCHED"
                                 elif trade_side == "SELL":
-                                    # CLOB failed but we will still close the
-                                    # DB exit mirror below.
+                                    # CLOB SELL failed; DB close mirror still runs
+                                    # unconditionally below.  Log this explicitly so
+                                    # it is searchable separately from the CLOB failure.
                                     order_status = "LIVE_EXIT_DB_ONLY"
+                                    logging.warning(
+                                        "COPY_LIVE_EXIT_DB_ONLY_FALLBACK bot=%s "
+                                        "wallet=%s trade=%s slug=%s "
+                                        "clob_skip_reason=%s "
+                                        "— CLOB SELL failed; DB close will still run",
+                                        bot_label, wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        live_skip_reason,
+                                    )
                                 else:
                                     order_status = "SKIPPED"
 
