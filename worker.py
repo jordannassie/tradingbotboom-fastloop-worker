@@ -62,6 +62,7 @@ import base64
 import json
 import logging
 import os
+import re
 from collections import deque, defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
@@ -6362,6 +6363,14 @@ copy_live_trade_timestamps: deque = deque()
 # Entries are never actively pruned (bounded by COPY_LIVE_MAX_OPEN_POSITIONS = 3).
 _live_exit_attempt_ts: dict[str, float] = {}
 
+# CLOB client shared with copy loops that don't receive it as a parameter.
+# Set once in main() after build_trading_client(); read-only afterwards.
+_copy_trading_client: "ClobClient | None" = None
+
+# Positions for which a pre-expiry CLOB SELL has already been attempted in the
+# current process lifetime.  Prevents repeated SELL spam in the 15-second window.
+_pre_expiry_attempted_positions: set[str] = set()
+
 
 def _prune_live_copy_history() -> None:
     """Prune in-memory live copy timestamps older than 1 hour."""
@@ -10225,6 +10234,240 @@ def _copy_auto_exit_close_position_sync(
         return False
 
 
+def _try_pre_expiry_live_exit_sync(
+    pos: dict,
+    bot: dict,
+    client: "ClobClient | None",
+) -> bool:
+    """
+    Attempt a pre-expiry CLOB SELL for a live copied_position nearing market close.
+
+    Sync — designed to be called via asyncio.to_thread from copy_auto_exit_loop.
+
+    Returns True  when inside the pre-expiry window (whether or not the SELL
+                  succeeded).  Caller should skip the normal live-skip path.
+    Returns False when outside the window; caller falls through to normal log.
+
+    Close-time detection order (zero-API fallback first):
+      1. Parse Unix timestamp embedded in updown market slug:
+             <asset>-updown-<interval>-<unix_ts>  (e.g. btc-updown-5m-1776792000)
+      2. market_cache.end_date  (one DB query; populated by settlement loop)
+
+    Safety guards applied before submitting:
+      • already_attempted  — only one attempt per position per process lifetime
+      • no_trading_client  — COPY_LIVE_ENABLED=false or client not initialized
+      • no_token_id        — can't SELL without a CLOB token_id
+      • below_min_size     — projected shares < MIN_ORDER_SHARES (5) pre-flight
+      • exit_cooldown      — reuses SE-1 guard (_live_exit_attempt_ts)
+
+    On SELL success: closes the DB row (status=CLOSED, raw_json updated).
+    On SELL failure: logs COPY_PRE_EXPIRY_EXIT_FAIL; settlement/redeem runs later.
+    """
+    pos_id   = str(pos.get("id") or "")
+    pos_slug = str(pos.get("market_slug") or "?")
+    token_id = pos.get("token_id")
+    outcome  = str(pos.get("outcome") or "").upper()
+
+    # ── 1. Determine market close time ────────────────────────────────────────
+    end_dt: datetime | None = None
+
+    # Primary: parse Unix timestamp from slug (zero-latency, no I/O).
+    # Matches the trailing numeric field in updown slugs, e.g.
+    #   btc-updown-5m-1776792000  →  timestamp = 1776792000
+    _slug_ts_match = re.search(r"-(\d{9,11})$", pos_slug)
+    if _slug_ts_match:
+        try:
+            end_dt = datetime.fromtimestamp(
+                int(_slug_ts_match.group(1)), tz=timezone.utc
+            )
+        except (ValueError, OverflowError, OSError):
+            end_dt = None
+
+    # Fallback: market_cache.end_date (one DB call; avoids Gamma API call).
+    if end_dt is None and pos_slug != "?":
+        try:
+            _mc_resp = (
+                supabase.table("market_cache")
+                .select("end_date, yes_token_id, no_token_id")
+                .eq("market_slug", pos_slug)
+                .limit(1)
+                .execute()
+            )
+            _mc_rows = _mc_resp.data or []
+            if _mc_rows:
+                _mc_row = _mc_rows[0]
+                _end_str = _mc_row.get("end_date")
+                if _end_str:
+                    end_dt = _parse_ts(str(_end_str))
+                # Opportunistically enrich token_id from cache if missing.
+                if not token_id:
+                    if outcome in ("YES", "UP"):
+                        token_id = _mc_row.get("yes_token_id")
+                    elif outcome in ("NO", "DOWN"):
+                        token_id = _mc_row.get("no_token_id")
+        except Exception as _mc_exc:
+            logging.warning(
+                "COPY_PRE_EXPIRY_CACHE_FAIL pos=%s slug=%s err=%s",
+                pos_id[:8], pos_slug, _mc_exc,
+            )
+
+    if end_dt is None:
+        logging.info(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s reason=no_close_time",
+            pos_id[:8], pos_slug,
+        )
+        return False
+
+    # ── 2. Check window ───────────────────────────────────────────────────────
+    now_utc          = datetime.now(timezone.utc)
+    seconds_to_close = (end_dt - now_utc).total_seconds()
+
+    logging.info(
+        "COPY_PRE_EXPIRY_EXIT_CHECK pos=%s slug=%s "
+        "seconds_to_close=%.1f threshold=%s end_dt=%s",
+        pos_id[:8], pos_slug,
+        seconds_to_close, PRE_EXPIRY_EXIT_SECONDS,
+        end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+    # Not in window: too far out (>threshold) or long past close (> 60s ago).
+    if seconds_to_close > PRE_EXPIRY_EXIT_SECONDS or seconds_to_close < -60:
+        return False
+
+    # ── 3. Safety guards ──────────────────────────────────────────────────────
+    # Guard: already attempted for this position in this process run.
+    if pos_id in _pre_expiry_attempted_positions:
+        logging.info(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
+            "reason=already_attempted seconds_to_close=%.1f",
+            pos_id[:8], pos_slug, seconds_to_close,
+        )
+        return True
+
+    # Guard: no trading client or feature disabled.
+    if not client or not COPY_LIVE_ENABLED:
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
+            "reason=no_client_or_disabled seconds_to_close=%.1f",
+            pos_id[:8], pos_slug, seconds_to_close,
+        )
+        _pre_expiry_attempted_positions.add(pos_id)
+        return True
+
+    # Guard: token_id required for CLOB SELL.
+    if not token_id:
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s outcome=%s "
+            "reason=no_token_id seconds_to_close=%.1f",
+            pos_id[:8], pos_slug, outcome, seconds_to_close,
+        )
+        _pre_expiry_attempted_positions.add(pos_id)
+        return True
+
+    # Guard: projected shares below CLOB minimum (pre-flight, no API call).
+    size_usd     = float(pos.get("size") or 5.0)
+    entry_price  = float(pos.get("entry_price") or 0.5)
+    max_slippage = float(bot.get("max_slippage") or 0.03)
+    _s_lim_price = max(entry_price * (1.0 - max_slippage), 0.01)
+    _proj_shares = size_usd / _s_lim_price if _s_lim_price > 0 else 0.0
+    if _proj_shares < MIN_ORDER_SHARES:
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
+            "reason=below_min_size projected_shares=%.4f min=%.1f "
+            "size_usd=%.2f seconds_to_close=%.1f",
+            pos_id[:8], pos_slug,
+            _proj_shares, MIN_ORDER_SHARES, size_usd, seconds_to_close,
+        )
+        _pre_expiry_attempted_positions.add(pos_id)
+        return True
+
+    # Guard: reuse SE-1 exit cooldown (avoids stacking if this position's
+    # SELL is still pending from an earlier copy_trade_loop SELL mirror).
+    _now_ts    = time()
+    _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
+    if _now_ts - _last_exit < COPY_LIVE_EXIT_COOLDOWN_SEC:
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
+            "reason=exit_cooldown_active elapsed_sec=%s cooldown_sec=%s",
+            pos_id[:8], pos_slug,
+            int(_now_ts - _last_exit), COPY_LIVE_EXIT_COOLDOWN_SEC,
+        )
+        _pre_expiry_attempted_positions.add(pos_id)
+        return True
+
+    # ── 4. Attempt CLOB SELL ──────────────────────────────────────────────────
+    _pre_expiry_attempted_positions.add(pos_id)
+    _live_exit_attempt_ts[str(token_id)] = _now_ts
+
+    logging.warning(
+        "COPY_PRE_EXPIRY_EXIT_ATTEMPT pos=%s bot=%s slug=%s token_id=%s "
+        "outcome=%s seconds_to_close=%.1f size_usd=%.2f entry_price=%.4f",
+        pos_id[:8], str(bot.get("id") or "?")[:8],
+        pos_slug, str(token_id)[:20],
+        outcome, seconds_to_close, size_usd, entry_price,
+    )
+
+    ok, actual_price, actual_shares, raw_response = submit_copy_live_order(
+        client,
+        str(token_id),
+        "SELL",
+        entry_price,
+        size_usd,
+        max_slippage,
+    )
+
+    if ok:
+        _exit_price = actual_price if actual_price else entry_price
+        _pnl = round(
+            (_exit_price - entry_price) / max(entry_price, 0.0001) * size_usd, 4
+        )
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_OK pos=%s slug=%s token_id=%s "
+            "actual_price=%.4f actual_shares=%.4f pnl=%.4f",
+            pos_id[:8], pos_slug, str(token_id)[:20],
+            _exit_price, actual_shares or 0, _pnl,
+        )
+        # Close the DB row — LIVE position (no paper bankroll update).
+        # Concurrency guard: .eq("status", "OPEN") prevents double-close.
+        _rj = dict(pos.get("raw_json") or {})
+        _rj["close_reason"]   = CLOSE_REASON_PRE_EXPIRY
+        _rj["pre_expiry_exit"] = True
+        try:
+            supabase.table("copied_positions").update({
+                "status":     "CLOSED",
+                "exit_price": _exit_price,
+                "closed_at":  datetime.now(timezone.utc).isoformat(),
+                "pnl":        _pnl,
+                "raw_json":   _rj,
+            }).eq("id", pos_id).eq("status", "OPEN").execute()
+            _try_write_close_reason_col(pos_id, CLOSE_REASON_PRE_EXPIRY)
+            logging.info(
+                "COPY_PRE_EXPIRY_POSITION_CLOSED pos=%s slug=%s "
+                "exit_price=%.4f pnl=%.4f",
+                pos_id[:8], pos_slug, _exit_price, _pnl,
+            )
+        except Exception as _db_exc:
+            logging.warning(
+                "COPY_PRE_EXPIRY_POSITION_CLOSE_FAIL pos=%s slug=%s err=%s",
+                pos_id[:8], pos_slug, _db_exc,
+            )
+    else:
+        _err = (
+            raw_response.get("errorMsg")
+            or raw_response.get("error")
+            or str(raw_response)[:100]
+        )
+        logging.warning(
+            "COPY_PRE_EXPIRY_EXIT_FAIL pos=%s slug=%s token_id=%s "
+            "error=%s seconds_to_close=%.1f "
+            "— settlement/redeem path remains intact",
+            pos_id[:8], pos_slug, str(token_id)[:20],
+            _err, seconds_to_close,
+        )
+
+    return True
+
+
 async def copy_auto_exit_loop() -> None:
     """
     Auto-profit / max-hold background scanner for OPEN copied positions.
@@ -10465,9 +10708,23 @@ async def copy_auto_exit_loop() -> None:
 
                     # ── 3j. Live block ────────────────────────────────────────
                     if is_live:
+                        # Pre-expiry exit: attempt a CLOB SELL in the final
+                        # PRE_EXPIRY_EXIT_SECONDS before market close.
+                        # Best-effort — settlement/redeem path is unaffected.
+                        if PRE_EXPIRY_EXIT_SECONDS > 0:
+                            _pe_in_window = await asyncio.to_thread(
+                                _try_pre_expiry_live_exit_sync,
+                                pos, bot, _copy_trading_client,
+                            )
+                            if _pe_in_window:
+                                # Pre-expiry attempt was made (OK or FAIL logged
+                                # inside helper).  Skip normal live-skip logging.
+                                skipped += 1
+                                continue
+
                         logging.warning(
                             "COPY_EXIT_SKIP_LIVE_UNSUPPORTED pos=%s slug=%s reason=%s "
-                            "— live auto-exit is not yet implemented; "
+                            "— live auto-exit not yet implemented; "
                             "position remains open until source wallet SELL or settlement",
                             pos_id[:8], pos_slug, close_reason,
                         )
@@ -11962,6 +12219,8 @@ async def main():
         COPY_LIVE_ENABLED,
     )
     trading_client = build_trading_client()
+    global _copy_trading_client
+    _copy_trading_client = trading_client
     tasks = []
     # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
     tasks.append(asyncio.create_task(_run_forever("rotate_loop", rotate_loop)))

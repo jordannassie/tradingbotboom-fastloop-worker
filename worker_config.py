@@ -481,6 +481,11 @@ CLOSE_REASON_SETTLED_MARKET       = "settled_market"
 CLOSE_REASON_MANUAL_RESET         = "manual_reset"
 CLOSE_REASON_CLOSE_FAILED_RETRY   = "close_failed_retrying"
 CLOSE_REASON_CLOSE_FAILED_FINAL   = "close_failed_final"
+CLOSE_REASON_PRE_EXPIRY           = "pre_expiry_exit"
+
+# Seconds before market close at which to attempt a LIVE pre-expiry SELL.
+# Set to 0 to disable the feature entirely.
+PRE_EXPIRY_EXIT_SECONDS           = int(os.getenv("PRE_EXPIRY_EXIT_SECONDS", "15"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
