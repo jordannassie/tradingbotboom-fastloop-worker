@@ -6520,6 +6520,37 @@ def submit_copy_live_order(
         return False, actual_price, actual_shares, {"error": str(exc)}
 
 
+def _check_live_account_ready() -> "tuple[bool, str]":
+    """
+    In-memory readiness check for the live Polymarket CLOB account.
+
+    Uses cached values populated by live_balance_loop / derive_wallet_addresses —
+    no additional API calls, zero latency.
+
+    Signals checked (in order):
+      live_signer_address   — proxy wallet registered and returned by CLOB API.
+                              None means the account has never completed setup
+                              or the API auth failed at startup.
+      live_allowance_cache  — USDC token approval (collateral allowance) > 0.
+                              Zero or None means the USDC approval transaction
+                              has not been submitted / confirmed yet.
+      live_balance_cache    — USDC balance > 0.
+                              Zero or None means the account has no funds.
+
+    Only applied to BUY orders — SELL/mirror closes are always allowed through.
+
+    Returns (True, "") when all signals are healthy.
+    Returns (False, reason_string) on the first failing signal.
+    """
+    if not live_signer_address:
+        return False, "proxy_wallet_not_initialized"
+    if live_allowance_cache is None or live_allowance_cache <= 0:
+        return False, "usdc_allowance_zero_or_unknown"
+    if live_balance_cache is None or live_balance_cache <= 0:
+        return False, "usdc_balance_zero_or_unknown"
+    return True, ""
+
+
 def evaluate_and_execute_live_copy_trade(
     copy_bot: dict,
     wallet_trade: dict,
@@ -6750,6 +6781,30 @@ def evaluate_and_execute_live_copy_trade(
         logging.info(
             "COPY_LIVE_SIZE_CAPPED bot=%s shared=%.2f cap=%.2f final=%.2f",
             _bot_name, float(submitted_size), COPY_LIVE_MAX_TRADE_USD, final_size,
+        )
+
+    # ── Live account readiness (BUY only) ────────────────────────────────────
+    # SELL/mirror-close orders are exempt — exits must always be attempted.
+    # For BUY entries, verify the cached CLOB account state before submitting.
+    if trade_side in ("BUY", ""):
+        _acct_ok, _acct_fail = _check_live_account_ready()
+        if not _acct_ok:
+            logging.warning(
+                "COPY_LIVE_ACCOUNT_READY_FAIL bot=%s trade=%s reason=%s "
+                "proxy_wallet=%s allowance=%s balance=%s",
+                _bot_name, _trade_id, _acct_fail,
+                bool(live_signer_address),
+                live_allowance_cache,
+                live_balance_cache,
+            )
+            return False, f"live_account_not_ready_{_acct_fail}", None, None, {}
+        logging.info(
+            "COPY_LIVE_ACCOUNT_READY_OK bot=%s trade=%s "
+            "signer=%s allowance=%.4f balance=%.4f",
+            _bot_name, _trade_id,
+            str(live_signer_address or "?")[:16],
+            live_allowance_cache or 0.0,
+            live_balance_cache or 0.0,
         )
 
     # ── Submit CLOB order ─────────────────────────────────────────────────────
