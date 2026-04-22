@@ -365,14 +365,15 @@ COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",     
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
 
-# Seconds to suppress duplicate SELL exit submissions for the same CLOB token.
-# Prevents "not enough balance" rejections caused by a pending exit order still
-# reserving CLOB collateral from a previous loop tick.  Override via env var.
-COPY_LIVE_EXIT_COOLDOWN_SEC    = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_SEC",     "90"))
+# Seconds to suppress exact-duplicate SELL exit submissions for the same CLOB
+# token within a single loop tick.  Kept tiny (3s) to allow fast re-tries while
+# preventing the same exit event from being submitted twice in rapid succession.
+# Override via env var.  Previous value was 90s — reduced to 3s to unblock
+# fast-market exits that were being held as live_exit_already_pending.
+COPY_LIVE_EXIT_COOLDOWN_SEC    = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_SEC",     "3"))
 
-# Shorter cooldown for fast 5-minute up/down markets where the 90s default
-# blocks timely exits.  Applied when the market slug is in the fast-market set.
-COPY_LIVE_EXIT_COOLDOWN_FAST_SEC = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_FAST_SEC", "20"))
+# Fast-market window — also 3s; slug-based distinction preserved for future use.
+COPY_LIVE_EXIT_COOLDOWN_FAST_SEC = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_FAST_SEC", "3"))
 
 # Slugs that use COPY_LIVE_EXIT_COOLDOWN_FAST_SEC instead of the default.
 COPY_LIVE_EXIT_FAST_MARKET_SLUGS: frozenset[str] = frozenset({
