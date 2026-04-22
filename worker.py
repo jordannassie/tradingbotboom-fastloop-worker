@@ -2514,6 +2514,14 @@ def execute_live_strategy(
 ) -> bool:
     global trade_triggers
     if not client or not current_yes_token or not current_no_token:
+        logging.warning(
+            "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=client_or_tokens "
+            "client=%s yes_token=%s no_token=%s",
+            strategy_id, current_slug,
+            "available" if client else "missing",
+            bool(current_yes_token),
+            bool(current_no_token),
+        )
         return False
     logging.info(
         "LIVE_EXEC strategy=%s slug=%s size_usd=%s",
@@ -2523,6 +2531,8 @@ def execute_live_strategy(
     )
     trade_triggers += 1
     try:
+        orders_attempted = 0
+        orders_ok = 0
         if size_usd is not None and size_usd > 0:
             yes_shares = compute_shares_from_size(size_usd, ya) if ya else 0
             no_shares = compute_shares_from_size(size_usd, na) if na else 0
@@ -2535,10 +2545,11 @@ def execute_live_strategy(
                 "BUY",
             ):
                 logging.info(
-                    "LIVE_ORDER_SUBMIT strategy=%s side=yes slug=%s price=%s size=%s shares=%s",
-                    strategy_id, current_slug, ya, size_usd, yes_shares,
+                    "LIVE_ORDER_SUBMIT_ATTEMPT strategy=%s slug=%s side=yes token=%s shares=%s price=%s size_usd=%s",
+                    strategy_id, current_slug, current_yes_token, yes_shares, ya, size_usd,
                 )
-                submit_order(
+                orders_attempted += 1
+                ok_yes = submit_order(
                     client,
                     current_yes_token,
                     "yes",
@@ -2549,6 +2560,23 @@ def execute_live_strategy(
                     size_usd,
                     strategy_id=strategy_id,
                 )
+                if ok_yes:
+                    orders_ok += 1
+                    logging.info(
+                        "LIVE_ORDER_SUBMIT_OK strategy=%s slug=%s side=yes",
+                        strategy_id, current_slug,
+                    )
+                else:
+                    logging.warning(
+                        "LIVE_ORDER_SUBMIT_FAIL strategy=%s slug=%s side=yes",
+                        strategy_id, current_slug,
+                    )
+            else:
+                logging.info(
+                    "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=min_shares_or_price side=yes "
+                    "ya=%s yes_shares=%s",
+                    strategy_id, current_slug, ya, yes_shares,
+                )
             if na is not None and no_shares > 0 and not _should_skip_min_shares(
                 client,
                 current_no_token,
@@ -2558,10 +2586,11 @@ def execute_live_strategy(
                 "BUY",
             ):
                 logging.info(
-                    "LIVE_ORDER_SUBMIT strategy=%s side=no slug=%s price=%s size=%s shares=%s",
-                    strategy_id, current_slug, na, size_usd, no_shares,
+                    "LIVE_ORDER_SUBMIT_ATTEMPT strategy=%s slug=%s side=no token=%s shares=%s price=%s size_usd=%s",
+                    strategy_id, current_slug, current_no_token, no_shares, na, size_usd,
                 )
-                submit_order(
+                orders_attempted += 1
+                ok_no = submit_order(
                     client,
                     current_no_token,
                     "no",
@@ -2572,6 +2601,27 @@ def execute_live_strategy(
                     size_usd,
                     strategy_id=strategy_id,
                 )
+                if ok_no:
+                    orders_ok += 1
+                    logging.info(
+                        "LIVE_ORDER_SUBMIT_OK strategy=%s slug=%s side=no",
+                        strategy_id, current_slug,
+                    )
+                else:
+                    logging.warning(
+                        "LIVE_ORDER_SUBMIT_FAIL strategy=%s slug=%s side=no",
+                        strategy_id, current_slug,
+                    )
+            else:
+                logging.info(
+                    "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=min_shares_or_price side=no "
+                    "na=%s no_shares=%s",
+                    strategy_id, current_slug, na, no_shares,
+                )
+        logging.info(
+            "LIVE_EXEC_SUMMARY strategy=%s slug=%s orders_attempted=%s orders_ok=%s size_usd=%s",
+            strategy_id, current_slug, orders_attempted, orders_ok, size_usd,
+        )
         return True
     except Exception:
         logging.exception("Live execution failed for strategy %s", strategy_id)
@@ -2710,12 +2760,20 @@ async def execute_strategy(
         "SHARED_STRATEGY_BRAIN_DECISION strategy=%s slug=%s side=%s decision=take paper_and_live_same_source=true",
         strategy_id, current_slug, final_side,
     )
-    route_live = live_master_enabled and not skip_live
+    route_live = live_master_enabled and not skip_live and client is not None
+    logging.info(
+        "LIVE_DECISION_TAKE_OR_SKIP strategy=%s slug=%s side=%s route_live=%s "
+        "live_master=%s skip_live=%s client=%s",
+        strategy_id, current_slug, final_side, route_live,
+        live_master_enabled, skip_live, "available" if client else "missing",
+    )
     executed_live = False
     live_size_usd = None
     if not route_live:
         if not live_master_enabled:
             live_skip_reason = "live_master_disabled"
+        elif client is None:
+            live_skip_reason = "client_missing"
         elif skip_live:
             live_skip_reason = "force_exit_active"
         else:
@@ -2740,9 +2798,20 @@ async def execute_strategy(
         if new_allowance is not None:
             allowance = new_allowance
         logging.info("LIVE_BANKROLL_AFTER_REFRESH live_balance_usd=%s", live_balance)
+        logging.info(
+            "LIVE_EXECUTION_GATE strategy=%s slug=%s live_balance=%s allowance=%s "
+            "min_required=%s yes_token=%s no_token=%s",
+            strategy_id, current_slug, live_balance, allowance,
+            LIVE_MIN_AVAILABLE_USD, bool(current_yes_token), bool(current_no_token),
+        )
         if should_skip_new_entries(
             "LIVE", live_balance, LIVE_MIN_AVAILABLE_USD, strategy_id
         ):
+            logging.warning(
+                "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=bankroll_guard "
+                "balance=%s min_required=%s",
+                strategy_id, current_slug, live_balance, LIVE_MIN_AVAILABLE_USD,
+            )
             route_live = False
         elif live_balance is None or live_balance <= 0:
             logging.warning(
