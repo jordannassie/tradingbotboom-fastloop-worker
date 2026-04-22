@@ -4160,6 +4160,12 @@ async def rotate_loop():
                 (current_yes_token[:6] + "...") if current_yes_token else "none",
                 (current_no_token[:6] + "...") if current_no_token else "none",
             )
+            logging.info(
+                "LIVE_ROTATED_TO_CURRENT_SLUG slug=%s yes_token=%s no_token=%s",
+                current_slug,
+                bool(current_yes_token),
+                bool(current_no_token),
+            )
         prefix_index = (prefix_index + 1) % len(prefixes)
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
@@ -4747,6 +4753,20 @@ async def heartbeat_loop(client: ClobClient | None):
                     slug_field,
                     paper_enabled,
                 )
+            # Show slug freshness every minute so stale/expired slugs are obvious.
+            _slug_start_probe = slug_start_timestamp(current_slug)
+            _time_to_end_probe = (
+                (_slug_start_probe + (current_interval_seconds or 300)) - now_ts
+                if _slug_start_probe is not None
+                else None
+            )
+            logging.info(
+                "LIVE_ACTIVE_SLUG slug=%s time_to_end=%s expired=%s interval_s=%s",
+                current_slug or "none",
+                _time_to_end_probe,
+                _time_to_end_probe is not None and _time_to_end_probe < 0,
+                current_interval_seconds,
+            )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
                 "STUCK_DETECTOR_LIVE subsystem=btcbot_strategy_live scope=btcbot_strategy_only "
@@ -4828,7 +4848,18 @@ async def heartbeat_loop(client: ClobClient | None):
             and is_enabled_combined
             and time_to_end is not None
         ):
-            if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+            if time_to_end < 0:
+                # Market has already expired (negative time_to_end). Skip force-exit
+                # entirely — there are no live positions to close on a finished market.
+                # entry_cutoff_active=True will block new entries naturally.
+                # Let rotate_loop refresh current_slug to the current valid market.
+                logging.warning(
+                    "LIVE_EXPIRED_SLUG_SKIPPED slug=%s time_to_end=%s "
+                    "reason=market_expired_negative_time skip_force_exit=true",
+                    current_slug,
+                    time_to_end,
+                )
+            elif should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
                     signer = live_signer_address or live_funder_address
                     positions_truth = get_live_positions_truth(
                         client, signer, purpose="force_exit"
