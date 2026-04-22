@@ -732,7 +732,7 @@ def get_live_positions_from_tracker(min_shares: float = 0.01) -> dict[str, float
     if now_ts != last_tracker_snapshot_log_ts:
         tokens = list(snapshot.items())[:3]
         logging.info(
-            "LIVE_TRACKER_SNAPSHOT tokens=%s example=%s",
+            "LIVE_TRACKER_SNAPSHOT subsystem=btcbot_strategy_live tokens=%s example=%s",
             len(snapshot),
             [(token, round(shares, 4)) for token, shares in tokens],
         )
@@ -1617,7 +1617,7 @@ async def evaluate_live_tpsl_positions(
         client, signer, purpose="tpsl"
     )
     if not positions_truth:
-        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS reason=truth_empty")
+        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS subsystem=btcbot_strategy_live reason=truth_empty")
         return
     for token_id, info in list(live_entry_info.items()):
         strategy = info.get("strategy")
@@ -1634,7 +1634,7 @@ async def evaluate_live_tpsl_positions(
         shares = positions_truth.get(token_id, 0.0)
         if shares <= 0:
             logging.info(
-                "LIVE_TPSL_SKIP_NO_POSITIONS token_id=%s shares=%s",
+                "LIVE_TPSL_SKIP_NO_POSITIONS subsystem=btcbot_strategy_live token_id=%s shares=%s",
                 token_id,
                 shares,
             )
@@ -2704,26 +2704,30 @@ async def execute_strategy(
         )
         return False
 
-    route_live = live_master_enabled and settings["arm_live"] and not skip_live
+    # Shared strategy brain: LIVE and PAPER evaluate from the same source of truth.
+    # arm_live is no longer a routing gate; live_master_enabled is the single live switch.
+    logging.info(
+        "SHARED_STRATEGY_BRAIN_DECISION strategy=%s slug=%s side=%s decision=take paper_and_live_same_source=true",
+        strategy_id, current_slug, final_side,
+    )
+    route_live = live_master_enabled and not skip_live
     executed_live = False
     live_size_usd = None
     if not route_live:
         if not live_master_enabled:
             live_skip_reason = "live_master_disabled"
-        elif not settings["arm_live"]:
-            live_skip_reason = "arm_live_off"
         elif skip_live:
             live_skip_reason = "force_exit_active"
         else:
             live_skip_reason = "unknown"
         logging.info(
-            "LIVE_STRATEGY_SKIP strategy=%s reason=%s slug=%s",
-            strategy_id, live_skip_reason, current_slug,
+            "EXECUTION_MODE_BRANCH strategy=%s slug=%s chosen_mode=paper reason=%s",
+            strategy_id, current_slug, live_skip_reason,
         )
     if route_live:
         logging.info(
-            "LIVE_STRATEGY_EVALUATED strategy=%s slug=%s arm_live=%s live_master=%s",
-            strategy_id, current_slug, settings["arm_live"], live_master_enabled,
+            "EXECUTION_MODE_BRANCH strategy=%s slug=%s chosen_mode=live reason=live_master_enabled",
+            strategy_id, current_slug,
         )
         derive_wallet_addresses(client)
         live_balance = get_live_balance_value()
@@ -3459,7 +3463,7 @@ async def evaluate_candle_strategies(
             settings["arm_live"],
             live_master_enabled,
             "ENTER_LIVE"
-            if executed and live_master_enabled and settings["arm_live"]
+            if executed and live_master_enabled
             else "ENTER_PAPER"
             if executed
             else "SKIP_OTHER",
@@ -4618,12 +4622,9 @@ async def heartbeat_loop(client: ClobClient | None):
         )
         mode = fastloop_settings["mode"]
         edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
-        arm_live_active = (
-            sniper_settings["arm_live"]
-            or fastloop_settings["arm_live"]
-            or candle_bias_settings["arm_live"]
-            or any(settings["arm_live"] for settings in candle_strategy_settings.values())
-        )
+        # Shared brain: any enabled strategy is eligible for live routing.
+        # arm_live is kept for informational logging only; it no longer gates execution.
+        arm_live_active = is_enabled_combined
         slug_field = current_slug or "none"
         if now_ts - last_proof_tick_ts >= 60:
             last_proof_tick_ts = now_ts
@@ -4642,26 +4643,63 @@ async def heartbeat_loop(client: ClobClient | None):
                 candle_bias_settings.get("direction_mode", "normal"),
                 candle_bias_settings.get("bias_side", "yes"),
             )
+            # Step 24: Warn clearly when strategy live has nothing active.
+            if live_master_enabled and not is_enabled_combined:
+                logging.warning(
+                    "STRATEGY_LIVE_DISABLED_NO_ARMED_BOTS subsystem=btcbot_strategy_live "
+                    "live_master_enabled=%s armed_sniper=%s armed_fastloop=%s "
+                    "candle_strategies_enabled=%s "
+                    "message=\"strategy live is idle because no live strategy bots are armed\"",
+                    live_master_enabled,
+                    sniper_settings["is_enabled"],
+                    fastloop_settings["is_enabled"],
+                    candle_strategy_enabled,
+                )
+            # Step 25: Log strategy plan parity — LIVE mirrors PAPER's enabled set.
+            paper_enabled = [
+                s for s, cfg in [
+                    ("sniper", sniper_settings),
+                    ("fastloop", fastloop_settings),
+                    ("candle_bias", candle_bias_settings),
+                ] + [(sid, candle_strategy_settings[sid]) for sid in candle_strategy_settings]
+                if cfg["is_enabled"]
+            ]
+            logging.info(
+                "STRATEGY_PLAN_PARITY subsystem=btcbot_strategy_live slug=%s "
+                "paper_enabled_strategies=%s live_enabled_strategies=%s parity_match=true",
+                slug_field,
+                paper_enabled,
+                paper_enabled,
+            )
+            if paper_enabled:
+                logging.info(
+                    "LIVE_USING_PAPER_PLAN subsystem=btcbot_strategy_live slug=%s "
+                    "strategies_active=%s reason=\"live mirrors paper strategy plan\"",
+                    slug_field,
+                    paper_enabled,
+                )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
-                "STUCK_DETECTOR_LIVE scope=btcbot_strategy_only "
+                "STUCK_DETECTOR_LIVE subsystem=btcbot_strategy_live scope=btcbot_strategy_only "
                 "no_live_orders_for_s=%s live_master_enabled=%s "
-                "armed_sniper=%s armed_fastloop=%s slug=%s",
+                "sniper_enabled=%s fastloop_enabled=%s slug=%s "
+                "note='copy_trading_live is a separate subsystem and may be healthy'",
                 now_ts - last_live_order_ts,
                 live_master_enabled,
-                sniper_settings["arm_live"],
-                fastloop_settings["arm_live"],
+                sniper_settings["is_enabled"],
+                fastloop_settings["is_enabled"],
                 slug_field,
             )
         if now_ts - last_any_order_ts > STUCK_ANY_SECONDS:
             logging.warning(
-                "STUCK_DETECTOR_ANY scope=btcbot_strategy_only "
+                "STUCK_DETECTOR_ANY subsystem=btcbot_strategy_live scope=btcbot_strategy_only "
                 "no_orders_for_s=%s live_master_enabled=%s "
-                "armed_sniper=%s armed_fastloop=%s slug=%s",
+                "sniper_enabled=%s fastloop_enabled=%s slug=%s "
+                "note='copy_trading_live is a separate subsystem and may be healthy'",
                 now_ts - last_any_order_ts,
                 live_master_enabled,
-                sniper_settings["arm_live"],
-                fastloop_settings["arm_live"],
+                sniper_settings["is_enabled"],
+                fastloop_settings["is_enabled"],
                 slug_field,
             )
         if (
@@ -4718,12 +4756,7 @@ async def heartbeat_loop(client: ClobClient | None):
             live_master_enabled
             and client
             and current_slug
-            and (
-                sniper_settings["arm_live"]
-                or fastloop_settings["arm_live"]
-                or candle_bias_settings["arm_live"]
-                or any(settings["arm_live"] for settings in candle_strategy_settings.values())
-            )
+            and is_enabled_combined
             and time_to_end is not None
         ):
             if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
@@ -4995,7 +5028,7 @@ async def heartbeat_loop(client: ClobClient | None):
                         sniper_settings["arm_live"],
                         live_master_enabled,
                         "ENTER_LIVE"
-                        if sniper_traded and live_master_enabled and sniper_settings["arm_live"]
+                        if sniper_traded and live_master_enabled
                         else "ENTER_PAPER",
                     )
             else:
@@ -5114,9 +5147,9 @@ async def heartbeat_loop(client: ClobClient | None):
                             fastloop_settings["is_enabled"],
                             fastloop_settings["arm_live"],
                             live_master_enabled,
-                            "ENTER_LIVE"
-                            if fastloop_executed and live_master_enabled and fastloop_settings["arm_live"]
-                            else "ENTER_PAPER",
+                        "ENTER_LIVE"
+                        if fastloop_executed and live_master_enabled
+                        else "ENTER_PAPER",
                         )
                 else:
                     log_paper_decision(
@@ -5230,7 +5263,7 @@ async def heartbeat_loop(client: ClobClient | None):
                     candle_bias_settings["arm_live"],
                     live_master_enabled,
                     "ENTER_LIVE"
-                    if candle_bias_traded and live_master_enabled and candle_bias_settings["arm_live"]
+                    if candle_bias_traded and live_master_enabled
                     else "ENTER_PAPER" if candle_bias_traded
                     else "SKIP_OTHER",
                 )
