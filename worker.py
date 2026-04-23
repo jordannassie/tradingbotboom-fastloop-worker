@@ -4849,17 +4849,16 @@ async def heartbeat_loop(client: ClobClient | None):
             and time_to_end is not None
         ):
             if time_to_end < 0:
-                # Market has already expired. Skip this entire tick — no force-exit,
-                # no strategy evaluation. Preserve the 5-second tick rate while
-                # waiting for rotate_loop to refresh current_slug to the current market.
+                # Market has already expired (negative time_to_end). Skip force-exit
+                # entirely — there are no live positions to close on a finished market.
+                # entry_cutoff_active=True will block new entries naturally.
+                # Let rotate_loop refresh current_slug to the current valid market.
                 logging.warning(
                     "LIVE_EXPIRED_SLUG_SKIPPED slug=%s time_to_end=%s "
                     "reason=market_expired_negative_time skip_force_exit=true",
                     current_slug,
                     time_to_end,
                 )
-                await asyncio.sleep(5)
-                continue
             elif should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
                     signer = live_signer_address or live_funder_address
                     positions_truth = get_live_positions_truth(
