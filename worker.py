@@ -62,7 +62,6 @@ import base64
 import json
 import logging
 import os
-import re
 from collections import deque, defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
@@ -732,7 +731,7 @@ def get_live_positions_from_tracker(min_shares: float = 0.01) -> dict[str, float
     if now_ts != last_tracker_snapshot_log_ts:
         tokens = list(snapshot.items())[:3]
         logging.info(
-            "LIVE_TRACKER_SNAPSHOT subsystem=btcbot_strategy_live tokens=%s example=%s",
+            "LIVE_TRACKER_SNAPSHOT tokens=%s example=%s",
             len(snapshot),
             [(token, round(shares, 4)) for token, shares in tokens],
         )
@@ -1617,7 +1616,7 @@ async def evaluate_live_tpsl_positions(
         client, signer, purpose="tpsl"
     )
     if not positions_truth:
-        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS subsystem=btcbot_strategy_live reason=truth_empty")
+        logging.info("LIVE_TPSL_SKIP_NO_POSITIONS reason=truth_empty")
         return
     for token_id, info in list(live_entry_info.items()):
         strategy = info.get("strategy")
@@ -1634,7 +1633,7 @@ async def evaluate_live_tpsl_positions(
         shares = positions_truth.get(token_id, 0.0)
         if shares <= 0:
             logging.info(
-                "LIVE_TPSL_SKIP_NO_POSITIONS subsystem=btcbot_strategy_live token_id=%s shares=%s",
+                "LIVE_TPSL_SKIP_NO_POSITIONS token_id=%s shares=%s",
                 token_id,
                 shares,
             )
@@ -2514,14 +2513,6 @@ def execute_live_strategy(
 ) -> bool:
     global trade_triggers
     if not client or not current_yes_token or not current_no_token:
-        logging.warning(
-            "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=client_or_tokens "
-            "client=%s yes_token=%s no_token=%s",
-            strategy_id, current_slug,
-            "available" if client else "missing",
-            bool(current_yes_token),
-            bool(current_no_token),
-        )
         return False
     logging.info(
         "LIVE_EXEC strategy=%s slug=%s size_usd=%s",
@@ -2531,8 +2522,6 @@ def execute_live_strategy(
     )
     trade_triggers += 1
     try:
-        orders_attempted = 0
-        orders_ok = 0
         if size_usd is not None and size_usd > 0:
             yes_shares = compute_shares_from_size(size_usd, ya) if ya else 0
             no_shares = compute_shares_from_size(size_usd, na) if na else 0
@@ -2545,11 +2534,10 @@ def execute_live_strategy(
                 "BUY",
             ):
                 logging.info(
-                    "LIVE_ORDER_SUBMIT_ATTEMPT strategy=%s slug=%s side=yes token=%s shares=%s price=%s size_usd=%s",
-                    strategy_id, current_slug, current_yes_token, yes_shares, ya, size_usd,
+                    "LIVE_ORDER_SUBMIT strategy=%s side=yes slug=%s price=%s size=%s shares=%s",
+                    strategy_id, current_slug, ya, size_usd, yes_shares,
                 )
-                orders_attempted += 1
-                ok_yes = submit_order(
+                submit_order(
                     client,
                     current_yes_token,
                     "yes",
@@ -2560,23 +2548,6 @@ def execute_live_strategy(
                     size_usd,
                     strategy_id=strategy_id,
                 )
-                if ok_yes:
-                    orders_ok += 1
-                    logging.info(
-                        "LIVE_ORDER_SUBMIT_OK strategy=%s slug=%s side=yes",
-                        strategy_id, current_slug,
-                    )
-                else:
-                    logging.warning(
-                        "LIVE_ORDER_SUBMIT_FAIL strategy=%s slug=%s side=yes",
-                        strategy_id, current_slug,
-                    )
-            else:
-                logging.info(
-                    "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=min_shares_or_price side=yes "
-                    "ya=%s yes_shares=%s",
-                    strategy_id, current_slug, ya, yes_shares,
-                )
             if na is not None and no_shares > 0 and not _should_skip_min_shares(
                 client,
                 current_no_token,
@@ -2586,11 +2557,10 @@ def execute_live_strategy(
                 "BUY",
             ):
                 logging.info(
-                    "LIVE_ORDER_SUBMIT_ATTEMPT strategy=%s slug=%s side=no token=%s shares=%s price=%s size_usd=%s",
-                    strategy_id, current_slug, current_no_token, no_shares, na, size_usd,
+                    "LIVE_ORDER_SUBMIT strategy=%s side=no slug=%s price=%s size=%s shares=%s",
+                    strategy_id, current_slug, na, size_usd, no_shares,
                 )
-                orders_attempted += 1
-                ok_no = submit_order(
+                submit_order(
                     client,
                     current_no_token,
                     "no",
@@ -2601,27 +2571,6 @@ def execute_live_strategy(
                     size_usd,
                     strategy_id=strategy_id,
                 )
-                if ok_no:
-                    orders_ok += 1
-                    logging.info(
-                        "LIVE_ORDER_SUBMIT_OK strategy=%s slug=%s side=no",
-                        strategy_id, current_slug,
-                    )
-                else:
-                    logging.warning(
-                        "LIVE_ORDER_SUBMIT_FAIL strategy=%s slug=%s side=no",
-                        strategy_id, current_slug,
-                    )
-            else:
-                logging.info(
-                    "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=min_shares_or_price side=no "
-                    "na=%s no_shares=%s",
-                    strategy_id, current_slug, na, no_shares,
-                )
-        logging.info(
-            "LIVE_EXEC_SUMMARY strategy=%s slug=%s orders_attempted=%s orders_ok=%s size_usd=%s",
-            strategy_id, current_slug, orders_attempted, orders_ok, size_usd,
-        )
         return True
     except Exception:
         logging.exception("Live execution failed for strategy %s", strategy_id)
@@ -2754,38 +2703,26 @@ async def execute_strategy(
         )
         return False
 
-    # Shared strategy brain: LIVE and PAPER evaluate from the same source of truth.
-    # arm_live is no longer a routing gate; live_master_enabled is the single live switch.
-    logging.info(
-        "SHARED_STRATEGY_BRAIN_DECISION strategy=%s slug=%s side=%s decision=take paper_and_live_same_source=true",
-        strategy_id, current_slug, final_side,
-    )
-    route_live = live_master_enabled and not skip_live and client is not None
-    logging.info(
-        "LIVE_DECISION_TAKE_OR_SKIP strategy=%s slug=%s side=%s route_live=%s "
-        "live_master=%s skip_live=%s client=%s",
-        strategy_id, current_slug, final_side, route_live,
-        live_master_enabled, skip_live, "available" if client else "missing",
-    )
+    route_live = live_master_enabled and settings["arm_live"] and not skip_live
     executed_live = False
     live_size_usd = None
     if not route_live:
         if not live_master_enabled:
             live_skip_reason = "live_master_disabled"
-        elif client is None:
-            live_skip_reason = "client_missing"
+        elif not settings["arm_live"]:
+            live_skip_reason = "arm_live_off"
         elif skip_live:
             live_skip_reason = "force_exit_active"
         else:
             live_skip_reason = "unknown"
         logging.info(
-            "EXECUTION_MODE_BRANCH strategy=%s slug=%s chosen_mode=paper reason=%s",
-            strategy_id, current_slug, live_skip_reason,
+            "LIVE_STRATEGY_SKIP strategy=%s reason=%s slug=%s",
+            strategy_id, live_skip_reason, current_slug,
         )
     if route_live:
         logging.info(
-            "EXECUTION_MODE_BRANCH strategy=%s slug=%s chosen_mode=live reason=live_master_enabled",
-            strategy_id, current_slug,
+            "LIVE_STRATEGY_EVALUATED strategy=%s slug=%s arm_live=%s live_master=%s",
+            strategy_id, current_slug, settings["arm_live"], live_master_enabled,
         )
         derive_wallet_addresses(client)
         live_balance = get_live_balance_value()
@@ -2798,20 +2735,9 @@ async def execute_strategy(
         if new_allowance is not None:
             allowance = new_allowance
         logging.info("LIVE_BANKROLL_AFTER_REFRESH live_balance_usd=%s", live_balance)
-        logging.info(
-            "LIVE_EXECUTION_GATE strategy=%s slug=%s live_balance=%s allowance=%s "
-            "min_required=%s yes_token=%s no_token=%s",
-            strategy_id, current_slug, live_balance, allowance,
-            LIVE_MIN_AVAILABLE_USD, bool(current_yes_token), bool(current_no_token),
-        )
         if should_skip_new_entries(
             "LIVE", live_balance, LIVE_MIN_AVAILABLE_USD, strategy_id
         ):
-            logging.warning(
-                "LIVE_EXECUTION_BLOCK_REASON strategy=%s slug=%s gate=bankroll_guard "
-                "balance=%s min_required=%s",
-                strategy_id, current_slug, live_balance, LIVE_MIN_AVAILABLE_USD,
-            )
             route_live = False
         elif live_balance is None or live_balance <= 0:
             logging.warning(
@@ -3532,7 +3458,7 @@ async def evaluate_candle_strategies(
             settings["arm_live"],
             live_master_enabled,
             "ENTER_LIVE"
-            if executed and live_master_enabled
+            if executed and live_master_enabled and settings["arm_live"]
             else "ENTER_PAPER"
             if executed
             else "SKIP_OTHER",
@@ -4160,12 +4086,6 @@ async def rotate_loop():
                 (current_yes_token[:6] + "...") if current_yes_token else "none",
                 (current_no_token[:6] + "...") if current_no_token else "none",
             )
-            logging.info(
-                "LIVE_ROTATED_TO_CURRENT_SLUG slug=%s yes_token=%s no_token=%s",
-                current_slug,
-                bool(current_yes_token),
-                bool(current_no_token),
-            )
         prefix_index = (prefix_index + 1) % len(prefixes)
         await asyncio.sleep(ROTATE_POLL_SECONDS)
 
@@ -4697,9 +4617,12 @@ async def heartbeat_loop(client: ClobClient | None):
         )
         mode = fastloop_settings["mode"]
         edge_threshold = min(sniper_settings["edge_threshold"], fastloop_settings["edge_threshold"])
-        # Shared brain: any enabled strategy is eligible for live routing.
-        # arm_live is kept for informational logging only; it no longer gates execution.
-        arm_live_active = is_enabled_combined
+        arm_live_active = (
+            sniper_settings["arm_live"]
+            or fastloop_settings["arm_live"]
+            or candle_bias_settings["arm_live"]
+            or any(settings["arm_live"] for settings in candle_strategy_settings.values())
+        )
         slug_field = current_slug or "none"
         if now_ts - last_proof_tick_ts >= 60:
             last_proof_tick_ts = now_ts
@@ -4718,77 +4641,26 @@ async def heartbeat_loop(client: ClobClient | None):
                 candle_bias_settings.get("direction_mode", "normal"),
                 candle_bias_settings.get("bias_side", "yes"),
             )
-            # Step 24: Warn clearly when strategy live has nothing active.
-            if live_master_enabled and not is_enabled_combined:
-                logging.warning(
-                    "STRATEGY_LIVE_DISABLED_NO_ARMED_BOTS subsystem=btcbot_strategy_live "
-                    "live_master_enabled=%s armed_sniper=%s armed_fastloop=%s "
-                    "candle_strategies_enabled=%s "
-                    "message=\"strategy live is idle because no live strategy bots are armed\"",
-                    live_master_enabled,
-                    sniper_settings["is_enabled"],
-                    fastloop_settings["is_enabled"],
-                    candle_strategy_enabled,
-                )
-            # Step 25: Log strategy plan parity — LIVE mirrors PAPER's enabled set.
-            paper_enabled = [
-                s for s, cfg in [
-                    ("sniper", sniper_settings),
-                    ("fastloop", fastloop_settings),
-                    ("candle_bias", candle_bias_settings),
-                ] + [(sid, candle_strategy_settings[sid]) for sid in candle_strategy_settings]
-                if cfg["is_enabled"]
-            ]
-            logging.info(
-                "STRATEGY_PLAN_PARITY subsystem=btcbot_strategy_live slug=%s "
-                "paper_enabled_strategies=%s live_enabled_strategies=%s parity_match=true",
-                slug_field,
-                paper_enabled,
-                paper_enabled,
-            )
-            if paper_enabled:
-                logging.info(
-                    "LIVE_USING_PAPER_PLAN subsystem=btcbot_strategy_live slug=%s "
-                    "strategies_active=%s reason=\"live mirrors paper strategy plan\"",
-                    slug_field,
-                    paper_enabled,
-                )
-            # Show slug freshness every minute so stale/expired slugs are obvious.
-            _slug_start_probe = slug_start_timestamp(current_slug)
-            _time_to_end_probe = (
-                (_slug_start_probe + (current_interval_seconds or 300)) - now_ts
-                if _slug_start_probe is not None
-                else None
-            )
-            logging.info(
-                "LIVE_ACTIVE_SLUG slug=%s time_to_end=%s expired=%s interval_s=%s",
-                current_slug or "none",
-                _time_to_end_probe,
-                _time_to_end_probe is not None and _time_to_end_probe < 0,
-                current_interval_seconds,
-            )
         if now_ts - last_live_order_ts > STUCK_LIVE_SECONDS:
             logging.warning(
-                "STUCK_DETECTOR_LIVE subsystem=btcbot_strategy_live scope=btcbot_strategy_only "
+                "STUCK_DETECTOR_LIVE scope=btcbot_strategy_only "
                 "no_live_orders_for_s=%s live_master_enabled=%s "
-                "sniper_enabled=%s fastloop_enabled=%s slug=%s "
-                "note='copy_trading_live is a separate subsystem and may be healthy'",
+                "armed_sniper=%s armed_fastloop=%s slug=%s",
                 now_ts - last_live_order_ts,
                 live_master_enabled,
-                sniper_settings["is_enabled"],
-                fastloop_settings["is_enabled"],
+                sniper_settings["arm_live"],
+                fastloop_settings["arm_live"],
                 slug_field,
             )
         if now_ts - last_any_order_ts > STUCK_ANY_SECONDS:
             logging.warning(
-                "STUCK_DETECTOR_ANY subsystem=btcbot_strategy_live scope=btcbot_strategy_only "
+                "STUCK_DETECTOR_ANY scope=btcbot_strategy_only "
                 "no_orders_for_s=%s live_master_enabled=%s "
-                "sniper_enabled=%s fastloop_enabled=%s slug=%s "
-                "note='copy_trading_live is a separate subsystem and may be healthy'",
+                "armed_sniper=%s armed_fastloop=%s slug=%s",
                 now_ts - last_any_order_ts,
                 live_master_enabled,
-                sniper_settings["is_enabled"],
-                fastloop_settings["is_enabled"],
+                sniper_settings["arm_live"],
+                fastloop_settings["arm_live"],
                 slug_field,
             )
         if (
@@ -4845,21 +4717,15 @@ async def heartbeat_loop(client: ClobClient | None):
             live_master_enabled
             and client
             and current_slug
-            and is_enabled_combined
+            and (
+                sniper_settings["arm_live"]
+                or fastloop_settings["arm_live"]
+                or candle_bias_settings["arm_live"]
+                or any(settings["arm_live"] for settings in candle_strategy_settings.values())
+            )
             and time_to_end is not None
         ):
-            if time_to_end < 0:
-                # Market has already expired (negative time_to_end). Skip force-exit
-                # entirely — there are no live positions to close on a finished market.
-                # entry_cutoff_active=True will block new entries naturally.
-                # Let rotate_loop refresh current_slug to the current valid market.
-                logging.warning(
-                    "LIVE_EXPIRED_SLUG_SKIPPED slug=%s time_to_end=%s "
-                    "reason=market_expired_negative_time skip_force_exit=true",
-                    current_slug,
-                    time_to_end,
-                )
-            elif should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
+            if should_force_exit(time_to_end, FORCE_EXIT_SECONDS):
                     signer = live_signer_address or live_funder_address
                     positions_truth = get_live_positions_truth(
                         client, signer, purpose="force_exit"
@@ -5128,7 +4994,7 @@ async def heartbeat_loop(client: ClobClient | None):
                         sniper_settings["arm_live"],
                         live_master_enabled,
                         "ENTER_LIVE"
-                        if sniper_traded and live_master_enabled
+                        if sniper_traded and live_master_enabled and sniper_settings["arm_live"]
                         else "ENTER_PAPER",
                     )
             else:
@@ -5247,9 +5113,9 @@ async def heartbeat_loop(client: ClobClient | None):
                             fastloop_settings["is_enabled"],
                             fastloop_settings["arm_live"],
                             live_master_enabled,
-                        "ENTER_LIVE"
-                        if fastloop_executed and live_master_enabled
-                        else "ENTER_PAPER",
+                            "ENTER_LIVE"
+                            if fastloop_executed and live_master_enabled and fastloop_settings["arm_live"]
+                            else "ENTER_PAPER",
                         )
                 else:
                     log_paper_decision(
@@ -5363,7 +5229,7 @@ async def heartbeat_loop(client: ClobClient | None):
                     candle_bias_settings["arm_live"],
                     live_master_enabled,
                     "ENTER_LIVE"
-                    if candle_bias_traded and live_master_enabled
+                    if candle_bias_traded and live_master_enabled and candle_bias_settings["arm_live"]
                     else "ENTER_PAPER" if candle_bias_traded
                     else "SKIP_OTHER",
                 )
@@ -5913,47 +5779,19 @@ def insert_wallet_trade_if_new(trade_row: dict) -> bool:
     Insert a wallet_trade row if (wallet_address, source_trade_id) is new.
     Returns True if inserted, False if duplicate or error.
     wallet_trades is append-only — we never update existing rows.
-
-    Uses upsert with ignore_duplicates=True so Supabase returns HTTP 200
-    with empty data on conflict instead of a noisy HTTP 409.  The empty-data
-    path is detected and logged as WALLET_TRADE_DUPLICATE_SKIPPED.
     """
-    _wallet_short = str(trade_row.get("wallet_address") or "")[:16]
-    _trade_id     = str(trade_row.get("source_trade_id") or "")[:24]
-    _slug         = trade_row.get("market_slug") or "?"
-    _side         = trade_row.get("side") or "?"
     try:
-        resp = (
-            supabase.table("wallet_trades")
-            .upsert(
-                trade_row,
-                on_conflict="wallet_address,source_trade_id",
-                ignore_duplicates=True,
-            )
-            .execute()
-        )
-        if not resp.data:
-            # Duplicate: row already exists — expected, safe, intentional.
-            logging.info(
-                "WALLET_TRADE_DUPLICATE_SKIPPED wallet=%s trade_id=%s "
-                "slug=%s side=%s reason=already_exists",
-                _wallet_short, _trade_id, _slug, _side,
-            )
-            return False
-        return True
+        resp = supabase.table("wallet_trades").insert(trade_row).execute()
+        return bool(resp.data)
     except Exception as exc:
         exc_str = str(exc).lower()
         if any(kw in exc_str for kw in ("duplicate", "unique", "23505", "conflict")):
-            # Safety-net: upsert still raised a conflict exception.
-            logging.info(
-                "WALLET_TRADE_DUPLICATE_SKIPPED wallet=%s trade_id=%s "
-                "slug=%s side=%s reason=already_exists",
-                _wallet_short, _trade_id, _slug, _side,
-            )
-            return False
+            return False  # expected dedup — not an error
         logging.warning(
             "COPY_INSERT_WALLET_TRADE_FAIL wallet=%s trade_id=%s err=%s",
-            _wallet_short, _trade_id, exc,
+            str(trade_row.get("wallet_address", ""))[:10],
+            str(trade_row.get("source_trade_id", ""))[:20],
+            exc,
         )
         return False
 
@@ -6177,52 +6015,43 @@ def get_unevaluated_trades_for_bot(
 
         trade_ids = [t["source_trade_id"] for t in all_trades]
 
-        # Fetch already-attempted source_trade_ids for this bot + wallet.
-        #
-        # ROOT CAUSE (original bug): .in_("source_trade_id", trade_ids) built a
-        # GET URL with all UUIDs in the query string — >37 KB with 1 000 IDs —
-        # causing httpx.InvalidURL.
-        #
-        # ROOT CAUSE (Phase 3 partial fix): chunking at 50 IDs still left URL
-        # length risk for wallets with long Polymarket hex trade IDs (~66 chars
-        # each: 50 × 66 chars + overhead can breach httpx/rfc3986 limits on
-        # certain builds).
-        #
-        # FINAL FIX: scalar-only filters — no .in_() list param, no URL-size
-        # risk regardless of wallet activity or trade-ID length.
-        # Logical equivalence: all copy_attempts for this bot + wallet within the
-        # same lookback window cover exactly the trades we are about to evaluate.
-        _attempts_fetch_limit = min(max(len(trade_ids) * 3, 200), 3000)
-        try:
-            _att_resp = (
-                supabase.table("copy_attempts")
-                .select("source_trade_id, skip_reason, source_side, copied")
-                .eq("copy_bot_id", bot_id)
-                .eq("wallet_address", wallet_address)
-                .gte("created_at", cutoff)
-                .order("created_at", desc=True)
-                .limit(_attempts_fetch_limit)
-                .execute()
-            )
-            attempt_rows: list[dict] = _att_resp.data or []
-        except Exception as _att_exc:
-            logging.warning(
-                "COPY_UNEVALUATED_ATTEMPTED_FETCH_CHUNK_FAIL bot=%s wallet=%s err=%s "
-                "— attempts fetch failed; all %s trades treated as unevaluated this tick",
-                _label, wallet_address[:10], _att_exc, len(trade_ids),
-            )
-            attempt_rows = []
-        logging.info(
-            "COPY_UNEVALUATED_ATTEMPTED_FETCH_SUMMARY bot=%s wallet=%s "
-            "trades_in_window=%s attempt_rows=%s limit=%s",
-            _label, wallet_address[:10],
-            len(trade_ids), len(attempt_rows), _attempts_fetch_limit,
-        )
+        # Fetch already-attempted source_trade_ids for this bot.
+        # CHUNKED to prevent httpx.InvalidURL: URL component 'query' too long.
+        # The Supabase REST client builds a GET URL with `in.(id,id,...)` for
+        # `.in_()` calls.  With 1000 UUIDs (36 chars each + commas) the query
+        # string can exceed 37 KB, well past typical server/client URL limits.
+        # Chunking at 50 UUIDs keeps each GET param under ~2 KB.
+        _ATTEMPT_CHUNK = 50
+        _total_chunks  = max(1, -(-len(trade_ids) // _ATTEMPT_CHUNK))  # ceiling div
+        attempt_rows: list[dict] = []
+        for _ci, _chunk_start in enumerate(range(0, len(trade_ids), _ATTEMPT_CHUNK), 1):
+            _chunk = trade_ids[_chunk_start:_chunk_start + _ATTEMPT_CHUNK]
+            try:
+                _cr = (
+                    supabase.table("copy_attempts")
+                    .select("source_trade_id, skip_reason, source_side, copied")
+                    .eq("copy_bot_id", bot_id)
+                    .in_("source_trade_id", _chunk)
+                    .execute()
+                )
+                _chunk_rows = _cr.data or []
+                attempt_rows.extend(_chunk_rows)
+                logging.info(
+                    "COPY_UNEVALUATED_CHUNK bot=%s chunk=%s/%s "
+                    "trades_in_chunk=%s attempts_found=%s",
+                    _label, _ci, _total_chunks, len(_chunk), len(_chunk_rows),
+                )
+            except Exception as _chunk_exc:
+                logging.warning(
+                    "COPY_UNEVALUATED_CHUNK_FAIL bot=%s chunk=%s/%s err=%s "
+                    "— chunk skipped; affected trades may be re-evaluated this tick",
+                    _label, _ci, _total_chunks, _chunk_exc,
+                )
         logging.info(
             "COPY_UNEVALUATED_SUMMARY bot=%s wallet=%s "
-            "total_trades=%s attempt_rows=%s",
+            "total_trades=%s chunks=%s attempt_rows_fetched=%s",
             _label, wallet_address[:10],
-            len(trade_ids), len(attempt_rows),
+            len(trade_ids), _total_chunks, len(attempt_rows),
         )
 
         # Group attempts by source_trade_id to handle trades with multiple rows.
@@ -6413,7 +6242,7 @@ def get_copy_open_exposure_for_mode(mode: str) -> float:
     """
     try:
         resp = supabase.rpc(
-            "copy_open_exposure_for_mode", {"p_mode": mode.lower()}
+            "copy_open_exposure_for_mode", {"mode": mode.lower()}
         ).execute()
         val = resp.data
 
@@ -6518,20 +6347,6 @@ def _get_copy_buy_lock(mode: str) -> asyncio.Lock:
 # Separate from copy_bot_trade_timestamps (which is per-bot).
 copy_live_trade_timestamps: deque = deque()
 
-# In-memory TTL: token_id → Unix timestamp of the last live SELL exit submission.
-# Used to suppress duplicate SELL exit submits while a previous attempt's order
-# is still pending on the CLOB and reserving collateral/balance.
-# Entries are never actively pruned (bounded by COPY_LIVE_MAX_OPEN_POSITIONS = 3).
-_live_exit_attempt_ts: dict[str, float] = {}
-
-# CLOB client shared with copy loops that don't receive it as a parameter.
-# Set once in main() after build_trading_client(); read-only afterwards.
-_copy_trading_client: "ClobClient | None" = None
-
-# Positions for which a pre-expiry CLOB SELL has already been attempted in the
-# current process lifetime.  Prevents repeated SELL spam in the 15-second window.
-_pre_expiry_attempted_positions: set[str] = set()
-
 
 def _prune_live_copy_history() -> None:
     """Prune in-memory live copy timestamps older than 1 hour."""
@@ -6555,68 +6370,22 @@ def get_live_open_positions_count(live_bot_ids: list[str]) -> int:
     """
     Count OPEN copied_positions that belong to LIVE-mode copy bots.
 
-    Primary query scopes to raw_json->>'mode' = 'LIVE' rows so that paper
-    positions accumulated before arm_live was set do not inflate the count.
-
-    If the JSON-path filter raises (e.g. PostgREST version or JSONB mismatch),
-    falls back to an unfiltered query rather than returning 999.  The fallback
-    count may include paper rows and is logged with a warning so the operator
-    can investigate.  Returns 999 only if both queries fail.
+    Returns 999 on any DB failure as a fail-safe to block further live orders.
     """
     if not live_bot_ids:
         return 0
-
-    # ── Primary: raw_json->>'mode' = 'LIVE' scoped count ──────────────────────
     try:
         resp = (
-            supabase.table("copied_positions")
-            .select("id, market_slug")
-            .in_("copy_bot_id", live_bot_ids)
-            .eq("status", "OPEN")
-            .filter("raw_json->>mode", "eq", "LIVE")
-            .execute()
-        )
-        rows  = resp.data or []
-        count = len(rows)
-        logging.info(
-            "COPY_LIVE_OPEN_COUNT_RESULT scope=live_mode_only "
-            "live_bots=%s open_live_count=%s",
-            len(live_bot_ids), count,
-        )
-        if count >= COPY_LIVE_MAX_OPEN_POSITIONS:
-            _slugs = [r.get("market_slug") or r.get("id") for r in rows]
-            logging.warning(
-                "COPY_LIVE_OPEN_POSITIONS_BLOCKING live_bots=%s count=%s max=%s "
-                "blocking_positions=%s — check DB for stale open rows",
-                len(live_bot_ids), count, COPY_LIVE_MAX_OPEN_POSITIONS, _slugs,
-            )
-        return count
-    except Exception as _mode_exc:
-        logging.warning(
-            "COPY_LIVE_OPEN_COUNT_MODE_FILTER_FAIL live_bots=%s err=%s "
-            "— retrying without mode filter; result may include paper positions",
-            len(live_bot_ids), _mode_exc,
-        )
-
-    # ── Fallback: unfiltered count (paper + live positions) ───────────────────
-    try:
-        resp_fb = (
             supabase.table("copied_positions")
             .select("id")
             .in_("copy_bot_id", live_bot_ids)
             .eq("status", "OPEN")
             .execute()
         )
-        count_fb = len(resp_fb.data or [])
-        logging.warning(
-            "COPY_LIVE_OPEN_COUNT_FALLBACK scope=all_modes "
-            "live_bots=%s open_count=%s — includes paper rows if any",
-            len(live_bot_ids), count_fb,
-        )
-        return count_fb
+        return len(resp.data or [])
     except Exception:
         logging.exception("COPY_LIVE_OPEN_POS_COUNT_FAIL")
-        return 999  # fail-safe: block orders when count is completely unknown
+        return 999  # fail-safe: block orders when count is unknown
 
 
 def get_live_open_exposure(live_bot_ids: list[str]) -> float:
@@ -6713,68 +6482,17 @@ def submit_copy_live_order(
         signed = client.create_order(order_args)
         resp   = client.post_order(signed, OrderType.GTC)
         raw_response: dict = resp if isinstance(resp, dict) else {"response": str(resp)}
-
-        # Detect CLOB-level rejections that don't raise a Python exception.
-        # The py-clob-client may return {"success": false, "errorMsg": "..."} or
-        # {"error": "..."} for API-level errors (e.g. insufficient balance,
-        # market closed, order size too small, invalid token).
-        _clob_success = raw_response.get("success")
-        _clob_err     = raw_response.get("errorMsg") or raw_response.get("error") or ""
-        if _clob_success is False or (_clob_success is None and _clob_err):
-            logging.warning(
-                "COPY_LIVE_CLOB_REJECT token=%s side=%s price=%.4f shares=%.4f "
-                "error=%s resp_keys=%s",
-                token_id, order_side, actual_price, actual_shares,
-                str(_clob_err)[:200], list(raw_response.keys())[:8],
-            )
-            return False, actual_price, actual_shares, raw_response
-
         logging.info(
             "COPY_LIVE_ORDER_OK token=%s side=%s price=%.4f shares=%.4f resp_keys=%s",
-            token_id[:20], order_side, actual_price, actual_shares,
+            token_id[:16], order_side, actual_price, actual_shares,
             list(raw_response.keys())[:5],
         )
         return True, actual_price, actual_shares, raw_response
     except Exception as exc:
         logging.exception(
-            "COPY_LIVE_ORDER_FAIL token=%s side=%s err=%s", token_id, order_side, exc
+            "COPY_LIVE_ORDER_FAIL token=%s side=%s err=%s", token_id[:16], order_side, exc
         )
         return False, actual_price, actual_shares, {"error": str(exc)}
-
-
-def _check_live_account_ready() -> "tuple[bool, str]":
-    """
-    In-memory readiness check for the live Polymarket CLOB account.
-
-    Uses cached values populated by live_balance_loop / derive_wallet_addresses —
-    no additional API calls, zero latency.
-
-    Signals checked (in order):
-      live_signer_address   — proxy wallet registered and returned by CLOB API.
-                              None means the account has never completed setup
-                              or the API auth failed at startup.
-      live_allowance_cache  — USDC token approval (collateral allowance) > 0.
-                              Zero or None means the USDC approval transaction
-                              has not been submitted / confirmed yet.
-      live_balance_cache    — USDC balance > 0.
-                              Zero or None means the account has no funds.
-
-    Only applied to BUY orders — SELL/mirror closes are always allowed through.
-
-    Returns (True, "") when all signals are healthy.
-    Returns (False, reason_string) on the first failing signal.
-    """
-    if not live_signer_address:
-        return False, "proxy_wallet_not_initialized"
-    # None means the live_balance_loop hasn't refreshed yet — allow through so a
-    # cold-start worker can still attempt live orders; the CLOB will reject if the
-    # account truly has no funds.  Only block if the cache was fetched and is
-    # explicitly zero (approval revoked / account empty).
-    if live_allowance_cache is not None and live_allowance_cache <= 0:
-        return False, "usdc_allowance_zero"
-    if live_balance_cache is not None and live_balance_cache <= 0:
-        return False, "usdc_balance_zero"
-    return True, ""
 
 
 def evaluate_and_execute_live_copy_trade(
@@ -6822,156 +6540,6 @@ def evaluate_and_execute_live_copy_trade(
         submitted_size, submitted_price,
     )
 
-    # ── Token-ID resolution (pre-gate) ───────────────────────────────────────
-    # wallet_trade.token_id may be null when the Polymarket Data API omits it
-    # for recent trades, or when a market token rotated between the source
-    # wallet's trade and our evaluation window.
-    #
-    # Resolution order (additive — no change if token_id already present):
-    #   Source 1: current_slug globals   — zero-latency; current BTC 5m window only.
-    #   Source 2: market_cache DB lookup — any slug previously seen by the worker.
-    #   Source 3: Gamma API exact-slug   — authoritative fallback; populates
-    #             market_cache on success so future ticks skip the API call.
-    #
-    # All sources use exact slug match. No token is ever borrowed from a different
-    # market. If all sources fail, Gate LB / Gate L10 block the trade as before.
-    if not wallet_trade.get("token_id"):
-        _wt_slug      = str(wallet_trade.get("market_slug") or "")
-        _wt_outcome   = str(wallet_trade.get("outcome") or "").upper()
-        _wt_cond_id   = wallet_trade.get("condition_id")
-        _sources_tried: list[str] = []
-        logging.info(
-            "COPY_LIVE_TOKEN_RESOLVE_ATTEMPT bot=%s trade=%s "
-            "slug=%s outcome=%s current_slug=%s "
-            "token_id_present=%s condition_id_present=%s "
-            "has_yes_token=%s has_no_token=%s",
-            _bot_name, _trade_id,
-            _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
-            bool(wallet_trade.get("token_id")), bool(_wt_cond_id),
-            bool(current_yes_token), bool(current_no_token),
-        )
-        _resolved_token: str | None = None
-        _resolve_source = "none"
-
-        # Source 1: current slug globals (zero-latency, no DB/API call)
-        _sources_tried.append("current_slug")
-        if _wt_slug and current_slug and _wt_slug == current_slug:
-            if _wt_outcome in ("YES", "UP") and current_yes_token:
-                _resolved_token = current_yes_token
-                _resolve_source = "current_slug"
-            elif _wt_outcome in ("NO", "DOWN") and current_no_token:
-                _resolved_token = current_no_token
-                _resolve_source = "current_slug"
-
-        # Source 2: market_cache exact-slug lookup
-        if not _resolved_token and _wt_slug:
-            _sources_tried.append("market_cache")
-            try:
-                _mc_resp = (
-                    supabase.table("market_cache")
-                    .select("yes_token_id, no_token_id")
-                    .eq("market_slug", _wt_slug)
-                    .limit(1)
-                    .execute()
-                )
-                _mc_rows = _mc_resp.data or []
-                if _mc_rows:
-                    _mc = _mc_rows[0]
-                    if _wt_outcome in ("YES", "UP") and (_mc.get("yes_token_id") or ""):
-                        _resolved_token = str(_mc["yes_token_id"])
-                        _resolve_source = "market_cache"
-                    elif _wt_outcome in ("NO", "DOWN") and (_mc.get("no_token_id") or ""):
-                        _resolved_token = str(_mc["no_token_id"])
-                        _resolve_source = "market_cache"
-            except Exception as _mc_exc:
-                logging.warning(
-                    "COPY_LIVE_TOKEN_MARKET_CACHE_FAIL bot=%s trade=%s "
-                    "slug=%s err=%s",
-                    _bot_name, _trade_id, _wt_slug, _mc_exc,
-                )
-
-        # Source 3: Gamma API exact-slug fetch (authoritative; populates cache)
-        if not _resolved_token and _wt_slug:
-            _sources_tried.append("gamma_api")
-            try:
-                _gd = _fetch_gamma_market_data_sync(
-                    condition_id=_wt_cond_id,
-                    market_slug=_wt_slug,
-                    token_id=None,
-                )
-                if _gd:
-                    _g_yes = _gd.get("yes_token_id") or ""
-                    _g_no  = _gd.get("no_token_id")  or ""
-                    if _wt_outcome in ("YES", "UP") and _g_yes:
-                        _resolved_token = str(_g_yes)
-                        _resolve_source = "gamma_api"
-                    elif _wt_outcome in ("NO", "DOWN") and _g_no:
-                        _resolved_token = str(_g_no)
-                        _resolve_source = "gamma_api"
-                    else:
-                        # Gamma found the market but has no clobTokenId for this
-                        # outcome — market may be resolved, not yet in CLOB, or
-                        # outcome label doesn't match YES/NO/UP/DOWN.
-                        logging.warning(
-                            "COPY_LIVE_TOKEN_GAMMA_NO_CLOB_TOKEN bot=%s trade=%s "
-                            "slug=%s outcome=%s gamma_yes_present=%s gamma_no_present=%s "
-                            "gamma_resolved=%s gamma_active=%s",
-                            _bot_name, _trade_id, _wt_slug, _wt_outcome,
-                            bool(_g_yes), bool(_g_no),
-                            _gd.get("resolved"), _gd.get("active"),
-                        )
-                    # Populate market_cache so future ticks skip this API call.
-                    if _g_yes or _g_no:
-                        try:
-                            supabase.table("market_cache").upsert(
-                                {
-                                    "market_slug":   _wt_slug,
-                                    "yes_token_id":  _g_yes or None,
-                                    "no_token_id":   _g_no  or None,
-                                },
-                                on_conflict="market_slug",
-                            ).execute()
-                            logging.info(
-                                "COPY_LIVE_TOKEN_GAMMA_CACHE_POPULATED "
-                                "slug=%s yes=%s no=%s",
-                                _wt_slug,
-                                str(_g_yes)[:16] if _g_yes else "none",
-                                str(_g_no)[:16]  if _g_no  else "none",
-                            )
-                        except Exception as _cp_exc:
-                            logging.warning(
-                                "COPY_LIVE_TOKEN_GAMMA_CACHE_FAIL slug=%s err=%s",
-                                _wt_slug, _cp_exc,
-                            )
-            except Exception as _gamma_exc:
-                logging.warning(
-                    "COPY_LIVE_TOKEN_GAMMA_API_FAIL bot=%s trade=%s "
-                    "slug=%s err=%s",
-                    _bot_name, _trade_id, _wt_slug, _gamma_exc,
-                )
-
-        if _resolved_token:
-            # Shallow-copy the dict so the caller's reference is unchanged.
-            wallet_trade = {**wallet_trade, "token_id": _resolved_token}
-            logging.info(
-                "COPY_LIVE_TOKEN_RESOLVE_OK bot=%s trade=%s "
-                "slug=%s outcome=%s resolved_token=%s source=%s",
-                _bot_name, _trade_id,
-                _wt_slug, _wt_outcome, str(_resolved_token)[:20], _resolve_source,
-            )
-        else:
-            logging.warning(
-                "COPY_LIVE_TOKEN_RESOLVE_FAIL bot=%s trade=%s "
-                "slug=%s outcome=%s current_slug=%s "
-                "token_id_present=%s condition_id_present=%s "
-                "sources_tried=%s "
-                "— all resolution sources exhausted; gates will block this trade",
-                _bot_name, _trade_id,
-                _wt_slug or "?", _wt_outcome or "?", current_slug or "none",
-                bool(wallet_trade.get("token_id")), bool(_wt_cond_id),
-                _sources_tried,
-            )
-
     # ── Gate L8: global live hourly cap ──────────────────────────────────────
     # 0 = unlimited. SELL/close orders are exempt — exits must not be capped.
     if COPY_LIVE_MAX_TRADES_PER_HOUR > 0 and trade_side != "SELL":
@@ -7018,53 +6586,14 @@ def evaluate_and_execute_live_copy_trade(
                 current_open_exposure, submitted_size, projected_exposure, live_max_exposure,
             )
 
-    # ── Gate LB: token_id required for live BUY ──────────────────────────────
-    # The shared brain allows market_slug as a fallback for paper matching.
-    # Live BUY CLOB orders always need a token_id; missing token_id here means
-    # all resolution sources were exhausted.  L10 (below) still guards SELLs.
-    if trade_side in ("BUY", "") and not wallet_trade.get("token_id"):
-        logging.warning(
-            "COPY_LIVE_SKIP_TOKEN_ID_MISSING bot=%s trade=%s "
-            "reason=live_token_id_missing slug=%s outcome=%s "
-            "token_id_present=%s condition_id_present=%s",
-            _bot_name, _trade_id,
-            str(wallet_trade.get("market_slug") or "?"),
-            str(wallet_trade.get("outcome") or "?"),
-            bool(wallet_trade.get("token_id")),
-            bool(wallet_trade.get("condition_id")),
-        )
-        return False, "live_token_id_missing", None, None, {}
-
-    # ── Gate LC: max-hold required for live BUY ──────────────────────────────
-    # Without max-hold, a live position that cannot be TP-closed stays open
-    # indefinitely.  Block live BUY entries unless the bot has max-hold fully
-    # configured.  SELL/mirror orders are exempt.
-    if trade_side in ("BUY", ""):
-        _live_fast   = _read_bot_fast_settings(copy_bot)
-        _exit_mode   = _live_fast["exit_mode"]
-        _max_hold_m  = _live_fast["max_hold_minutes"]
-        if "max_hold" not in _exit_mode or not (_max_hold_m and _max_hold_m > 0):
-            logging.warning(
-                "COPY_LIVE_GATE_MAX_HOLD_FAIL bot=%s trade=%s "
-                "reason=live_max_hold_required exit_mode=%s max_hold_minutes=%s",
-                _bot_name, _trade_id, _exit_mode, _max_hold_m,
-            )
-            return False, "live_max_hold_required", None, None, {}
-
     # ── Gate L10: token_id required for CLOB ─────────────────────────────────
     # The shared brain allows market_slug as fallback for paper matching.
-    # Live CLOB orders (BUY and SELL) always need a token_id.
+    # Live CLOB orders always need a token_id.
     token_id = wallet_trade.get("token_id")
     if not token_id:
         logging.warning(
-            "COPY_LIVE_SKIP_INSUFFICIENT_MARKET_DATA bot=%s trade=%s "
-            "reason=token_id_missing_for_clob side=%s slug=%s outcome=%s "
-            "token_id_present=%s condition_id_present=%s",
-            _bot_name, _trade_id, trade_side,
-            str(wallet_trade.get("market_slug") or "?"),
-            str(wallet_trade.get("outcome") or "?"),
-            bool(wallet_trade.get("token_id")),
-            bool(wallet_trade.get("condition_id")),
+            "COPY_LIVE_GATE_L10_FAIL bot=%s trade=%s reason=token_id_missing_for_clob",
+            _bot_name, _trade_id,
         )
         return False, "insufficient_market_data", None, None, {}
 
@@ -7085,30 +6614,6 @@ def evaluate_and_execute_live_copy_trade(
             _bot_name, float(submitted_size), COPY_LIVE_MAX_TRADE_USD, final_size,
         )
 
-    # ── Live account readiness (BUY only) ────────────────────────────────────
-    # SELL/mirror-close orders are exempt — exits must always be attempted.
-    # For BUY entries, verify the cached CLOB account state before submitting.
-    if trade_side in ("BUY", ""):
-        _acct_ok, _acct_fail = _check_live_account_ready()
-        if not _acct_ok:
-            logging.warning(
-                "COPY_LIVE_ACCOUNT_READY_FAIL bot=%s trade=%s reason=%s "
-                "proxy_wallet=%s allowance=%s balance=%s",
-                _bot_name, _trade_id, _acct_fail,
-                bool(live_signer_address),
-                live_allowance_cache,
-                live_balance_cache,
-            )
-            return False, f"live_account_not_ready_{_acct_fail}", None, None, {}
-        logging.info(
-            "COPY_LIVE_ACCOUNT_READY_OK bot=%s trade=%s "
-            "signer=%s allowance=%.4f balance=%.4f",
-            _bot_name, _trade_id,
-            str(live_signer_address or "?")[:16],
-            live_allowance_cache or 0.0,
-            live_balance_cache or 0.0,
-        )
-
     # ── Submit CLOB order ─────────────────────────────────────────────────────
     max_slippage = float(
         copy_bot.get("max_slippage")
@@ -7117,98 +6622,12 @@ def evaluate_and_execute_live_copy_trade(
     )
     order_side   = trade_side if trade_side in ("BUY", "SELL") else "BUY"
     source_price = submitted_price  # validated by shared brain
-    _order_kind  = "exit" if order_side == "SELL" else "entry"
 
-    # ── SELL-only pre-submit guards (BUY entry path is unaffected) ────────────
-    if order_side == "SELL":
-        _now_ts = time()
-
-        # Guard SE-1: tiny duplicate-protection window.
-        # Prevents the exact same SELL event from being submitted twice within
-        # a single loop tick.  Cooldown is now 3s (was 90s) — just enough to
-        # deduplicate rapid re-processing of the same event without blocking
-        # real fast-market exits.
-        _exit_slug      = str(wallet_trade.get("market_slug") or "")
-        _is_fast_market = _exit_slug in COPY_LIVE_EXIT_FAST_MARKET_SLUGS
-        _exit_cooldown  = (
-            COPY_LIVE_EXIT_COOLDOWN_FAST_SEC if _is_fast_market
-            else COPY_LIVE_EXIT_COOLDOWN_SEC
-        )
-        _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
-        _elapsed   = int(_now_ts - _last_exit)
-        if _elapsed < _exit_cooldown:
-            logging.warning(
-                "COPY_LIVE_EXIT_ALREADY_PENDING bot=%s trade=%s slug=%s "
-                "token_id=%s side=SELL size_usd=%.2f "
-                "elapsed_sec=%s cooldown_sec=%s fast_market=%s "
-                "— duplicate-protection window active; re-submit in %ss",
-                _bot_name, _trade_id,
-                _exit_slug or "?",
-                str(token_id)[:20], final_size,
-                _elapsed, _exit_cooldown, _is_fast_market,
-                _exit_cooldown - _elapsed,
-            )
-            return False, "live_exit_already_pending", final_size, source_price, {}
-
-        # Guard SE-2: projected share size below CLOB minimum (MIN_ORDER_SHARES = 5).
-        # Replicate the slippage-adjusted price formula from submit_copy_live_order
-        # so we can pre-flight this check before any API call or order signing.
-        _sell_limit_price  = max(source_price * (1.0 - max_slippage), 0.01)
-        _sell_proj_shares  = final_size / _sell_limit_price if _sell_limit_price > 0 else 0.0
-        if _sell_proj_shares < MIN_ORDER_SHARES:
-            logging.warning(
-                "COPY_LIVE_EXIT_BELOW_MIN_SIZE bot=%s trade=%s slug=%s "
-                "token_id=%s side=SELL price=%.4f size_usd=%.2f "
-                "projected_shares=%.4f min_shares=%.1f "
-                "— skipping CLOB submit; CLOB would reject with 'Size lower than minimum'",
-                _bot_name, _trade_id,
-                str(wallet_trade.get("market_slug") or "?"),
-                str(token_id)[:20],
-                _sell_limit_price, final_size,
-                _sell_proj_shares, MIN_ORDER_SHARES,
-            )
-            return False, "live_exit_below_min_size", final_size, source_price, {}
-
-        # Both guards passed — record this attempt timestamp before submitting.
-        # This starts the cooldown window so the next loop tick won't pile up.
-        _live_exit_attempt_ts[str(token_id)] = _now_ts
-
-    # ── BUY-only pre-submit guard: min $1 marketable amount ──────────────────
-    # Polymarket rejects marketable BUY orders where price × shares < $1.
-    # Replicate the slippage-adjusted price formula used in submit_copy_live_order
-    # so we can pre-flight this check before any API call or order signing.
-    if order_side == "BUY":
-        _buy_limit_price = min(source_price * (1.0 + max_slippage), 0.99)
-        _buy_proj_shares = final_size / _buy_limit_price if _buy_limit_price > 0 else 0.0
-        _buy_proj_amount = _buy_limit_price * _buy_proj_shares
-        if _buy_proj_amount < 1.0:
-            logging.warning(
-                "COPY_LIVE_ENTRY_BELOW_MIN_AMOUNT bot=%s slug=%s "
-                "token_id=%s side=BUY price=%.4f size_usd=%.2f "
-                "projected_amount=%.4f "
-                "— skipping CLOB submit; CLOB rejects with "
-                "'invalid amount for a marketable BUY order'",
-                _bot_name,
-                str(wallet_trade.get("market_slug") or "?"),
-                str(token_id),
-                source_price, final_size,
-                _buy_proj_amount,
-            )
-            return False, "live_entry_below_min_amount", final_size, source_price, {}
-
-    # Pre-submission log: full token_id + exact OrderArgs context, entry vs exit.
-    # NOTE: for SELL (exit) orders the 'size' passed to submit_copy_live_order is
-    # a USD amount (from compute_copy_size) which is divided by the slippage-
-    # adjusted price to get shares.  This means the share count may differ from
-    # the shares originally bought if the market price has moved.  Watch for
-    # CLOB rejections citing 'insufficient shares' as a sign of this mismatch.
     logging.info(
-        "COPY_LIVE_%s_SUBMIT_ATTEMPT bot=%s wallet=%s trade=%s "
-        "token_id=%s side=%s price=%.4f size_usd=%.2f slippage=%.4f",
-        _order_kind.upper(),
+        "COPY_LIVE_ORDER_ATTEMPT bot=%s wallet=%s trade=%s "
+        "token_id=%s side=%s price=%.4f size=%.2f slippage=%.4f",
         _bot_name, _wallet, _trade_id,
-        str(token_id),  # full token_id for unambiguous diagnostics
-        order_side, source_price, final_size, max_slippage,
+        str(token_id)[:20], order_side, source_price, final_size, max_slippage,
     )
 
     ok, actual_price, actual_shares, raw_response = submit_copy_live_order(
@@ -7220,26 +6639,10 @@ def evaluate_and_execute_live_copy_trade(
         max_slippage,
     )
     if not ok:
-        _err_detail = (
-            raw_response.get("errorMsg")
-            or raw_response.get("error")
-            or raw_response.get("message")
-            or raw_response.get("errorCode")
-            or str(raw_response)[:300]
-        )
-        _fail_tag = (
-            "COPY_LIVE_EXIT_SUBMIT_FAIL"
-            if order_side == "SELL"
-            else "COPY_LIVE_ENTRY_SUBMIT_FAIL"
-        )
         logging.warning(
-            "%s bot=%s trade=%s slug=%s "
-            "token_id=%s side=%s size_usd=%.2f price=%.4f error=%s",
-            _fail_tag, _bot_name, _trade_id,
-            str(wallet_trade.get("market_slug") or "?"),
-            str(token_id),  # full token_id
-            order_side, final_size, source_price,
-            str(_err_detail)[:300],
+            "COPY_LIVE_ORDER_FAIL bot=%s trade=%s "
+            "reason=order_submission_failed raw_response=%r",
+            _bot_name, _trade_id, str(raw_response)[:200],
         )
         return False, "order_submission_failed", final_size, source_price, raw_response
 
@@ -8962,14 +8365,13 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                     # If already at or above cap, all new BUY attempts this
                     # cycle are skipped immediately.  SELL/CLOSE trades are
                     # never affected by this flag.
-                    # Uses the same RPC as the DB trigger for consistency.
                     _paper_cap_locked = False
                     if not _effective_live:
                         _loop_cap = float(
                             global_settings.get("paper_max_exposure_usd") or 0
                         )
                         if _loop_cap > 0:
-                            _loop_exposure = get_copy_open_exposure_for_mode("paper")
+                            _loop_exposure = _get_paper_exposure_simple()
                             if _loop_exposure >= _loop_cap:
                                 _paper_cap_locked = True
                                 logging.warning(
@@ -9078,50 +8480,17 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     )
                                 else:
                                     # BUY: paper-specific exposure hard guard.
-                                    # Uses get_copy_open_exposure_for_mode (RPC) so
-                                    # the pre-check scope exactly matches the DB
-                                    # trigger scope — eliminating COPY_BUY_ALLOWED
-                                    # followed by exposure_cap_exceeded mismatches.
+                                    # Re-reads live DB so stale values can't bypass cap.
                                     _pg_cap  = float(
                                         global_settings.get("paper_max_exposure_usd") or 0
                                     )
-                                    logging.info(
-                                        "COPY_PAPER_EXPOSURE_SCOPE mode=paper "
-                                        "wallet=%s bot=%s "
-                                        "scope=rpc:copy_open_exposure_for_mode "
-                                        "filter=p_mode=paper cap=%.2f",
-                                        wallet_label, bot_label, _pg_cap,
-                                    )
-                                    _pg_exp  = get_copy_open_exposure_for_mode("paper")
+                                    _pg_exp  = _get_paper_exposure_simple()
                                     _pg_proj = round(
                                         _pg_exp + (submitted_size or 0.0), 4
-                                    )
-                                    logging.info(
-                                        "COPY_PAPER_EXPOSURE_RESULT mode=paper "
-                                        "wallet=%s bot=%s "
-                                        "current=%.4f proposed=%.4f "
-                                        "projected=%.4f cap=%.2f",
-                                        wallet_label, bot_label,
-                                        _pg_exp, submitted_size or 0.0,
-                                        _pg_proj,
-                                        _pg_cap if _pg_cap > 0 else float("inf"),
                                     )
                                     _should_open = (
                                         _pg_cap <= 0           # unlimited
                                         or _pg_proj <= _pg_cap # within cap
-                                    )
-                                    logging.log(
-                                        logging.WARNING if not _should_open
-                                        else logging.INFO,
-                                        "COPY_PAPER_PREGUARD_DECISION mode=paper "
-                                        "wallet=%s bot=%s "
-                                        "current=%.4f proposed=%.4f "
-                                        "projected=%.4f cap=%.2f decision=%s",
-                                        wallet_label, bot_label,
-                                        _pg_exp, submitted_size or 0.0,
-                                        _pg_proj,
-                                        _pg_cap if _pg_cap > 0 else float("inf"),
-                                        "blocked" if not _should_open else "allowed",
                                     )
                                     if not _should_open:
                                         logging.warning(
@@ -9271,19 +8640,9 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                 elif live_ok:
                                     order_status = "LIVE_MATCHED"
                                 elif trade_side == "SELL":
-                                    # CLOB SELL failed; DB close mirror still runs
-                                    # unconditionally below.  Log this explicitly so
-                                    # it is searchable separately from the CLOB failure.
+                                    # CLOB failed but we will still close the
+                                    # DB exit mirror below.
                                     order_status = "LIVE_EXIT_DB_ONLY"
-                                    logging.warning(
-                                        "COPY_LIVE_EXIT_DB_ONLY_FALLBACK bot=%s "
-                                        "wallet=%s trade=%s slug=%s "
-                                        "clob_skip_reason=%s "
-                                        "— CLOB SELL failed; DB close will still run",
-                                        bot_label, wallet_label, trade_label,
-                                        wallet_trade.get("market_slug") or "?",
-                                        live_skip_reason,
-                                    )
                                 else:
                                     order_status = "SKIPPED"
 
@@ -10459,246 +9818,6 @@ def _copy_auto_exit_close_position_sync(
         return False
 
 
-def _try_pre_expiry_live_exit_sync(
-    pos: dict,
-    bot: dict,
-    client: "ClobClient | None",
-) -> bool:
-    """
-    Attempt a pre-expiry CLOB SELL for a live copied_position nearing market close.
-
-    Sync — designed to be called via asyncio.to_thread from copy_auto_exit_loop.
-
-    Returns True  when inside the pre-expiry window (whether or not the SELL
-                  succeeded).  Caller should skip the normal live-skip path.
-    Returns False when outside the window; caller falls through to normal log.
-
-    Close-time detection order (zero-API fallback first):
-      1. Parse Unix timestamp embedded in updown market slug:
-             <asset>-updown-<interval>-<unix_ts>  (e.g. btc-updown-5m-1776792000)
-      2. market_cache.end_date  (one DB query; populated by settlement loop)
-
-    Safety guards applied before submitting:
-      • already_attempted  — only one attempt per position per process lifetime
-      • no_trading_client  — COPY_LIVE_ENABLED=false or client not initialized
-      • no_token_id        — can't SELL without a CLOB token_id
-      • below_min_size     — projected shares < MIN_ORDER_SHARES (5) pre-flight
-      • exit_cooldown      — reuses SE-1 guard (_live_exit_attempt_ts)
-
-    On SELL success: closes the DB row (status=CLOSED, raw_json updated).
-    On SELL failure: logs COPY_PRE_EXPIRY_EXIT_FAIL; settlement/redeem runs later.
-    """
-    pos_id   = str(pos.get("id") or "")
-    pos_slug = str(pos.get("market_slug") or "?")
-    token_id = pos.get("token_id")
-    outcome  = str(pos.get("outcome") or "").upper()
-
-    # ── 1. Determine market close time ────────────────────────────────────────
-    end_dt: datetime | None = None
-
-    # Primary: parse Unix timestamp from slug (zero-latency, no I/O).
-    # Matches the trailing numeric field in updown slugs, e.g.
-    #   btc-updown-5m-1776792000  →  timestamp = 1776792000
-    _slug_ts_match = re.search(r"-(\d{9,11})$", pos_slug)
-    if _slug_ts_match:
-        try:
-            end_dt = datetime.fromtimestamp(
-                int(_slug_ts_match.group(1)), tz=timezone.utc
-            )
-        except (ValueError, OverflowError, OSError):
-            end_dt = None
-
-    # Fallback: market_cache.end_date (one DB call; avoids Gamma API call).
-    if end_dt is None and pos_slug != "?":
-        try:
-            _mc_resp = (
-                supabase.table("market_cache")
-                .select("end_date, yes_token_id, no_token_id")
-                .eq("market_slug", pos_slug)
-                .limit(1)
-                .execute()
-            )
-            _mc_rows = _mc_resp.data or []
-            if _mc_rows:
-                _mc_row = _mc_rows[0]
-                _end_str = _mc_row.get("end_date")
-                if _end_str:
-                    end_dt = _parse_ts(str(_end_str))
-                # Opportunistically enrich token_id from cache if missing.
-                if not token_id:
-                    if outcome in ("YES", "UP"):
-                        token_id = _mc_row.get("yes_token_id")
-                    elif outcome in ("NO", "DOWN"):
-                        token_id = _mc_row.get("no_token_id")
-        except Exception as _mc_exc:
-            logging.warning(
-                "COPY_PRE_EXPIRY_CACHE_FAIL pos=%s slug=%s err=%s",
-                pos_id[:8], pos_slug, _mc_exc,
-            )
-
-    if end_dt is None:
-        logging.info(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s reason=no_close_time",
-            pos_id[:8], pos_slug,
-        )
-        return False
-
-    # ── 2. Check window ───────────────────────────────────────────────────────
-    now_utc          = datetime.now(timezone.utc)
-    seconds_to_close = (end_dt - now_utc).total_seconds()
-
-    logging.info(
-        "COPY_PRE_EXPIRY_EXIT_CHECK pos=%s slug=%s "
-        "seconds_to_close=%.1f threshold=%s end_dt=%s",
-        pos_id[:8], pos_slug,
-        seconds_to_close, PRE_EXPIRY_EXIT_SECONDS,
-        end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
-
-    # Not in window: too far out (>threshold) or long past close (> 60s ago).
-    if seconds_to_close > PRE_EXPIRY_EXIT_SECONDS or seconds_to_close < -60:
-        return False
-
-    # ── 3. Safety guards ──────────────────────────────────────────────────────
-    # Guard: already attempted for this position in this process run.
-    if pos_id in _pre_expiry_attempted_positions:
-        logging.info(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
-            "reason=already_attempted seconds_to_close=%.1f",
-            pos_id[:8], pos_slug, seconds_to_close,
-        )
-        return True
-
-    # Guard: no trading client or feature disabled.
-    if not client or not COPY_LIVE_ENABLED:
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
-            "reason=no_client_or_disabled seconds_to_close=%.1f",
-            pos_id[:8], pos_slug, seconds_to_close,
-        )
-        _pre_expiry_attempted_positions.add(pos_id)
-        return True
-
-    # Guard: token_id required for CLOB SELL.
-    if not token_id:
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s outcome=%s "
-            "reason=no_token_id seconds_to_close=%.1f",
-            pos_id[:8], pos_slug, outcome, seconds_to_close,
-        )
-        _pre_expiry_attempted_positions.add(pos_id)
-        return True
-
-    # Guard: projected shares below CLOB minimum (pre-flight, no API call).
-    size_usd     = float(pos.get("size") or 5.0)
-    entry_price  = float(pos.get("entry_price") or 0.5)
-    max_slippage = float(bot.get("max_slippage") or 0.03)
-    _s_lim_price = max(entry_price * (1.0 - max_slippage), 0.01)
-    _proj_shares = size_usd / _s_lim_price if _s_lim_price > 0 else 0.0
-    if _proj_shares < MIN_ORDER_SHARES:
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
-            "reason=below_min_size projected_shares=%.4f min=%.1f "
-            "size_usd=%.2f seconds_to_close=%.1f",
-            pos_id[:8], pos_slug,
-            _proj_shares, MIN_ORDER_SHARES, size_usd, seconds_to_close,
-        )
-        _pre_expiry_attempted_positions.add(pos_id)
-        return True
-
-    # Guard: tiny duplicate-protection window shared with SE-1.
-    # Cooldown is now 3s — just enough to avoid double-submitting the same
-    # pre-expiry exit within a single pass.
-    _now_ts    = time()
-    _last_exit = _live_exit_attempt_ts.get(str(token_id), 0.0)
-    _pre_is_fast    = str(pos_slug) in COPY_LIVE_EXIT_FAST_MARKET_SLUGS
-    _pre_cooldown   = (
-        COPY_LIVE_EXIT_COOLDOWN_FAST_SEC if _pre_is_fast
-        else COPY_LIVE_EXIT_COOLDOWN_SEC
-    )
-    if _now_ts - _last_exit < _pre_cooldown:
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_SKIP pos=%s slug=%s "
-            "reason=exit_cooldown_active elapsed_sec=%s cooldown_sec=%s fast_market=%s",
-            pos_id[:8], pos_slug,
-            int(_now_ts - _last_exit), _pre_cooldown, _pre_is_fast,
-        )
-        _pre_expiry_attempted_positions.add(pos_id)
-        return True
-
-    # ── 4. Attempt CLOB SELL ──────────────────────────────────────────────────
-    _pre_expiry_attempted_positions.add(pos_id)
-    _live_exit_attempt_ts[str(token_id)] = _now_ts
-
-    logging.warning(
-        "COPY_PRE_EXPIRY_EXIT_ATTEMPT pos=%s bot=%s slug=%s token_id=%s "
-        "outcome=%s seconds_to_close=%.1f size_usd=%.2f entry_price=%.4f",
-        pos_id[:8], str(bot.get("id") or "?")[:8],
-        pos_slug, str(token_id)[:20],
-        outcome, seconds_to_close, size_usd, entry_price,
-    )
-
-    ok, actual_price, actual_shares, raw_response = submit_copy_live_order(
-        client,
-        str(token_id),
-        "SELL",
-        entry_price,
-        size_usd,
-        max_slippage,
-    )
-
-    if ok:
-        _exit_price = actual_price if actual_price else entry_price
-        _pnl = round(
-            (_exit_price - entry_price) / max(entry_price, 0.0001) * size_usd, 4
-        )
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_OK pos=%s slug=%s token_id=%s "
-            "actual_price=%.4f actual_shares=%.4f pnl=%.4f",
-            pos_id[:8], pos_slug, str(token_id)[:20],
-            _exit_price, actual_shares or 0, _pnl,
-        )
-        # Close the DB row — LIVE position (no paper bankroll update).
-        # Concurrency guard: .eq("status", "OPEN") prevents double-close.
-        _rj = dict(pos.get("raw_json") or {})
-        _rj["close_reason"]   = CLOSE_REASON_PRE_EXPIRY
-        _rj["pre_expiry_exit"] = True
-        try:
-            supabase.table("copied_positions").update({
-                "status":     "CLOSED",
-                "exit_price": _exit_price,
-                "closed_at":  datetime.now(timezone.utc).isoformat(),
-                "pnl":        _pnl,
-                "raw_json":   _rj,
-            }).eq("id", pos_id).eq("status", "OPEN").execute()
-            _try_write_close_reason_col(pos_id, CLOSE_REASON_PRE_EXPIRY)
-            logging.info(
-                "COPY_PRE_EXPIRY_POSITION_CLOSED pos=%s slug=%s "
-                "exit_price=%.4f pnl=%.4f",
-                pos_id[:8], pos_slug, _exit_price, _pnl,
-            )
-        except Exception as _db_exc:
-            logging.warning(
-                "COPY_PRE_EXPIRY_POSITION_CLOSE_FAIL pos=%s slug=%s err=%s",
-                pos_id[:8], pos_slug, _db_exc,
-            )
-    else:
-        _err = (
-            raw_response.get("errorMsg")
-            or raw_response.get("error")
-            or str(raw_response)[:100]
-        )
-        logging.warning(
-            "COPY_PRE_EXPIRY_EXIT_FAIL pos=%s slug=%s token_id=%s "
-            "error=%s seconds_to_close=%.1f "
-            "— settlement/redeem path remains intact",
-            pos_id[:8], pos_slug, str(token_id)[:20],
-            _err, seconds_to_close,
-        )
-
-    return True
-
-
 async def copy_auto_exit_loop() -> None:
     """
     Auto-profit / max-hold background scanner for OPEN copied positions.
@@ -10939,23 +10058,9 @@ async def copy_auto_exit_loop() -> None:
 
                     # ── 3j. Live block ────────────────────────────────────────
                     if is_live:
-                        # Pre-expiry exit: attempt a CLOB SELL in the final
-                        # PRE_EXPIRY_EXIT_SECONDS before market close.
-                        # Best-effort — settlement/redeem path is unaffected.
-                        if PRE_EXPIRY_EXIT_SECONDS > 0:
-                            _pe_in_window = await asyncio.to_thread(
-                                _try_pre_expiry_live_exit_sync,
-                                pos, bot, _copy_trading_client,
-                            )
-                            if _pe_in_window:
-                                # Pre-expiry attempt was made (OK or FAIL logged
-                                # inside helper).  Skip normal live-skip logging.
-                                skipped += 1
-                                continue
-
                         logging.warning(
                             "COPY_EXIT_SKIP_LIVE_UNSUPPORTED pos=%s slug=%s reason=%s "
-                            "— live auto-exit not yet implemented; "
+                            "— live auto-exit is not yet implemented; "
                             "position remains open until source wallet SELL or settlement",
                             pos_id[:8], pos_slug, close_reason,
                         )
@@ -12450,8 +11555,6 @@ async def main():
         COPY_LIVE_ENABLED,
     )
     trading_client = build_trading_client()
-    global _copy_trading_client
-    _copy_trading_client = trading_client
     tasks = []
     # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
     tasks.append(asyncio.create_task(_run_forever("rotate_loop", rotate_loop)))

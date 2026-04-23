@@ -365,25 +365,6 @@ COPY_LIVE_MAX_TRADE_USD        = float(os.getenv("COPY_LIVE_MAX_TRADE_USD",     
 COPY_LIVE_MAX_OPEN_POSITIONS   = int(os.getenv("COPY_LIVE_MAX_OPEN_POSITIONS",    "3"))
 COPY_LIVE_MAX_TRADES_PER_HOUR  = int(os.getenv("COPY_LIVE_MAX_TRADES_PER_HOUR",   "5"))
 
-# Seconds to suppress exact-duplicate SELL exit submissions for the same CLOB
-# token within a single loop tick.  Kept tiny (3s) to allow fast re-tries while
-# preventing the same exit event from being submitted twice in rapid succession.
-# Override via env var.  Previous value was 90s — reduced to 3s to unblock
-# fast-market exits that were being held as live_exit_already_pending.
-COPY_LIVE_EXIT_COOLDOWN_SEC    = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_SEC",     "3"))
-
-# Fast-market window — also 3s; slug-based distinction preserved for future use.
-COPY_LIVE_EXIT_COOLDOWN_FAST_SEC = int(os.getenv("COPY_LIVE_EXIT_COOLDOWN_FAST_SEC", "3"))
-
-# Slugs that use COPY_LIVE_EXIT_COOLDOWN_FAST_SEC instead of the default.
-COPY_LIVE_EXIT_FAST_MARKET_SLUGS: frozenset[str] = frozenset({
-    "btc-updown-5m",
-    "eth-updown-5m",
-    "sol-updown-5m",
-    "xrp-updown-5m",
-})
-
-
 # ── 20. Leaderboard wallet discovery config ────────────────────────────────────
 #
 # LEADERBOARD_INGEST_ENABLED   Toggle the leaderboard ingest loop on/off.
@@ -494,11 +475,6 @@ CLOSE_REASON_SETTLED_MARKET       = "settled_market"
 CLOSE_REASON_MANUAL_RESET         = "manual_reset"
 CLOSE_REASON_CLOSE_FAILED_RETRY   = "close_failed_retrying"
 CLOSE_REASON_CLOSE_FAILED_FINAL   = "close_failed_final"
-CLOSE_REASON_PRE_EXPIRY           = "pre_expiry_exit"
-
-# Seconds before market close at which to attempt a LIVE pre-expiry SELL.
-# Set to 0 to disable the feature entirely.
-PRE_EXPIRY_EXIT_SECONDS           = int(os.getenv("PRE_EXPIRY_EXIT_SECONDS", "15"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
