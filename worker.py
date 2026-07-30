@@ -7661,6 +7661,190 @@ def update_wallet_metrics_for_address(wallet_address: str) -> None:
         logging.exception("COPY_UPDATE_METRICS_FAIL wallet=%s", wallet_address[:10])
 
 
+# =============================================================================
+# READ-ONLY TOP TRADERS HELPER
+# -----------------------------------------------------------------------------
+# get_ranked_top_traders() is intentionally isolated from all trade-execution
+# paths.  It reads Supabase and returns a sorted list; it never writes, never
+# triggers orders, and must not be called from heartbeat_loop or any live loop.
+# =============================================================================
+
+def get_ranked_top_traders(limit: int = 50) -> list[dict]:
+    """
+    READ-ONLY.  Returns a ranked list of tracked wallets joined with their
+    wallet_metrics row, sorted by:
+      1. copy_score  DESC
+      2. pnl_30d     DESC
+      3. recent_closed_count DESC
+
+    This function only reads from Supabase.  It must remain isolated from
+    all trade-execution code and must never be called from production loops.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of traders to return (default 50).
+
+    Returns
+    -------
+    list[dict]
+        Each dict contains the fields listed in the task spec.  Any field not
+        present in the database row is returned as None (or 0 for counts).
+    """
+    try:
+        # ── Step 1: read tracked_wallets ──────────────────────────────────
+        tw_resp = (
+            supabase.table("tracked_wallets")
+            .select(
+                "id, wallet_address, display_name, tags, is_active"
+            )
+            .execute()
+        )
+        tracked = tw_resp.data or []
+
+        if not tracked:
+            logging.info("TOP_TRADERS_RANKED count=0 (no tracked wallets)")
+            return []
+
+        # Build a lookup keyed by wallet_address for O(1) join below
+        tracked_by_address: dict[str, dict] = {
+            row["wallet_address"]: row for row in tracked if row.get("wallet_address")
+        }
+
+        # ── Step 2: read wallet_metrics for those addresses ───────────────
+        addresses = list(tracked_by_address.keys())
+        wm_resp = (
+            supabase.table("wallet_metrics")
+            .select(
+                "wallet_address, copy_score, wallet_class, pnl_7d, pnl_30d,"
+                " win_rate, trade_count, volume, avg_hold_minutes,"
+                " median_hold_minutes, pct_under_15min, pct_under_30min,"
+                " recent_closed_count, max_drawdown, category_focus,"
+                " last_trade_at, updated_at"
+            )
+            .in_("wallet_address", addresses)
+            .execute()
+        )
+        metrics_by_address: dict[str, dict] = {
+            row["wallet_address"]: row
+            for row in (wm_resp.data or [])
+            if row.get("wallet_address")
+        }
+
+        # ── Step 3: join + normalise ──────────────────────────────────────
+        def _safe_float(value, default=None):
+            """Return float or default; never raises."""
+            try:
+                return float(value) if value is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(value, default=0):
+            """Return int or default; never raises."""
+            try:
+                return int(value) if value is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        results: list[dict] = []
+        for address, tw_row in tracked_by_address.items():
+            m = metrics_by_address.get(address, {})
+            results.append({
+                "tracked_wallet_id":    tw_row.get("id"),
+                "wallet_address":       address,
+                "display_name":         tw_row.get("display_name"),
+                "tags":                 tw_row.get("tags"),
+                "is_active":            tw_row.get("is_active"),
+                # metrics — float fields
+                "copy_score":           _safe_float(m.get("copy_score")),
+                "wallet_class":         m.get("wallet_class"),
+                "pnl_7d":               _safe_float(m.get("pnl_7d")),
+                "pnl_30d":              _safe_float(m.get("pnl_30d")),
+                "win_rate":             _safe_float(m.get("win_rate")),
+                "volume":               _safe_float(m.get("volume")),
+                "avg_hold_minutes":     _safe_float(m.get("avg_hold_minutes")),
+                "median_hold_minutes":  _safe_float(m.get("median_hold_minutes")),
+                "pct_under_15min":      _safe_float(m.get("pct_under_15min")),
+                "pct_under_30min":      _safe_float(m.get("pct_under_30min")),
+                "max_drawdown":         _safe_float(m.get("max_drawdown")),
+                # metrics — int/count fields
+                "trade_count":          _safe_int(m.get("trade_count")),
+                "recent_closed_count":  _safe_int(m.get("recent_closed_count")),
+                # metrics — string / timestamp fields
+                "category_focus":       m.get("category_focus"),
+                "last_trade_at":        m.get("last_trade_at"),
+                "updated_at":           m.get("updated_at"),
+            })
+
+        # ── Step 4: sort ──────────────────────────────────────────────────
+        # Primary:   copy_score DESC  (None treated as -inf)
+        # Secondary: pnl_30d DESC     (None treated as -inf)
+        # Tertiary:  recent_closed_count DESC
+        results.sort(
+            key=lambda r: (
+                r["copy_score"]         if r["copy_score"]         is not None else float("-inf"),
+                r["pnl_30d"]            if r["pnl_30d"]            is not None else float("-inf"),
+                r["recent_closed_count"],
+            ),
+            reverse=True,
+        )
+
+        # ── Step 5: apply limit ───────────────────────────────────────────
+        results = results[:limit]
+
+        # Single non-sensitive log line (requirement 9)
+        logging.info("TOP_TRADERS_RANKED count=%d", len(results))
+        return results
+
+    except Exception:
+        logging.exception("TOP_TRADERS_RANKED_FAIL")
+        return []
+
+
+def _verify_get_ranked_top_traders_structure() -> None:
+    """
+    Developer verification helper — READ-ONLY, non-executing in production.
+
+    Call manually (e.g. in a local Python REPL or a one-off script) to confirm
+    that get_ranked_top_traders() returns the expected structure without any
+    crash.  This function is never called automatically.
+
+    Example usage (REPL):
+        from worker import _verify_get_ranked_top_traders_structure
+        _verify_get_ranked_top_traders_structure()
+    """
+    EXPECTED_KEYS = {
+        "tracked_wallet_id", "wallet_address", "display_name", "tags",
+        "is_active", "copy_score", "wallet_class", "pnl_7d", "pnl_30d",
+        "win_rate", "trade_count", "volume", "avg_hold_minutes",
+        "median_hold_minutes", "pct_under_15min", "pct_under_30min",
+        "recent_closed_count", "max_drawdown", "category_focus",
+        "last_trade_at", "updated_at",
+    }
+
+    rows = get_ranked_top_traders(limit=5)
+    assert isinstance(rows, list), f"Expected list, got {type(rows)}"
+
+    if rows:
+        missing = EXPECTED_KEYS - set(rows[0].keys())
+        assert not missing, f"Missing keys in first row: {missing}"
+
+        # Verify sort order: copy_score should be non-increasing
+        scores = [
+            r["copy_score"] if r["copy_score"] is not None else float("-inf")
+            for r in rows
+        ]
+        assert scores == sorted(scores, reverse=True), (
+            f"Rows not sorted by copy_score DESC: {scores}"
+        )
+
+    logging.info(
+        "TOP_TRADERS_VERIFY OK rows_checked=%d keys_verified=%d",
+        len(rows),
+        len(EXPECTED_KEYS),
+    )
+
+
 # ── Copy bot evaluation ───────────────────────────────────────────────────────
 
 
@@ -10943,6 +11127,267 @@ async def _run_leaderboard_scan() -> None:
     logging.warning(
         "LEADERBOARD_SCAN_DONE elapsed_s=%.1f next_scan_in=%ss",
         elapsed, LEADERBOARD_INGEST_INTERVAL,
+    )
+
+
+# =============================================================================
+# MULTI-PERIOD LEADERBOARD DISCOVERY
+# -----------------------------------------------------------------------------
+# discover_current_leaderboard_traders() is a DISCOVERY-ONLY helper.
+# It fetches DAY / WEEK / MONTH leaderboard snapshots, deduplicates by wallet
+# address, and upserts candidates into candidate_wallets.
+#
+# This block must remain fully isolated from all trade-execution code.
+# It must not be called from heartbeat_loop, copy_trade_loop, or any live loop.
+# It does NOT create copy bots, activate wallets, or place orders.
+# =============================================================================
+
+# Mapping of human-readable period labels to Polymarket API timeframe strings.
+_DISCOVER_LB_PERIOD_TIMEFRAMES: dict[str, str] = {
+    "DAY":   "1d",
+    "WEEK":  "1w",
+    "MONTH": "1m",
+}
+
+
+def _fetch_leaderboard_page_for_period_sync(
+    timeframe: str,
+    offset: int,
+    limit: int,
+) -> list[dict]:
+    """
+    Fetch one page of the Polymarket leaderboard for an explicit timeframe.
+
+    Equivalent to _fetch_leaderboard_page_sync but accepts the timeframe as a
+    parameter so multiple periods can be fetched in one call without mutating
+    the LEADERBOARD_TIMEFRAME global.
+
+    Returns [] on any error — caller skips empty pages.
+    """
+    url = (
+        f"{COPY_DATA_API_BASE}/leaderboard"
+        f"?timeframe={timeframe}"
+        f"&categoryType={LEADERBOARD_CATEGORY.upper()}"
+        f"&sortBy=profit"
+        f"&limit={limit}"
+        f"&offset={offset}"
+    )
+    try:
+        req = request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "FastLoopWorker/1.0"},
+        )
+        with request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read())
+        if isinstance(raw, list):
+            return raw
+        for key in ("data", "results", "leaderboard", "users", "entries"):
+            if isinstance(raw.get(key), list):
+                return raw[key]
+        logging.warning(
+            "DISCOVER_LB_UNKNOWN_SHAPE timeframe=%s offset=%s keys=%s",
+            timeframe, offset,
+            list(raw.keys())[:8] if isinstance(raw, dict) else type(raw),
+        )
+        return []
+    except Exception as exc:
+        logging.warning(
+            "DISCOVER_LB_FETCH_FAIL timeframe=%s offset=%s url=%s err=%s",
+            timeframe, offset, url, exc,
+        )
+        return []
+
+
+def discover_current_leaderboard_traders(limit_per_period: int = 50) -> dict:
+    """
+    DISCOVERY-ONLY.  Fetches current Polymarket leaderboard traders for
+    DAY, WEEK, and MONTH periods and upserts them into candidate_wallets.
+
+    This function is intentionally isolated from all trade-execution paths.
+    It must never be called automatically from heartbeat_loop or any live loop.
+    It does NOT create copy bots, activate wallets, or place orders.
+
+    Reuses existing helpers:
+      _fetch_leaderboard_page_for_period_sync — HTTP fetch per period
+      _normalize_leaderboard_row              — extract/normalise API fields
+      _upsert_candidate_wallet                — write to candidate_wallets
+
+    The ``source`` field in candidate_wallets encodes which leaderboard
+    period(s) the wallet appeared in, e.g. "leaderboard_day,leaderboard_week".
+    This replaces the tags requirement since candidate_wallets has no tags column.
+
+    Parameters
+    ----------
+    limit_per_period : int
+        Number of traders to fetch from each leaderboard period (default 50).
+
+    Returns
+    -------
+    dict with keys:
+      fetched           — total raw rows fetched across all periods
+      deduplicated      — unique wallet addresses after dedup
+      newly_discovered  — wallets not previously in candidate_wallets or tracked_wallets
+      already_known     — wallets already present (updated snapshot)
+      errors            — fetch + upsert error count
+    """
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    # ── Step 1: load known wallet addresses for dedup classification ──────────
+    try:
+        tw_resp = (
+            supabase.table("tracked_wallets")
+            .select("wallet_address")
+            .execute()
+        )
+        tracked_addresses: set[str] = {
+            str(r["wallet_address"]).lower() for r in (tw_resp.data or [])
+        }
+    except Exception:
+        logging.exception("DISCOVER_LB_LOAD_TRACKED_FAIL")
+        tracked_addresses = set()
+
+    try:
+        cw_resp = (
+            supabase.table("candidate_wallets")
+            .select("wallet_address")
+            .execute()
+        )
+        existing_candidates: set[str] = {
+            str(r["wallet_address"]).lower() for r in (cw_resp.data or [])
+        }
+    except Exception:
+        logging.exception("DISCOVER_LB_LOAD_CANDIDATES_FAIL")
+        existing_candidates = set()
+
+    # ── Step 2: fetch top N rows from each period ─────────────────────────────
+    per_period_rows: dict[str, list[dict]] = {}
+    total_fetched = 0
+    fetch_errors = 0
+
+    for period_label, timeframe in _DISCOVER_LB_PERIOD_TIMEFRAMES.items():
+        try:
+            rows = _fetch_leaderboard_page_for_period_sync(
+                timeframe=timeframe,
+                offset=0,
+                limit=limit_per_period,
+            )
+            per_period_rows[period_label] = rows
+            total_fetched += len(rows)
+            logging.info(
+                "DISCOVER_LB_PERIOD_FETCHED period=%s timeframe=%s rows=%d",
+                period_label, timeframe, len(rows),
+            )
+        except Exception as exc:
+            fetch_errors += 1
+            per_period_rows[period_label] = []
+            logging.warning(
+                "DISCOVER_LB_PERIOD_FAIL period=%s timeframe=%s err=%s",
+                period_label, timeframe, exc,
+            )
+
+    # ── Step 3: normalise + deduplicate by wallet address ─────────────────────
+    # wallet_address → merged candidate dict + list of periods seen
+    merged: dict[str, dict] = {}
+
+    for period_label, rows in per_period_rows.items():
+        for rank_in_period, row in enumerate(rows, start=1):
+            candidate = _normalize_leaderboard_row(row, rank_in_period, fetched_at)
+            if not candidate:
+                continue
+            addr = candidate["wallet_address"]
+            if addr not in merged:
+                merged[addr] = candidate
+                merged[addr]["_periods"] = [period_label]
+            else:
+                # Keep best rank across all periods
+                if candidate["rank"] < merged[addr]["rank"]:
+                    merged[addr]["rank"]         = candidate["rank"]
+                    merged[addr]["daily_profit"] = candidate["daily_profit"]
+                    merged[addr]["daily_volume"] = candidate["daily_volume"]
+                if period_label not in merged[addr]["_periods"]:
+                    merged[addr]["_periods"].append(period_label)
+
+    deduplicated = len(merged)
+    logging.info(
+        "DISCOVER_LB_DEDUP total_fetched=%d unique_wallets=%d",
+        total_fetched, deduplicated,
+    )
+
+    # ── Step 4: upsert each unique candidate into candidate_wallets ───────────
+    newly_discovered = already_known = upsert_errors = 0
+
+    for addr, candidate in merged.items():
+        periods = candidate.pop("_periods", [])
+        # Encode period membership in the source field so it's queryable
+        # without a schema change.  E.g. "leaderboard_day,leaderboard_week"
+        source_parts = sorted(f"leaderboard_{p.lower()}" for p in periods)
+        candidate["source"]     = ",".join(source_parts)
+        candidate["is_tracked"] = addr in tracked_addresses
+        candidate["status"]     = "tracked" if candidate["is_tracked"] else "candidate"
+
+        is_new = addr not in existing_candidates and not candidate["is_tracked"]
+
+        ok = _upsert_candidate_wallet(candidate)
+        if not ok:
+            upsert_errors += 1
+            continue
+        if is_new:
+            newly_discovered += 1
+        else:
+            already_known += 1
+
+    # Single summary log — no secrets, no full wallet addresses
+    logging.info(
+        "DISCOVER_LB_SUMMARY fetched=%d deduplicated=%d "
+        "newly_discovered=%d already_known=%d errors=%d",
+        total_fetched,
+        deduplicated,
+        newly_discovered,
+        already_known,
+        fetch_errors + upsert_errors,
+    )
+
+    return {
+        "fetched":           total_fetched,
+        "deduplicated":      deduplicated,
+        "newly_discovered":  newly_discovered,
+        "already_known":     already_known,
+        "errors":            fetch_errors + upsert_errors,
+    }
+
+
+def _verify_discover_current_leaderboard_traders() -> None:
+    """
+    Developer verification helper — READ-ONLY from production's perspective,
+    non-executing automatically.
+
+    Call manually in a local Python REPL (with env vars loaded) to confirm
+    that discover_current_leaderboard_traders() runs without crashing and
+    returns the expected result structure.  This function is never called
+    automatically.
+
+    Example usage (REPL):
+        from worker import _verify_discover_current_leaderboard_traders
+        _verify_discover_current_leaderboard_traders()
+    """
+    EXPECTED_KEYS = {"fetched", "deduplicated", "newly_discovered", "already_known", "errors"}
+
+    # Use limit_per_period=5 to minimise API calls during verification
+    result = discover_current_leaderboard_traders(limit_per_period=5)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+    missing = EXPECTED_KEYS - set(result.keys())
+    assert not missing, f"Missing result keys: {missing}"
+    assert all(isinstance(v, int) for v in result.values()), (
+        f"All result values must be int: {result}"
+    )
+    assert result["deduplicated"] <= result["fetched"], (
+        "deduplicated must not exceed fetched"
+    )
+
+    logging.info(
+        "DISCOVER_LB_VERIFY OK result=%s keys_verified=%d",
+        result, len(EXPECTED_KEYS),
     )
 
 
