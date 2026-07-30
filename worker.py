@@ -7928,6 +7928,160 @@ def compute_copy_size(
     return round(size, 4)
 
 
+# =============================================================================
+# BOT STATE HELPERS — ACTIVE / EXIT_MONITOR_ONLY / OFF
+# -----------------------------------------------------------------------------
+# These two helpers read existing copy_bots columns to determine which
+# operations are permitted.  They must remain isolated from order execution —
+# they only return booleans and never write to the database or place orders.
+#
+# State mapping (using pre-existing copy_bots fields):
+#
+#   ACTIVE
+#     opens_only = False / NULL   → bot_allows_new_entries  = True
+#     copy_closes = True (default) → bot_requires_exit_monitoring = True
+#
+#   EXIT_MONITOR_ONLY
+#     opens_only = True            → bot_allows_new_entries  = False
+#     copy_closes = True           → bot_requires_exit_monitoring = True
+#
+#   OFF (safe only when no open copied positions remain)
+#     is_enabled = False           → bot not loaded at all  (handled by loader)
+#     copy_closes = False          → bot_requires_exit_monitoring = False
+#                                    (only when open_count == 0)
+#
+# The opens_only column already exists in copy_bots and is referenced in
+# audit logs (line 6764) but was never enforced as a gate until now.
+# No database migration is required.
+# =============================================================================
+
+def bot_allows_new_entries(bot: dict) -> bool:
+    """
+    READ-ONLY.  Returns True when this bot may open new copied BUY positions.
+
+    ACTIVE           : opens_only is False / NULL → True
+    EXIT_MONITOR_ONLY: opens_only = True          → False
+
+    The opens_only field is an existing copy_bots column.  Setting it to True
+    in Supabase transitions the bot to EXIT_MONITOR_ONLY without any code
+    change.  Existing SELLs and exit monitoring are unaffected.
+
+    This function must never be called from order-execution paths.
+    It reads only from the in-memory bot dict — no DB query, no I/O.
+    """
+    if bool(bot.get("opens_only")):
+        # EXIT_MONITOR_ONLY: new BUY entries blocked
+        return False
+    # ACTIVE: new BUY entries allowed
+    return True
+
+
+def bot_requires_exit_monitoring(bot: dict) -> bool:
+    """
+    READ-ONLY.  Returns True when this bot must continue monitoring source
+    SELL activity to close existing copied positions.
+
+    Safety guard: even when copy_closes=False, returns True while the bot
+    holds open copied positions.  The caller logs
+    FULL_DISABLE_BLOCKED_OPEN_POSITIONS and forces copy_closes=True for
+    that evaluation tick — without modifying the database row.
+
+    copy_closes = True (default)              → True  (normal exit monitoring)
+    copy_closes = False + open positions > 0  → True  (forced EXIT_MONITOR_ONLY)
+    copy_closes = False + open positions == 0 → False (fully OFF is safe)
+
+    Fails closed: returns True on any DB error so positions are never
+    silently orphaned.
+    """
+    copy_closes = bool(bot.get("copy_closes", True))
+    if copy_closes:
+        return True
+    # copy_closes=False was explicitly set — check for open positions before
+    # allowing full shutdown of exit monitoring.
+    bot_id = str(bot.get("id", ""))
+    if not bot_id:
+        return False
+    try:
+        open_count = get_open_positions_count(bot_id)
+        if open_count > 0:
+            return True  # safety guard: open positions must not lose monitoring
+    except Exception:
+        logging.warning(
+            "BOT_REQUIRES_EXIT_MONITORING_CHECK_FAIL bot=%s "
+            "— defaulting to True (fail-closed)",
+            bot_id[:8],
+        )
+        return True  # fail-closed: assume monitoring required on error
+    return False
+
+
+def _verify_bot_state_helpers() -> None:
+    """
+    Developer verification helper — non-executing in production.
+
+    Call manually in a local Python REPL (with env loaded) to confirm that
+    bot_allows_new_entries() and bot_requires_exit_monitoring() return the
+    expected values for all three bot states.  Never called automatically.
+
+    Example usage (REPL):
+        from worker import _verify_bot_state_helpers
+        _verify_bot_state_helpers()
+    """
+    # ── ACTIVE bot: opens_only=False, copy_closes=True ─────────────────────
+    active_bot = {"id": "test-active", "opens_only": False, "copy_closes": True}
+    assert bot_allows_new_entries(active_bot) is True, (
+        "ACTIVE bot should allow new entries"
+    )
+    assert bot_requires_exit_monitoring(active_bot) is True, (
+        "ACTIVE bot should require exit monitoring"
+    )
+
+    # ── EXIT_MONITOR_ONLY: opens_only=True, copy_closes=True ───────────────
+    exit_monitor_bot = {"id": "test-emo", "opens_only": True, "copy_closes": True}
+    assert bot_allows_new_entries(exit_monitor_bot) is False, (
+        "EXIT_MONITOR_ONLY bot must block new entries"
+    )
+    assert bot_requires_exit_monitoring(exit_monitor_bot) is True, (
+        "EXIT_MONITOR_ONLY bot must keep exit monitoring"
+    )
+
+    # ── OFF bot (no open positions): opens_only=True, copy_closes=False ────
+    off_bot = {"id": "test-off", "opens_only": True, "copy_closes": False}
+    assert bot_allows_new_entries(off_bot) is False, (
+        "OFF bot must block new entries"
+    )
+    # bot_requires_exit_monitoring will query DB for open positions.
+    # With test ID the DB will return 0 → False is expected.
+    result_off = bot_requires_exit_monitoring(off_bot)
+    assert result_off is False, (
+        f"OFF bot with no open positions should not require exit monitoring; got {result_off}"
+    )
+
+    # ── Safety guard: copy_closes=False but open positions exist ───────────
+    # This test only verifies that the function returns True when open_count > 0.
+    # We simulate this by patching get_open_positions_count inline.
+    _real_fn = get_open_positions_count  # type: ignore[name-defined]
+
+    def _mock_open_count(bot_id: str) -> int:
+        return 3  # simulate 3 open positions
+
+    import builtins
+    # Minimal monkeypatch for test scope only
+    globals()["get_open_positions_count"] = _mock_open_count
+    try:
+        guarded_bot = {"id": "test-guard", "opens_only": True, "copy_closes": False}
+        assert bot_requires_exit_monitoring(guarded_bot) is True, (
+            "Bot with open positions must require exit monitoring even when copy_closes=False"
+        )
+    finally:
+        globals()["get_open_positions_count"] = _real_fn
+
+    logging.info(
+        "BOT_STATE_VERIFY OK — ACTIVE/EXIT_MONITOR_ONLY/OFF states confirmed; "
+        "safety guard confirmed"
+    )
+
+
 def evaluate_copy_trade_shared(
     copy_bot: dict,
     wallet_trade: dict,
@@ -8578,6 +8732,35 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             )
                             continue
 
+                        # ── Bot state gate: ACTIVE vs EXIT_MONITOR_ONLY ──────────────
+                        # Reads opens_only from the copy_bots row (pre-existing column,
+                        # now enforced as an entry gate).
+                        # BUY/entry attempts are blocked when opens_only=True.
+                        # SELL/close events bypass this gate entirely.
+                        if _is_buy_attempt:
+                            if not bot_allows_new_entries(bot):
+                                logging.info(
+                                    "NEW_ENTRY_BLOCKED_EXIT_MONITOR bot=%s trade=%s "
+                                    "— opens_only=True; bot is EXIT_MONITOR_ONLY; "
+                                    "BUY blocked, SELL monitoring remains active",
+                                    bot_label, trade_label,
+                                )
+                                continue
+                            if bot.get("opens_only") is not None:
+                                # Only emitted when opens_only is explicitly configured
+                                # (avoids noise for unconfigured bots where field is absent)
+                                logging.info(
+                                    "NEW_ENTRY_ALLOWED bot=%s trade=%s state=ACTIVE",
+                                    bot_label, trade_label,
+                                )
+                        elif bool(bot.get("opens_only")):
+                            # SELL for an EXIT_MONITOR_ONLY bot — make this visible
+                            logging.info(
+                                "EXIT_MONITOR_ACTIVE bot=%s trade=%s "
+                                "— bot is EXIT_MONITOR_ONLY; SELL proceeding to shared brain",
+                                bot_label, trade_label,
+                            )
+
                         # Single lock per mode (BUY only) — prevents concurrent
                         # coroutines from both passing the exposure gate before
                         # either commits its row.
@@ -8593,9 +8776,27 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             # Gates: emergency_stop, closes filter, delay,
                             #        rate_limit, max_open_positions,
                             #        market_data, price → compute size+price.
+                            #
+                            # ── Exit monitoring safety override ───────────────
+                            # If copy_closes=False but open positions still exist,
+                            # force copy_closes=True for this evaluation tick.
+                            # This creates a shallow copy of the bot dict — the
+                            # evaluate_copy_trade_shared function and the DB row
+                            # are both untouched.
+                            _eval_bot = bot
+                            if not bot.get("copy_closes", True) and bot_requires_exit_monitoring(bot):
+                                _eval_bot = {**bot, "copy_closes": True}
+                                logging.warning(
+                                    "FULL_DISABLE_BLOCKED_OPEN_POSITIONS bot=%s "
+                                    "— copy_closes=False but open copied positions exist; "
+                                    "forcing exit monitoring for this tick. "
+                                    "To enter EXIT_MONITOR_ONLY safely, set "
+                                    "opens_only=True and copy_closes=True.",
+                                    bot_label,
+                                )
                             copied, skip_reason, submitted_size, submitted_price = (
                                 evaluate_copy_trade_shared(
-                                    bot, wallet_trade, global_settings,
+                                    _eval_bot, wallet_trade, global_settings,
                                     mode=_exec_mode,
                                 )
                             )
