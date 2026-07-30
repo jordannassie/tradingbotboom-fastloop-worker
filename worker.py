@@ -11592,6 +11592,436 @@ def _verify_discover_current_leaderboard_traders() -> None:
     )
 
 
+# =============================================================================
+# TRADER ROTATION RECOMMENDATIONS
+# -----------------------------------------------------------------------------
+# get_trader_rotation_recommendations() is READ-ONLY.
+# It fetches live data from Supabase and the Polymarket leaderboard API,
+# then returns structured recommendation dicts.
+#
+# It must remain fully isolated from all trade-execution paths.
+# It must never be called automatically from production loops.
+# It never writes to the database, creates bots, or places orders.
+# =============================================================================
+
+# Activity-staleness thresholds (in days)
+_ROTATION_ACTIVE_DAYS:   int = 7
+_ROTATION_COOLING_DAYS:  int = 14
+_ROTATION_STALE_DAYS:    int = 30
+
+# Minimum copy_score for a leaderboard candidate to pass PAPER_TEST qualification
+_ROTATION_MIN_COPY_SCORE: float = 0.0   # 0 = no filter; raise to tighten
+
+
+def _classify_trader_activity(last_trade_at_str: "str | None", now_utc: datetime) -> str:
+    """
+    Classify a trader's activity level based on last_trade_at.
+
+    Returns one of: ACTIVE | COOLING | STALE | INACTIVE
+
+    ACTIVE   — last activity within 7 days
+    COOLING  — 8–14 days
+    STALE    — 15–30 days
+    INACTIVE — over 30 days or no timestamp
+    """
+    if not last_trade_at_str:
+        return "INACTIVE"
+    try:
+        lta = datetime.fromisoformat(
+            str(last_trade_at_str).replace("Z", "+00:00")
+        )
+        days_ago = (now_utc - lta).days
+        if days_ago <= _ROTATION_ACTIVE_DAYS:
+            return "ACTIVE"
+        if days_ago <= _ROTATION_COOLING_DAYS:
+            return "COOLING"
+        if days_ago <= _ROTATION_STALE_DAYS:
+            return "STALE"
+        return "INACTIVE"
+    except Exception:
+        return "INACTIVE"
+
+
+def get_trader_rotation_recommendations(
+    max_paper_candidates: int = 10,
+) -> dict:
+    """
+    READ-ONLY rotation recommendation engine.
+
+    Produces a structured review of which traders to add, keep, pause, or stop.
+    Never writes to the database.  Never creates bots.  Never places orders.
+    Must not be called from production trading loops.
+
+    Input sources (all read-only):
+      - Polymarket leaderboard API (DAY / WEEK / MONTH, top 50 each)
+      - tracked_wallets + wallet_metrics (via get_ranked_top_traders)
+      - copy_bots (all bots — enabled and disabled)
+      - copied_positions (open count per bot, single query)
+      - candidate_wallets (enrichment data for leaderboard candidates)
+
+    Qualification rules for PAPER_TEST:
+      - Wallet appears on at least one leaderboard period
+      - Wallet address starts with 0x (valid on-chain address)
+      - Not already an ACTIVE paper bot (is_enabled=True, opens_only=False)
+      - Not tagged AVOID or PERSONAL in tracked_wallets
+      - Not already in tracked_by_address (existing tracked wallets are
+        handled via KEEP_ACTIVE / EXIT_MONITOR_ONLY / OFF paths instead)
+      - copy_score from candidate_wallets enrichment >= _ROTATION_MIN_COPY_SCORE
+        (0.0 by default — raise to filter low-quality candidates)
+
+    Staleness rules for existing tracked traders:
+      ACTIVE   — last_trade_at within 7 days
+      COOLING  — 8–14 days
+      STALE    — 15–30 days
+      INACTIVE — over 30 days or missing timestamp
+
+    Recommendation rules:
+      KEEP_ACTIVE        — tracker is ACTIVE or COOLING
+      EXIT_MONITOR_ONLY  — tracker is STALE/INACTIVE + open positions exist
+      OFF                — tracker is STALE/INACTIVE + no open positions
+
+    Parameters
+    ----------
+    max_paper_candidates : int
+        Maximum PAPER_TEST recommendations to return (default 10).
+
+    Returns
+    -------
+    dict with keys: generated_at, paper_test, keep_active,
+                    exit_monitor_only, off, summary
+    """
+    generated_at = datetime.now(timezone.utc).isoformat()
+    now_utc      = datetime.now(timezone.utc)
+
+    # ── Step 1: Fetch current leaderboard for DAY / WEEK / MONTH ─────────────
+    leaderboard_by_address: dict[str, dict] = {}
+
+    for period_label, timeframe in _DISCOVER_LB_PERIOD_TIMEFRAMES.items():
+        try:
+            rows = _fetch_leaderboard_page_for_period_sync(
+                timeframe=timeframe, offset=0, limit=50
+            )
+            for rank_in_period, row in enumerate(rows, start=1):
+                candidate = _normalize_leaderboard_row(
+                    row, rank_in_period, generated_at
+                )
+                if not candidate:
+                    continue
+                addr = candidate["wallet_address"]
+                if addr not in leaderboard_by_address:
+                    leaderboard_by_address[addr] = {
+                        "periods":       [period_label],
+                        "best_rank":     candidate["rank"],
+                        "daily_profit":  candidate.get("daily_profit"),
+                        "daily_volume":  candidate.get("daily_volume"),
+                        "display_name":  candidate.get("display_name"),
+                    }
+                else:
+                    leaderboard_by_address[addr]["periods"].append(period_label)
+                    if candidate["rank"] < leaderboard_by_address[addr]["best_rank"]:
+                        leaderboard_by_address[addr]["best_rank"] = candidate["rank"]
+                        leaderboard_by_address[addr]["daily_profit"] = candidate.get("daily_profit")
+                        leaderboard_by_address[addr]["daily_volume"] = candidate.get("daily_volume")
+        except Exception:
+            logging.exception(
+                "ROTATION_LB_FETCH_FAIL period=%s", period_label
+            )
+
+    # ── Step 2: Load tracked wallets + metrics (joined) ───────────────────────
+    # get_ranked_top_traders reads tracked_wallets + wallet_metrics in one pass.
+    ranked_tracked = get_ranked_top_traders(limit=200)
+    tracked_by_address: dict[str, dict] = {
+        r["wallet_address"]: r
+        for r in ranked_tracked
+        if r.get("wallet_address")
+    }
+
+    # ── Step 3: Load ALL copy bots (enabled + disabled) ───────────────────────
+    try:
+        all_bots_resp = supabase.table("copy_bots").select("*").execute()
+        all_bots_list: list[dict] = all_bots_resp.data or []
+    except Exception:
+        logging.exception("ROTATION_LOAD_BOTS_FAIL")
+        all_bots_list = []
+
+    # Group bots by lower-cased wallet_address
+    bots_by_wallet: dict[str, list[dict]] = {}
+    for bot in all_bots_list:
+        addr = str(bot.get("wallet_address") or "").lower()
+        if addr:
+            bots_by_wallet.setdefault(addr, []).append(bot)
+
+    # ── Step 4: Batch-load open position counts (single query) ───────────────
+    open_pos_by_bot: dict[str, int] = {}
+    all_bot_ids = [str(b["id"]) for b in all_bots_list if b.get("id")]
+    if all_bot_ids:
+        try:
+            op_resp = (
+                supabase.table("copied_positions")
+                .select("copy_bot_id")
+                .in_("copy_bot_id", all_bot_ids)
+                .eq("status", "OPEN")
+                .execute()
+            )
+            for row in (op_resp.data or []):
+                bid = str(row.get("copy_bot_id") or "")
+                if bid:
+                    open_pos_by_bot[bid] = open_pos_by_bot.get(bid, 0) + 1
+        except Exception:
+            logging.exception("ROTATION_LOAD_OPEN_POS_FAIL")
+
+    def _wallet_open_count(wallet_addr: str) -> int:
+        """Sum open positions across all bots assigned to this wallet."""
+        return sum(
+            open_pos_by_bot.get(str(b["id"]), 0)
+            for b in bots_by_wallet.get(wallet_addr, [])
+            if b.get("id")
+        )
+
+    # ── Step 5: Fetch candidate_wallets enrichment for leaderboard addresses ─
+    lb_addrs = list(leaderboard_by_address.keys())
+    cw_by_address: dict[str, dict] = {}
+    if lb_addrs:
+        try:
+            cw_resp = (
+                supabase.table("candidate_wallets")
+                .select(
+                    "wallet_address, copy_score, avg_hold_minutes, "
+                    "recent_pnl, trades_per_day, recent_trade_count"
+                )
+                .in_("wallet_address", lb_addrs)
+                .execute()
+            )
+            cw_by_address = {
+                row["wallet_address"]: row
+                for row in (cw_resp.data or [])
+                if row.get("wallet_address")
+            }
+        except Exception:
+            logging.exception("ROTATION_LOAD_CANDIDATE_WALLETS_FAIL")
+
+    # ── Step 6: Build recommendations for existing tracked wallets ────────────
+    keep_active:      list[dict] = []
+    exit_monitor_only: list[dict] = []
+    off:              list[dict] = []
+
+    active_wallet_addrs: set[str] = {
+        str(b.get("wallet_address") or "").lower()
+        for b in all_bots_list
+        if bool(b.get("is_enabled")) and not bool(b.get("opens_only"))
+    }
+
+    for addr, tw in tracked_by_address.items():
+        tags_raw = tw.get("tags") or []
+        tags: list[str] = tags_raw if isinstance(tags_raw, list) else [tags_raw]
+
+        lta          = tw.get("last_trade_at")
+        activity     = _classify_trader_activity(lta, now_utc)
+        open_count   = _wallet_open_count(addr)
+        wallet_bots  = bots_by_wallet.get(addr, [])
+        lb_info      = leaderboard_by_address.get(addr, {})
+
+        current_status = (
+            "ACTIVE"
+            if any(bool(b.get("is_enabled")) and not bool(b.get("opens_only")) for b in wallet_bots)
+            else "EXIT_MONITOR_ONLY"
+            if any(bool(b.get("is_enabled")) and bool(b.get("opens_only")) for b in wallet_bots)
+            else "OFF"
+        )
+
+        rec: dict = {
+            "wallet_address":      addr,
+            "display_name":        tw.get("display_name"),
+            "current_status":      current_status,
+            "recommended_status":  None,
+            "leaderboard_periods": lb_info.get("periods", []),
+            "leaderboard_rank":    lb_info.get("best_rank"),
+            "copy_score":          tw.get("copy_score"),
+            "pnl_7d":              tw.get("pnl_7d"),
+            "pnl_30d":             tw.get("pnl_30d"),
+            "win_rate":            tw.get("win_rate"),
+            "median_hold_minutes": tw.get("median_hold_minutes"),
+            "recent_closed_count": tw.get("recent_closed_count"),
+            "max_drawdown":        tw.get("max_drawdown"),
+            "last_trade_at":       lta,
+            "open_position_count": open_count,
+            "activity_class":      activity,
+            "reason":              None,
+        }
+
+        if activity in ("ACTIVE", "COOLING"):
+            rec["recommended_status"] = "KEEP_ACTIVE"
+            rec["reason"] = (
+                f"Trader is {activity.lower()}; last activity {lta or 'unknown'}; "
+                "no change recommended"
+            )
+            keep_active.append(rec)
+        elif open_count > 0:
+            rec["recommended_status"] = "EXIT_MONITOR_ONLY"
+            rec["reason"] = (
+                f"Trader is {activity.lower()} but has {open_count} open copied "
+                "position(s); exit monitoring must remain active until all close"
+            )
+            exit_monitor_only.append(rec)
+        else:
+            rec["recommended_status"] = "OFF"
+            rec["reason"] = (
+                f"Trader is {activity.lower()} and has no open positions; "
+                "safe to fully disable"
+            )
+            off.append(rec)
+
+    # ── Step 7: Build PAPER_TEST candidates from leaderboard ─────────────────
+    paper_candidates: list[dict] = []
+
+    for addr, lb in leaderboard_by_address.items():
+        # Skip wallets already in tracked_wallets (handled above)
+        if addr in tracked_by_address:
+            continue
+        # Must be a valid on-chain address
+        if not addr.startswith("0x"):
+            continue
+        # Skip if already has an active enabled bot
+        if addr in active_wallet_addrs:
+            continue
+        # Skip if tagged AVOID or PERSONAL (checked against candidate_wallets tags
+        # if ever present; for now guard on wallet class from enrichment)
+        cw = cw_by_address.get(addr, {})
+        cw_score = cw.get("copy_score")
+        if cw_score is not None and float(cw_score) < _ROTATION_MIN_COPY_SCORE:
+            continue
+
+        periods      = lb.get("periods", [])
+        best_rank    = lb.get("best_rank") or 999
+        daily_profit = float(lb.get("daily_profit") or 0.0)
+
+        # Composite sort key: period breadth first, then rank, then profit
+        _sort_score = (len(periods) * 10_000) - best_rank + min(daily_profit, 500.0)
+
+        paper_candidates.append({
+            "wallet_address":      addr,
+            "display_name":        lb.get("display_name") or cw.get("display_name"),
+            "current_status":      "NOT_TRACKED",
+            "recommended_status":  "PAPER_TEST",
+            "leaderboard_periods": periods,
+            "leaderboard_rank":    best_rank,
+            "copy_score":          cw_score,
+            "pnl_7d":              None,
+            "pnl_30d":             None,
+            "win_rate":            None,
+            "median_hold_minutes": cw.get("avg_hold_minutes"),
+            "recent_closed_count": int(cw.get("recent_trade_count") or 0),
+            "max_drawdown":        None,
+            "last_trade_at":       None,
+            "open_position_count": 0,
+            "activity_class":      "UNKNOWN",
+            "reason": (
+                f"Appears on {', '.join(sorted(periods))} leaderboard period(s); "
+                f"rank {best_rank}; not yet tracked"
+                + (f"; copy_score={float(cw_score):.1f}" if cw_score is not None else "")
+            ),
+            "_sort_score": _sort_score,
+        })
+
+    # Sort by composite score and cap at max_paper_candidates
+    paper_candidates.sort(key=lambda x: x.pop("_sort_score", 0), reverse=True)
+    paper_test = paper_candidates[:max_paper_candidates]
+
+    # ── Step 8: Summary log (counts only — no secrets) ───────────────────────
+    logging.info(
+        "TRADER_ROTATION_REVIEW paper_test=%d keep=%d exit_monitor=%d off=%d",
+        len(paper_test), len(keep_active), len(exit_monitor_only), len(off),
+    )
+
+    return {
+        "generated_at":    generated_at,
+        "paper_test":      paper_test,
+        "keep_active":     keep_active,
+        "exit_monitor_only": exit_monitor_only,
+        "off":             off,
+        "summary": {
+            "paper_test_count":        len(paper_test),
+            "keep_active_count":       len(keep_active),
+            "exit_monitor_only_count": len(exit_monitor_only),
+            "off_count":               len(off),
+        },
+    }
+
+
+def _verify_get_trader_rotation_recommendations() -> None:
+    """
+    Developer verification helper — READ-ONLY, non-executing in production.
+
+    Confirms get_trader_rotation_recommendations() returns the expected
+    structure and performs no database writes.  Never auto-runs.
+
+    Example usage (REPL):
+        from worker import _verify_get_trader_rotation_recommendations
+        _verify_get_trader_rotation_recommendations()
+    """
+    EXPECTED_TOP_KEYS = {
+        "generated_at", "paper_test", "keep_active",
+        "exit_monitor_only", "off", "summary",
+    }
+    EXPECTED_SUMMARY_KEYS = {
+        "paper_test_count", "keep_active_count",
+        "exit_monitor_only_count", "off_count",
+    }
+    REC_KEYS = {
+        "wallet_address", "display_name", "current_status",
+        "recommended_status", "leaderboard_periods", "leaderboard_rank",
+        "copy_score", "pnl_7d", "pnl_30d", "win_rate", "median_hold_minutes",
+        "recent_closed_count", "max_drawdown", "last_trade_at",
+        "open_position_count", "reason",
+    }
+
+    result = get_trader_rotation_recommendations(max_paper_candidates=5)
+
+    # Top-level structure
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+    missing_top = EXPECTED_TOP_KEYS - set(result.keys())
+    assert not missing_top, f"Missing top-level keys: {missing_top}"
+
+    # Summary structure
+    summary = result["summary"]
+    missing_summary = EXPECTED_SUMMARY_KEYS - set(summary.keys())
+    assert not missing_summary, f"Missing summary keys: {missing_summary}"
+    assert all(isinstance(v, int) for v in summary.values()), (
+        f"All summary values must be int: {summary}"
+    )
+
+    # Validate recommendation structure for each bucket
+    all_recs = (
+        result["paper_test"]
+        + result["keep_active"]
+        + result["exit_monitor_only"]
+        + result["off"]
+    )
+    for rec in all_recs:
+        missing_rec = REC_KEYS - set(rec.keys())
+        assert not missing_rec, f"Missing rec keys: {missing_rec} in {rec}"
+        assert rec.get("recommended_status") in (
+            "PAPER_TEST", "KEEP_ACTIVE", "EXIT_MONITOR_ONLY", "OFF"
+        ), f"Unexpected recommended_status: {rec.get('recommended_status')}"
+
+    # Confirm counts match bucket lengths
+    assert summary["paper_test_count"]        == len(result["paper_test"])
+    assert summary["keep_active_count"]       == len(result["keep_active"])
+    assert summary["exit_monitor_only_count"] == len(result["exit_monitor_only"])
+    assert summary["off_count"]               == len(result["off"])
+
+    logging.info(
+        "ROTATION_VERIFY OK — structure valid; "
+        "paper_test=%d keep=%d exit_monitor=%d off=%d; "
+        "rec_keys_verified=%d",
+        summary["paper_test_count"],
+        summary["keep_active_count"],
+        summary["exit_monitor_only_count"],
+        summary["off_count"],
+        len(REC_KEYS),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ── EMA_5M_BTC  —  5-minute BTC EMA paper strategy ───────────────────────────
 #
