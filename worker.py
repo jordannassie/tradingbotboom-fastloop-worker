@@ -8227,6 +8227,69 @@ def compute_copy_size(
     return round(size, 4)
 
 
+def _test_compute_copy_size() -> None:
+    """
+    In-memory unit tests for compute_copy_size().  Runs once at startup.
+    Writes PASS / FAIL at WARNING level so results always appear in Railway.
+    Never reads from or writes to the database.
+    """
+    _dummy_trade_small  = {"notional": 2.0}
+    _dummy_trade_medium = {"notional": 10.0}
+    _dummy_gs           = {"default_position_size": 100.0}
+
+    _cases = [
+        # name, bot, trade, expected_max
+        (
+            "EXACT sizing_value=1 max_trade_size=1 => <=1",
+            {"copy_mode": "exact", "sizing_value": 1, "max_trade_size": 1},
+            _dummy_trade_medium, 1.0,
+        ),
+        (
+            "SCALED sizing_value=1 max_trade_size=1 source=10 => <=1",
+            {"copy_mode": "scaled", "sizing_value": 1, "max_trade_size": 1},
+            _dummy_trade_medium, 1.0,
+        ),
+        (
+            "EXACT sizing_value=5 max_trade_size=5 => <=5",
+            {"copy_mode": "exact", "sizing_value": 5, "max_trade_size": 5},
+            _dummy_trade_medium, 5.0,
+        ),
+        (
+            "EXACT sizing_value=10 max_trade_size=None => uses sizing (unlimited cap)",
+            {"copy_mode": "exact", "sizing_value": 10, "max_trade_size": None},
+            _dummy_trade_medium, 25.0,   # default cap is 25 when None
+        ),
+        (
+            "SCALED sizing_value=0.5 max_trade_size=5 source=2 => 1.0",
+            {"copy_mode": "scaled", "sizing_value": 0.5, "max_trade_size": 5},
+            _dummy_trade_small, 5.0,
+        ),
+        (
+            "PERCENT sizing_value=5 max_trade_size=1 base=100 => <=1",
+            {"copy_mode": "percent", "sizing_value": 5, "max_trade_size": 1},
+            _dummy_trade_medium, 1.0,
+        ),
+    ]
+
+    all_passed = True
+    for name, bot, trade, expected_max in _cases:
+        result = compute_copy_size(bot, trade, _dummy_gs)
+        passed = result <= expected_max
+        if not passed:
+            all_passed = False
+        logging.warning(
+            "COPY_SIZE_SELFTEST %s name=%r result=%.4f expected_max=%.4f",
+            "PASS" if passed else "FAIL",
+            name, result, expected_max,
+        )
+
+    logging.warning(
+        "COPY_SIZE_SELFTEST_SUMMARY %s cases=%s",
+        "ALL_PASS" if all_passed else "FAILURES_DETECTED",
+        len(_cases),
+    )
+
+
 # =============================================================================
 # BOT STATE HELPERS — ACTIVE / EXIT_MONITOR_ONLY / OFF
 # -----------------------------------------------------------------------------
@@ -8796,12 +8859,16 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         # ── Log every enabled copy bot (WARNING for Railway visibility) ───────
         for _b in all_bots:
             logging.warning(
-                "COPY_BOT_LOADED id=%s name=%s is_enabled=%s arm_live=%s mode=%s wallet=%s",
+                "COPY_BOT_LOADED id=%s name=%s is_enabled=%s arm_live=%s mode=%s "
+                "copy_mode=%s sizing_value=%s max_trade_size=%s wallet=%s",
                 str(_b.get("id", "?"))[:8],
                 _b.get("name") or "(no name)",
                 _b.get("is_enabled"),
                 bool(_b.get("arm_live")),
                 _b.get("mode") or "PAPER",
+                _b.get("copy_mode") or "exact",
+                _b.get("sizing_value"),
+                _b.get("max_trade_size"),
                 str(_b.get("wallet_address") or "?")[:12],
             )
 
@@ -9227,9 +9294,49 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                             _pg_cap if _pg_cap > 0
                                             else float("inf"),
                                         )
+                                        # ── PAPER_SIZE_FINAL: diagnostic + safety clamp ──
+                                        # Confirm what sizing values FastLoop read from
+                                        # the DB for this bot, and guarantee the final
+                                        # size never exceeds max_trade_size regardless
+                                        # of any upstream calculation edge-cases.
+                                        _pf_max = float(bot.get("max_trade_size") or 0)
+                                        _pf_size = float(submitted_size or 0)
+                                        _pf_notional = float(
+                                            wallet_trade.get("notional")
+                                            or wallet_trade.get("size")
+                                            or 0
+                                        )
+                                        if _pf_max > 0 and _pf_size > _pf_max:
+                                            logging.warning(
+                                                "PAPER_SIZE_CLAMPED "
+                                                "bot=%s copy_mode=%s "
+                                                "sizing_value=%s max_trade_size=%s "
+                                                "calculated=%.4f clamped_to=%.4f",
+                                                bot_label,
+                                                bot.get("copy_mode") or "exact",
+                                                bot.get("sizing_value"),
+                                                _pf_max,
+                                                _pf_size,
+                                                _pf_max,
+                                            )
+                                            _pf_size = round(_pf_max, 4)
+                                        logging.info(
+                                            "PAPER_SIZE_FINAL "
+                                            "bot=%s copy_mode=%s "
+                                            "sizing_value=%s max_trade_size=%s "
+                                            "source_size=%.4f "
+                                            "calculated=%.4f final=%.4f",
+                                            bot_label,
+                                            bot.get("copy_mode") or "exact",
+                                            bot.get("sizing_value"),
+                                            bot.get("max_trade_size"),
+                                            _pf_notional,
+                                            float(submitted_size or 0),
+                                            _pf_size,
+                                        )
                                         _new_pos_id = open_copied_position(
                                             bot, wallet_trade,
-                                            submitted_size, submitted_price,
+                                            _pf_size, submitted_price,
                                             mode="PAPER",
                                         )
                                         if _new_pos_id is not None:
@@ -13176,6 +13283,10 @@ async def main():
         COPY_TRADE_ENABLED,
         COPY_LIVE_ENABLED,
     )
+
+    # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
+    _test_compute_copy_size()
+
     trading_client = build_trading_client()
     tasks = []
     # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
