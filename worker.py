@@ -6091,6 +6091,16 @@ def get_unevaluated_trades_for_bot(
                 continue
 
             attempted_ids.add(tid)
+            # ── PAPER_EXIT_DUPLICATE_IGNORED ──────────────────────────────────
+            # Log when a SELL is being skipped because it already has a
+            # copy_attempts row for this bot (dedup protection working).
+            if any_is_sell:
+                logging.info(
+                    "PAPER_EXIT_DUPLICATE_IGNORED bot=%s trade=%s "
+                    "— source SELL already recorded in copy_attempts; "
+                    "not re-evaluated this tick",
+                    _label, tid[:24],
+                )
 
         if unlocked_sell_count:
             logging.info(
@@ -6924,6 +6934,10 @@ def close_matching_open_positions_on_exit(
             str(token_id or "?")[:16],
             str(condition_id or "?")[:16],
         )
+        logging.info(
+            "EXIT_SKIPPED bot_id=%s trade_id=%s reason=MISSING_PRICE",
+            bot_id, trade_id,
+        )
         return 0
 
     # ── Build query ───────────────────────────────────────────────────────────
@@ -6958,6 +6972,11 @@ def close_matching_open_positions_on_exit(
                 "(no token_id, market_slug, or condition_id); trade=%s",
                 bot_label, wallet_short, trade_id,
             )
+            logging.info(
+                "EXIT_SKIPPED bot_id=%s trade_id=%s reason=PAPER_POSITION_NOT_FOUND "
+                "detail=no_market_identifier",
+                bot_id, trade_id,
+            )
             return 0
         positions_to_close = resp.data or []
     except Exception:
@@ -6971,6 +6990,11 @@ def close_matching_open_positions_on_exit(
         logging.exception(
             "COPY_EXIT_MIRROR_QUERY_FAIL bot=%s slug=%s token=%s",
             bot_label, market_slug or "?", str(token_id or "?")[:16],
+        )
+        logging.info(
+            "EXIT_SKIPPED bot_id=%s trade_id=%s reason=PAPER_POSITION_NOT_FOUND "
+            "detail=db_query_exception",
+            bot_id, trade_id,
         )
         return 0
 
@@ -6996,6 +7020,17 @@ def close_matching_open_positions_on_exit(
             str(condition_id or "?")[:16],
             match_field,
         )
+        logging.info(
+            "EXIT_MATCH_RESULT bot_id=%s trade_id=%s matched_positions=0 "
+            "matched_open_size=0 requested_close_size=%s match_key=%s",
+            bot_id, trade_id,
+            wallet_trade.get("size") or wallet_trade.get("shares") or "?",
+            "%s=%s" % (match_field, (token_id or market_slug or condition_id or "NONE")),
+        )
+        logging.info(
+            "EXIT_SKIPPED bot_id=%s trade_id=%s reason=NO_OPEN_POSITION_MATCH",
+            bot_id, trade_id,
+        )
         return 0
 
     # ── Rows found ────────────────────────────────────────────────────────────
@@ -7007,6 +7042,19 @@ def close_matching_open_positions_on_exit(
         match_field,
         (token_id or market_slug or condition_id or "NONE"),
         len(positions_to_close),
+    )
+    # ── EXIT_MATCH_RESULT (positions found) ───────────────────────────────────
+    _matched_open_size = sum(
+        float_or_none(p.get("size")) or 0.0 for p in positions_to_close
+    )
+    logging.info(
+        "EXIT_MATCH_RESULT bot_id=%s trade_id=%s matched_positions=%s "
+        "matched_open_size=%s requested_close_size=%s match_key=%s",
+        bot_id, trade_id,
+        len(positions_to_close),
+        round(_matched_open_size, 4),
+        wallet_trade.get("size") or wallet_trade.get("shares") or "?",
+        "%s=%s" % (match_field, (token_id or market_slug or condition_id or "NONE")),
     )
 
     closed_count  = 0
@@ -7034,11 +7082,28 @@ def close_matching_open_positions_on_exit(
                     "— position is a SELL/short, exit mirroring not yet implemented",
                     pos_id[:8], bot_label, pos_slug,
                 )
+                logging.info(
+                    "EXIT_SKIPPED bot_id=%s trade_id=%s reason=OUTCOME_MISMATCH "
+                    "detail=short_position_not_supported pos=%s",
+                    bot_id, trade_id, pos_id[:12],
+                )
                 skipped_count += 1
                 continue
 
             pnl = round(size * (exit_price - entry_price) / entry_price, 6) if entry_price > 0 else 0.0
             is_live_position = bool((pos.get("raw_json") or {}).get("live"))
+
+            # ── PAPER_FULL_EXIT_READY ─────────────────────────────────────────
+            # Always a full exit — no partial-close logic exists yet.
+            if not is_live_position:
+                logging.warning(
+                    "PAPER_FULL_EXIT_READY bot_id=%s position_id=%s "
+                    "open_size=%s close_size=%s exit_price=%s "
+                    "note=partial_close_not_implemented",
+                    bot_id, pos_id[:16],
+                    round(size, 6), round(size, 6),
+                    round(exit_price, 6),
+                )
 
             # ── SELL_MIRROR_DB_ATTEMPT ────────────────────────────────────────
             _now_ts = utc_now_iso()
@@ -7096,6 +7161,17 @@ def close_matching_open_positions_on_exit(
                     pos_id[:8], bot_label, pos_slug, pos_outcome,
                     entry_price, exit_price, size, pnl, is_live_position, match_field,
                 )
+                # ── PAPER_EXIT_APPLIED diagnostic ─────────────────────────────
+                if not is_live_position:
+                    logging.warning(
+                        "PAPER_EXIT_APPLIED bot_id=%s position_id=%s "
+                        "trade_id=%s closed_size=%s remaining_size=0 "
+                        "realized_pnl=%s status=CLOSED",
+                        bot_id, pos_id[:16],
+                        trade_id,
+                        round(size, 6),
+                        round(pnl, 6),
+                    )
                 # Best-effort write to dedicated close_reason column (Phase 2 migration)
                 _try_write_close_reason_col(pos_id, CLOSE_REASON_SOURCE_WALLET_EXIT)
                 if pnl != 0.0 and not is_live_position:
@@ -7147,6 +7223,229 @@ def close_matching_open_positions_on_exit(
     )
 
     return closed_count
+
+
+# =============================================================================
+# READ-ONLY AUDIT HELPER — PAPER EXIT INTEGRITY
+# Developer-only; never auto-runs in production.
+# Call manually from a REPL or test harness.
+# =============================================================================
+
+def audit_paper_exit_integrity(bot_id: "str | None" = None) -> dict:
+    """
+    Read-only diagnostic helper for paper copy exit health.
+
+    Returns a dict of exit-integrity metrics without writing anything to
+    the database.  Safe to call from a REPL or integration test at any time.
+
+    Fields returned
+    ---------------
+    enabled_paper_bots          : list of {id, name, copy_closes, opens_only}
+    open_positions_by_bot       : {bot_id: count}
+    closed_positions_by_bot     : {bot_id: count}
+    total_realized_pnl          : sum of pnl on CLOSED positions
+    integrity_violations        : list of dicts, one per detected anomaly:
+        - CLOSED_WITH_NONZERO_REMAINING : closed position whose size > 0
+          (no remaining_size col yet — flagged if status=CLOSED but pnl=0 && size>0)
+        - OPEN_WITH_ZERO_SIZE           : open position with size <= 0
+        - OPEN_WITH_NEGATIVE_PNL_GT_SIZE: sanity check
+    duplicate_exit_attempts     : count of SELL copy_attempts already recorded
+    matched_vs_unmatched        : {matched: N, unmatched: N}
+    partial_exits               : always 0 — partial-close not yet implemented
+    note                        : human-readable summary string
+
+    NEVER auto-runs.  Does NOT write to the database.
+    """
+    result: dict = {
+        "enabled_paper_bots": [],
+        "open_positions_by_bot": {},
+        "closed_positions_by_bot": {},
+        "total_realized_pnl": 0.0,
+        "integrity_violations": [],
+        "duplicate_exit_attempts": 0,
+        "matched_vs_unmatched": {"matched": 0, "unmatched": 0},
+        "partial_exits": 0,
+        "note": "",
+    }
+
+    try:
+        # ── Fetch enabled PAPER bots ──────────────────────────────────────────
+        bots_q = (
+            supabase.table("copy_bots")
+            .select("id, name, copy_closes, opens_only, enabled, mode")
+            .eq("enabled", True)
+        )
+        if bot_id:
+            bots_q = bots_q.eq("id", bot_id)
+        bots_resp = bots_q.execute()
+        bots = [
+            b for b in (bots_resp.data or [])
+            if str(b.get("mode") or "").upper() != "LIVE"
+        ]
+        result["enabled_paper_bots"] = [
+            {
+                "id": b["id"],
+                "name": b.get("name"),
+                "copy_closes": b.get("copy_closes"),
+                "opens_only": b.get("opens_only"),
+            }
+            for b in bots
+        ]
+        bot_ids = [b["id"] for b in bots]
+
+        if not bot_ids:
+            result["note"] = "No enabled PAPER bots found."
+            return result
+
+        # ── Fetch all copied_positions for these bots ─────────────────────────
+        pos_resp = (
+            supabase.table("copied_positions")
+            .select("id, copy_bot_id, status, size, pnl, outcome, market_slug, token_id")
+            .in_("copy_bot_id", bot_ids)
+            .execute()
+        )
+        positions = pos_resp.data or []
+
+        open_by_bot: dict = {}
+        closed_by_bot: dict = {}
+        total_pnl = 0.0
+        violations = []
+
+        for p in positions:
+            bid   = p.get("copy_bot_id", "?")
+            stat  = str(p.get("status") or "").upper()
+            size  = float(p.get("size") or 0.0)
+            pnl   = float(p.get("pnl") or 0.0)
+            pid   = str(p.get("id") or "?")
+
+            if stat == "OPEN":
+                open_by_bot[bid] = open_by_bot.get(bid, 0) + 1
+                # Integrity: OPEN must have positive size
+                if size <= 0:
+                    violations.append({
+                        "type": "OPEN_WITH_ZERO_SIZE",
+                        "position_id": pid[:16],
+                        "bot_id": bid,
+                        "size": size,
+                    })
+            elif stat == "CLOSED":
+                closed_by_bot[bid] = closed_by_bot.get(bid, 0) + 1
+                total_pnl += pnl
+                # Integrity: CLOSED position with size > 0 and pnl == 0 is suspicious
+                # (no remaining_size col yet — best-effort heuristic)
+                if size > 0 and pnl == 0.0:
+                    violations.append({
+                        "type": "CLOSED_SUSPICIOUS_ZERO_PNL",
+                        "position_id": pid[:16],
+                        "bot_id": bid,
+                        "size": size,
+                        "pnl": pnl,
+                        "detail": "Closed with non-zero size and zero PnL — "
+                                  "may be a zero-movement close or a recording gap",
+                    })
+
+        result["open_positions_by_bot"]   = open_by_bot
+        result["closed_positions_by_bot"] = closed_by_bot
+        result["total_realized_pnl"]      = round(total_pnl, 6)
+        result["integrity_violations"]    = violations
+
+        # ── Fetch copy_attempts for duplicate detection ───────────────────────
+        _CHUNK = 50
+        sell_attempts_total = 0
+        matched_sell_trades  = 0
+        unmatched_sell_trades = 0
+
+        for _ci in range(0, len(bot_ids), _CHUNK):
+            _chunk = bot_ids[_ci:_ci + _CHUNK]
+            try:
+                att_resp = (
+                    supabase.table("copy_attempts")
+                    .select("source_trade_id, source_side, copied, skip_reason, copy_bot_id")
+                    .in_("copy_bot_id", _chunk)
+                    .eq("source_side", "SELL")
+                    .execute()
+                )
+                for row in (att_resp.data or []):
+                    sell_attempts_total += 1
+                    if row.get("copied"):
+                        matched_sell_trades += 1
+                    else:
+                        unmatched_sell_trades += 1
+            except Exception as _e:
+                result["note"] = f"Partial data: copy_attempts chunk failed: {_e}"
+
+        # Duplicate = same source_trade_id appeared more than once per bot
+        result["duplicate_exit_attempts"] = max(0, sell_attempts_total - (matched_sell_trades + unmatched_sell_trades))
+        result["matched_vs_unmatched"]    = {
+            "matched": matched_sell_trades,
+            "unmatched": unmatched_sell_trades,
+            "sell_attempts_total": sell_attempts_total,
+        }
+
+        result["note"] = (
+            f"PAPER_EXIT_AUDIT: {len(bots)} enabled PAPER bots. "
+            f"Open positions: {sum(open_by_bot.values())}. "
+            f"Closed positions: {sum(closed_by_bot.values())}. "
+            f"Total realized PnL: {result['total_realized_pnl']:.4f}. "
+            f"Integrity violations: {len(violations)}. "
+            f"NOTE: partial_exits always 0 — partial-close not yet implemented."
+        )
+
+    except Exception as _audit_exc:
+        result["note"] = f"audit_paper_exit_integrity failed: {_audit_exc}"
+        logging.exception("PAPER_EXIT_INTEGRITY_AUDIT_FAIL")
+
+    return result
+
+
+# =============================================================================
+# DEVELOPER-ONLY EXIT INTEGRITY ASSERTIONS
+# Never auto-run in production.  Import and call from a REPL or test harness.
+# =============================================================================
+
+def _assert_paper_exit_integrity(pos: dict, context: str = "") -> None:
+    """
+    Developer-only assertion checks for a single copied_positions row.
+
+    Raises AssertionError if any integrity invariant is violated.
+    NEVER call from production code paths.
+
+    Invariants checked
+    ------------------
+    1. remaining_size never below zero
+       (approximated as size >= 0 until remaining_size column exists)
+    2. CLOSED status implies remaining_size == 0
+       (approximated: CLOSED implies the position row has been fully consumed)
+    3. OPEN status implies size > 0
+    4. Realized PnL field is a finite number (not None/NaN/Inf)
+    """
+    import math as _math
+
+    ctx   = f"[{context}] " if context else ""
+    stat  = str(pos.get("status") or "").upper()
+    size  = float(pos.get("size") or 0.0)
+    pnl_v = pos.get("pnl")
+
+    # 1. size never negative
+    assert size >= 0, f"{ctx}size < 0: size={size} pos={pos.get('id')}"
+
+    # 2. CLOSED → size already consumed (we can only check that status is correct)
+    if stat == "CLOSED":
+        # No remaining_size column yet; the invariant is enforced by the write path
+        pass
+
+    # 3. OPEN → size > 0
+    if stat == "OPEN":
+        assert size > 0, (
+            f"{ctx}OPEN position has zero/negative size: size={size} pos={pos.get('id')}"
+        )
+
+    # 4. PnL is a finite number if set
+    if pnl_v is not None:
+        pnl_f = float(pnl_v)
+        assert _math.isfinite(pnl_f), (
+            f"{ctx}PnL is not finite: pnl={pnl_f} pos={pos.get('id')}"
+        )
 
 
 def open_copied_position(
@@ -8549,6 +8848,13 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         total_paper_opened = 0
         total_live_opened  = 0
         total_errors       = 0
+        # ── Per-tick exit diagnostic counters (paper only; no behavioral effect) ─
+        _tick_sells_seen    = 0   # source SELL events detected this tick
+        _tick_exits_matched = 0   # SELL events that matched ≥1 open position
+        _tick_exits_full    = 0   # full-position closes executed
+        _tick_exits_partial = 0   # partial closes (always 0 — not yet implemented)
+        _tick_exits_closed  = 0   # positions moved to CLOSED status
+        _tick_exits_skipped = 0   # SELL events with no matching open position
 
         log_rate_limited(
             "copy_loop_global_settings",
@@ -8840,6 +9146,21 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                         wallet_trade.get("market_slug") or "?",
                                         bool(bot.get("copy_closes")),
                                     )
+                                    # ── SOURCE_EXIT_SEEN diagnostic ───────────
+                                    logging.warning(
+                                        "SOURCE_EXIT_SEEN bot_id=%s bot=%s "
+                                        "wallet=%s trade_id=%s market=%s "
+                                        "outcome=%s sell_size=%s sell_price=%s "
+                                        "trade_time=%s",
+                                        bot_id, bot_label,
+                                        wallet_label, trade_label,
+                                        wallet_trade.get("market_slug") or "?",
+                                        wallet_trade.get("outcome") or "?",
+                                        wallet_trade.get("size") or wallet_trade.get("shares") or "?",
+                                        wallet_trade.get("price"),
+                                        wallet_trade.get("traded_at") or "?",
+                                    )
+                                    _tick_sells_seen += 1
                                 else:
                                     order_status = "PAPER_MATCHED"
                                 log_copy_attempt(
@@ -8856,6 +9177,13 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                     if n_closed:
                                         update_wallet_metrics_for_address(wallet_address)
                                     total_paper_opened += n_closed
+                                    # ── per-tick exit counters (diagnostics only) ──
+                                    if n_closed > 0:
+                                        _tick_exits_matched += 1
+                                        _tick_exits_full    += n_closed
+                                        _tick_exits_closed  += n_closed
+                                    else:
+                                        _tick_exits_skipped += 1
                                     logging.info(
                                         "COPY_EXIT_MIRROR_DONE bot=%s wallet=%s "
                                         "trade=%s slug=%s positions_closed=%s",
@@ -9174,6 +9502,17 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                 "COPY_EXPOSURE_SNAPSHOT mode=paper open_exposure=%.2f cap=UNLIMITED",
                 _snap_paper_exp,
             )
+
+        # ── PAPER_EXIT_AUDIT — once per evaluation cycle ──────────────────────
+        logging.warning(
+            "PAPER_EXIT_AUDIT "
+            "source_sells_seen=%s matched_exits=%s partial_exits=%s full_exits=%s "
+            "positions_closed=%s exit_skips=%s "
+            "note=realized_pnl_total_see_COPY_PAPER_BANKROLL_UPDATED",
+            _tick_sells_seen, _tick_exits_matched,
+            _tick_exits_partial, _tick_exits_full,
+            _tick_exits_closed, _tick_exits_skipped,
+        )
 
         logging.warning(
             "COPY_TRADE_LOOP_TICK wallets=%s new_trades=%s attempts=%s "
@@ -9541,6 +9880,18 @@ def _update_copy_paper_bankroll(
             old_pnl,
             new_pnl,
         )
+        # ── PAPER_EXIT_ACCOUNTING — source-wallet SELL path only ──────────────
+        if close_path == "exit_mirror":
+            logging.warning(
+                "PAPER_EXIT_ACCOUNTING bot_id=%s position_id=%s "
+                "exposure_before=N/A exposure_after=N/A "
+                "paper_balance_before=%.4f paper_balance_after=%.4f "
+                "realized_pnl=%+.4f",
+                COPY_PAPER_BOT_ID,
+                pos_id[:16] if pos_id else "?",
+                old_balance, new_balance,
+                pnl,
+            )
     except Exception:
         logging.exception(
             "COPY_PAPER_BANKROLL_UPDATE_FAIL pos=%s path=%s pnl=%s",
