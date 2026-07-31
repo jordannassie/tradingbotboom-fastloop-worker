@@ -5317,7 +5317,8 @@ async def paper_settlement_loop():
                         STRATEGY_REJECTION_WICK_BOT_ID,
                         STRATEGY_FOLLOW_THROUGH_BOT_ID,
                         BOT_ID,
-                        EMA_5M_BOT_ID,   # btc_5m_ema settled via BTC price move
+                        EMA_5M_BOT_ID,         # btc_5m_ema settled via BTC price move
+                        BTC5M_LATE_BOT_ID,     # btc_5m_late settled via BTC price move
                     ],
                 )
                 .eq("status", "OPEN")
@@ -5394,6 +5395,20 @@ async def paper_settlement_loop():
                     # EMA strategy uses its own isolated accounting path with
                     # EMA_BALANCE_BEFORE / EMA_POSITION_CLOSE_PNL / EMA_BALANCE_AFTER logs.
                     _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
+                elif bot_id == BTC5M_LATE_BOT_ID:
+                    # BTC_5M_LATE uses the standard realized-PnL path (bot_settings.paper_balance_usd).
+                    update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
+                    logging.warning(
+                        "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
+                        "slug=%s side=%s start_price=%.2f end_price=%.2f",
+                        row_id,
+                        "WIN" if pnl_usd >= 0 else "LOSS",
+                        pnl_usd,
+                        market_slug or "",
+                        row.get("side") or "",
+                        start_price or 0.0,
+                        end_price or 0.0,
+                    )
                 else:
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
@@ -13270,6 +13285,468 @@ async def ema_5m_btc_loop() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── BTC_5M_LATE  —  late-entry BTC 5-minute paper strategy ───────────────────
+#
+# Completely isolated from EMA_5M_BTC, copy trading, and live execution.
+# Reads its own bot_settings row (bot_id = btc_5m_late).
+# Writes to paper_positions; settled by the shared paper_settlement_loop.
+#
+# Decision rule (Version 1):
+#   - Evaluation window: [60s remaining, 20s remaining)
+#   - BUY UP  when: btc_price >= ref_price + $15 AND momentum == UP
+#               AND 0.55 <= up_ask  <= 0.80
+#   - BUY DOWN when: btc_price <= ref_price - $15 AND momentum == DOWN
+#               AND 0.55 <= down_ask <= 0.80
+#   - Otherwise: NO TRADE
+#
+# Price sources:
+#   reference_price  — close of last completed Binance 5m candle before the
+#                      current market start (proxy for Chainlink BTC/USD at open)
+#   btc_price        — Coinbase BTC-USD spot (real-time proxy)
+#   Resolution source is Chainlink BTC/USD — mismatch vs Binance/Coinbase is
+#   typically <$5 in normal conditions; flagged in BTC5M_MARKET log.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BINANCE_5M_LATE_URL = (
+    "https://api.binance.com/api/v3/klines"
+    "?symbol=BTCUSDT&interval=5m&limit=5"
+)
+
+# Per-period reference-price cache: { start_ts: float }.
+# Cleared for periods older than 2 x 300s.
+_btc5m_late_ref_cache: dict[int, float] = {}
+
+
+def _btc5m_late_fetch_data_sync(
+    start_ts: int,
+) -> tuple[float | None, float | None, str]:
+    """
+    Fetch all price data needed for one BTC_5M_LATE evaluation tick.
+
+    Returns (ref_price, btc_price, momentum):
+        ref_price  — close of the last completed Binance 5m candle whose
+                     open_time == start_ts - 300  (= the opening price of the
+                     current 5-minute market window).  Cached per start_ts so
+                     it does not drift during the evaluation window.
+        btc_price  — Coinbase BTC-USD spot price (real-time reference).
+        momentum   — "UP" / "DOWN" / "FLAT" from last 2 completed 5m closes.
+
+    NOTE: Chainlink BTC/USD is the authoritative resolution source.
+          Binance BTCUSDT / Coinbase BTC-USD are used as the best available
+          public proxies.  Mismatch is expected to be <$5 in normal markets.
+          The BTC5M_MARKET log reports the price_source so the mismatch is
+          always visible.
+
+    Returns (None, None, "FLAT") on any unrecoverable data failure.
+    """
+    # ── 1. Coinbase spot (real-time, matches existing _fetch_btc_spot_price_sync) ─
+    btc_price: float | None = _fetch_btc_spot_price_sync()
+
+    # ── 2. Binance 5m klines for reference + momentum ────────────────────────
+    try:
+        req = request.Request(
+            _BINANCE_5M_LATE_URL,
+            headers={"User-Agent": "FastLoopWorker/1.0"},
+        )
+        with request.urlopen(req, timeout=8) as resp:
+            rows = json.loads(resp.read())
+
+        # rows[-1] is the currently forming (open) candle — always exclude it.
+        completed = rows[:-1]
+        if not completed:
+            return btc_price, None, "FLAT"
+
+        # Reference price: the last completed candle BEFORE the current period.
+        # In the evaluation window (60s–20s remaining) the current period's candle
+        # is still forming, so completed[-1] is the previous period's candle.
+        # Its close == the opening price of the current 5-minute market.
+        last = completed[-1]
+        last_open_s = int(last[0]) // 1000
+        expected_prev_open_s = start_ts - 300
+
+        # Use cached reference for this period if available.
+        cached_ref = _btc5m_late_ref_cache.get(start_ts)
+        if cached_ref is not None:
+            ref_price: float | None = cached_ref
+        elif last_open_s == expected_prev_open_s:
+            ref_price = float(last[4])          # close of the candle ending at start_ts
+            _btc5m_late_ref_cache[start_ts] = ref_price
+            # Prune entries older than 2 periods to avoid unbounded growth.
+            for old_ts in [k for k in list(_btc5m_late_ref_cache) if k < start_ts - 600]:
+                _btc5m_late_ref_cache.pop(old_ts, None)
+        else:
+            # Last completed candle is not from the expected previous period.
+            # This can happen just after the period boundary.  Use its close as
+            # a best-available approximation and log a warning.
+            ref_price = float(last[4])
+            logging.warning(
+                "BTC5M_LATE_REF_APPROX start_ts=%s expected_prev_open=%s "
+                "actual_prev_open=%s ref_price=%.2f "
+                "— reference may be from a non-adjacent candle; treating as best-effort",
+                start_ts, expected_prev_open_s, last_open_s, ref_price,
+            )
+            _btc5m_late_ref_cache[start_ts] = ref_price
+
+        # Momentum from last 2 completed candles.
+        momentum = "FLAT"
+        if len(completed) >= 2:
+            c_last = float(completed[-1][4])
+            c_prev = float(completed[-2][4])
+            if c_last > c_prev:
+                momentum = "UP"
+            elif c_last < c_prev:
+                momentum = "DOWN"
+
+        return ref_price, btc_price, momentum
+
+    except Exception:
+        logging.exception("BTC5M_LATE_DATA_FETCH_FAIL start_ts=%s", start_ts)
+        return btc_price, None, "FLAT"
+
+
+def _btc5m_late_fetch_market_data_sync(slug: str) -> dict | None:
+    """
+    Fetch current UP / DOWN contract prices for a btc-updown-5m-* market.
+
+    Returns a dict:
+        {
+            "up_price":   float,   # outcomePrices[0]  (Up outcome)
+            "down_price": float,   # outcomePrices[1]  (Down outcome)
+            "question":   str,
+        }
+    Returns None on any failure so the caller can skip the market.
+    """
+    try:
+        url = f"{GAMMA_API_BASE}/markets?slug={slug}"
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+
+        if not data:
+            logging.warning("BTC5M_LATE_MARKET_EMPTY slug=%s", slug)
+            return None
+
+        m = data[0] if isinstance(data, list) else data
+        prices   = m.get("outcomePrices") or []
+        outcomes = m.get("outcomes") or []
+
+        # Gamma returns outcomes=["Up","Down"] and outcomePrices=[up_p, down_p]
+        try:
+            up_idx   = outcomes.index("Up")
+            down_idx = outcomes.index("Down")
+        except ValueError:
+            # Fallback positional if outcome labels are absent.
+            up_idx, down_idx = 0, 1
+
+        up_price   = float(prices[up_idx])   if len(prices) > up_idx   else None
+        down_price = float(prices[down_idx]) if len(prices) > down_idx else None
+
+        return {
+            "up_price":   up_price,
+            "down_price": down_price,
+            "question":   m.get("question") or "",
+        }
+
+    except Exception:
+        logging.exception("BTC5M_LATE_MARKET_FETCH_FAIL slug=%s", slug)
+        return None
+
+
+async def btc_5m_late_loop() -> None:
+    """
+    BTC_5M_LATE paper strategy main loop.
+
+    Wired to bot_settings row  bot_id = BTC5M_LATE_BOT_ID ("btc_5m_late").
+
+    Per-tick flow:
+      1.  Guard: BTC5M_LATE_ENABLED env flag must be true.
+      2.  Read bot_settings for BTC5M_LATE_BOT_ID (is_enabled, mode,
+          trade_size_usd, arm_live).
+      3.  Compute current btc-updown-5m-{ts} slug and seconds_remaining.
+      4.  Log BTC5M_MARKET once per period (when reference price is first
+          captured).
+      5.  Timing gate: skip if outside (BTC5M_LATE_ENTRY_CUTOFF_S,
+          BTC5M_LATE_EVAL_START_S] window.
+      6.  Disabled gate: skip if is_enabled = False.
+      7.  Live mode gate: skip (not implemented); only PAPER is allowed.
+      8.  Duplicate gate: skip if OPEN paper_position already exists for
+          this slug + strategy.
+      9.  Fetch reference_price, btc_price, momentum.
+      10. Fetch UP / DOWN contract prices from Gamma.
+      11. Log BTC5M_EVALUATE with all decision inputs.
+      12. Apply direction logic → BUY_UP / BUY_DOWN / SKIP.
+      13. Log BTC5M_DECISION with exact reason.
+      14. If signal: insert paper_positions row, log BTC5M_PAPER_OPENED.
+
+    Settlement is handled by the shared paper_settlement_loop (BTC5M_SETTLED
+    logged there).
+
+    All state is in the DB — loop is stateless between restarts.
+    """
+    if not BTC5M_LATE_ENABLED:
+        logging.warning(
+            "BTC5M_LATE_DISABLED env — set BTC5M_LATE_ENABLED=true to activate; "
+            "sleeping indefinitely"
+        )
+        while True:
+            await asyncio.sleep(3600)
+        return  # unreachable
+
+    logging.warning(
+        "BTC5M_LATE_BOOT bot_id=%s strategy_id=%s slug_prefix=%s "
+        "loop_interval=%ss eval_start=%ss entry_cutoff=%ss "
+        "distance_threshold=$%.0f ask_range=[%.2f, %.2f] "
+        "price_source=Binance+Coinbase resolution_source=Chainlink "
+        "— runtime settings read from bot_settings each tick",
+        BTC5M_LATE_BOT_ID,
+        BTC5M_LATE_STRATEGY_ID,
+        BTC5M_LATE_SLUG_PREFIX,
+        BTC5M_LATE_LOOP_INTERVAL,
+        BTC5M_LATE_EVAL_START_S,
+        BTC5M_LATE_ENTRY_CUTOFF_S,
+        BTC5M_LATE_DISTANCE_USD,
+        BTC5M_LATE_ASK_MIN,
+        BTC5M_LATE_ASK_MAX,
+    )
+
+    while True:
+        try:
+            # ── 1. Compute market timing ──────────────────────────────────────
+            period    = 300
+            now       = int(time())
+            start_ts  = (now // period) * period
+            end_ts    = start_ts + period
+            remaining = end_ts - now
+            slug      = f"{BTC5M_LATE_SLUG_PREFIX}-{start_ts}"
+
+            # ── 2. Fetch data early (captures reference at period open) ───────
+            # _btc5m_late_fetch_data_sync caches ref_price per start_ts so the
+            # reference stays fixed for the entire 5-minute period.
+            ref_price, btc_price, momentum = await asyncio.to_thread(
+                _btc5m_late_fetch_data_sync, start_ts
+            )
+
+            # Log BTC5M_MARKET whenever ref_price is first captured for this period.
+            # We detect "first capture" by checking whether this tick is CLOSE to
+            # the period start (within 2x loop_interval).
+            if remaining > (period - 2 * BTC5M_LATE_LOOP_INTERVAL):
+                logging.warning(
+                    "BTC5M_MARKET slug=%s start=%s end=%s "
+                    "price_to_beat=%s price_source=Binance_5m_close_proxy "
+                    "resolution_source=Chainlink_BTC_USD",
+                    slug, start_ts, end_ts, ref_price,
+                )
+
+            # ── 3. Read bot_settings ──────────────────────────────────────────
+            settings   = read_strategy_settings(BTC5M_LATE_BOT_ID)
+            is_enabled = bool(settings.get("is_enabled", False))
+            mode       = str(settings.get("mode") or "PAPER").upper()
+            trade_size = float(
+                settings.get("trade_size_usd") or BTC5M_LATE_TRADE_SIZE_USD
+            )
+
+            # ── 4. Timing gate ────────────────────────────────────────────────
+            # Evaluate only within [entry_cutoff, eval_start] seconds remaining.
+            in_window = BTC5M_LATE_ENTRY_CUTOFF_S < remaining <= BTC5M_LATE_EVAL_START_S
+            if not in_window:
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 5. Disabled gate ──────────────────────────────────────────────
+            if not is_enabled:
+                logging.info(
+                    "BTC5M_DECISION decision=SKIP reason=STRATEGY_DISABLED "
+                    "slug=%s seconds_left=%s",
+                    slug, remaining,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 6. Live mode gate (not implemented) ───────────────────────────
+            if mode != "PAPER":
+                logging.warning(
+                    "BTC5M_DECISION decision=SKIP reason=MODE_NOT_PAPER "
+                    "slug=%s mode=%s "
+                    "— live execution is not implemented for BTC_5M_LATE; "
+                    "set mode=PAPER in bot_settings",
+                    slug, mode,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 7. Duplicate gate ─────────────────────────────────────────────
+            already_open = await has_open_paper_position_for_strategy(
+                slug, BTC5M_LATE_STRATEGY_ID, BTC5M_LATE_BOT_ID
+            )
+            if already_open:
+                logging.info(
+                    "BTC5M_DECISION decision=SKIP reason=ALREADY_OPEN "
+                    "slug=%s seconds_left=%s",
+                    slug, remaining,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 8. Data safety gates ──────────────────────────────────────────
+            if ref_price is None:
+                logging.warning(
+                    "BTC5M_DECISION decision=SKIP reason=MISSING_REFERENCE_PRICE "
+                    "slug=%s seconds_left=%s",
+                    slug, remaining,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            if btc_price is None:
+                logging.warning(
+                    "BTC5M_DECISION decision=SKIP reason=MISSING_CURRENT_PRICE "
+                    "slug=%s seconds_left=%s",
+                    slug, remaining,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 9. Fetch contract prices from Gamma ───────────────────────────
+            market_data = await asyncio.to_thread(
+                _btc5m_late_fetch_market_data_sync, slug
+            )
+            if market_data is None:
+                logging.warning(
+                    "BTC5M_DECISION decision=SKIP reason=MISSING_MARKET_DATA "
+                    "slug=%s seconds_left=%s",
+                    slug, remaining,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            up_ask   = market_data.get("up_price")
+            down_ask = market_data.get("down_price")
+            if up_ask is None or down_ask is None:
+                logging.warning(
+                    "BTC5M_DECISION decision=SKIP reason=MISSING_CONTRACT_PRICES "
+                    "slug=%s up_ask=%s down_ask=%s",
+                    slug, up_ask, down_ask,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            distance = btc_price - ref_price
+
+            # ── 10. Log BTC5M_EVALUATE ────────────────────────────────────────
+            logging.warning(
+                "BTC5M_EVALUATE slug=%s seconds_left=%s "
+                "reference_price=%.2f btc_price=%.2f "
+                "distance_usd=%+.2f up_ask=%.4f down_ask=%.4f momentum=%s",
+                slug, remaining,
+                ref_price, btc_price,
+                distance, up_ask, down_ask, momentum,
+            )
+
+            # ── 11. Direction logic ───────────────────────────────────────────
+            decision   = "SKIP"
+            skip_reason = "NO_SIGNAL"
+            side: str | None        = None
+            entry_price: float | None = None
+
+            if (
+                distance >= BTC5M_LATE_DISTANCE_USD
+                and momentum == "UP"
+                and BTC5M_LATE_ASK_MIN <= up_ask <= BTC5M_LATE_ASK_MAX
+            ):
+                decision    = "BUY_UP"
+                side        = "yes"
+                entry_price = up_ask
+
+            elif (
+                distance <= -BTC5M_LATE_DISTANCE_USD
+                and momentum == "DOWN"
+                and BTC5M_LATE_ASK_MIN <= down_ask <= BTC5M_LATE_ASK_MAX
+            ):
+                decision    = "BUY_DOWN"
+                side        = "no"
+                entry_price = down_ask
+
+            else:
+                # Build a precise reason so logs are actionable.
+                if abs(distance) < BTC5M_LATE_DISTANCE_USD:
+                    skip_reason = (
+                        f"DISTANCE_TOO_SMALL distance={distance:+.1f} "
+                        f"threshold={BTC5M_LATE_DISTANCE_USD:.0f}"
+                    )
+                elif distance >= BTC5M_LATE_DISTANCE_USD and momentum != "UP":
+                    skip_reason = f"MOMENTUM_NOT_UP momentum={momentum} distance={distance:+.1f}"
+                elif distance <= -BTC5M_LATE_DISTANCE_USD and momentum != "DOWN":
+                    skip_reason = f"MOMENTUM_NOT_DOWN momentum={momentum} distance={distance:+.1f}"
+                elif distance >= BTC5M_LATE_DISTANCE_USD:
+                    skip_reason = (
+                        f"UP_ASK_OUT_OF_RANGE up_ask={up_ask:.4f} "
+                        f"range=[{BTC5M_LATE_ASK_MIN},{BTC5M_LATE_ASK_MAX}]"
+                    )
+                elif distance <= -BTC5M_LATE_DISTANCE_USD:
+                    skip_reason = (
+                        f"DOWN_ASK_OUT_OF_RANGE down_ask={down_ask:.4f} "
+                        f"range=[{BTC5M_LATE_ASK_MIN},{BTC5M_LATE_ASK_MAX}]"
+                    )
+
+            # ── 12. Log BTC5M_DECISION ────────────────────────────────────────
+            logging.warning(
+                "BTC5M_DECISION decision=%s reason=%s size_usd=%s slug=%s",
+                decision,
+                skip_reason if decision == "SKIP" else "SIGNAL_MET",
+                trade_size if decision != "SKIP" else "N/A",
+                slug,
+            )
+
+            if decision == "SKIP":
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            # ── 13. Open PAPER position ───────────────────────────────────────
+            if entry_price is None or side is None:
+                logging.error(
+                    "BTC5M_LATE_LOGIC_ERROR decision=%s but entry_price=%s side=%s",
+                    decision, entry_price, side,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
+
+            shares = round(trade_size / entry_price, 4)
+            ok, row_id, _ = await insert_paper_position_row(
+                bot_id        = BTC5M_LATE_BOT_ID,
+                strategy_id   = BTC5M_LATE_STRATEGY_ID,
+                market_slug   = slug,
+                side          = side,
+                entry_price   = entry_price,
+                size_usd      = trade_size,
+                shares        = shares,
+                start_ts      = start_ts,
+            )
+
+            if ok:
+                logging.warning(
+                    "BTC5M_PAPER_OPENED position_id=%s side=%s size_usd=%s "
+                    "entry_price=%.4f seconds_left=%s slug=%s",
+                    row_id or "?",
+                    side,
+                    trade_size,
+                    entry_price,
+                    remaining,
+                    slug,
+                )
+            else:
+                logging.warning(
+                    "BTC5M_PAPER_OPEN_FAIL slug=%s side=%s — "
+                    "insert_paper_position_row returned ok=False",
+                    slug, side,
+                )
+
+        except Exception:
+            logging.exception("BTC5M_LATE_LOOP_ERROR")
+
+        await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 async def main():
@@ -13313,6 +13790,8 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("trader_rotation_snapshot_loop", trader_rotation_snapshot_loop)))
     # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
     tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
+    # ── BTC_5M_LATE strategy (isolated — paper only, btc-updown-5m-* markets) ─
+    tasks.append(asyncio.create_task(_run_forever("btc_5m_late_loop", btc_5m_late_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)
