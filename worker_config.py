@@ -425,28 +425,35 @@ EMA_5M_ENTRY_CUTOFF_SECONDS = int(os.getenv("EMA_5M_ENTRY_CUTOFF_SECONDS", "30")
 EMA_5M_BOT_ID               = os.getenv("EMA_5M_BOT_ID",                   "btc_5m_ema")
 EMA_5M_STRATEGY_ID          = "EMA_5M_BTC"  # constant — not configurable
 
-# ─── BTC_5M_LATE — late-entry BTC 5-minute paper strategy ────────────────────
+# ─── BTC_5M_LATE — simplified BTC 5-minute PAPER strategy ───────────────────
+# strategy_mode = SIMPLE_PAPER_TEST
 # Completely isolated from EMA_5M_BTC, copy trading, and live execution.
-# Uses the same btc-updown-5m-{ts} markets but a different decision rule:
-#   buy UP/DOWN when current BTC price is ≥ BTC5M_LATE_DISTANCE_USD from the
-#   reference (opening) price AND the contract ask is in range.
-# Resolution source is Chainlink BTC/USD; Binance BTCUSDT is used as proxy.
+# Uses btc-updown-5m-{ts} markets.
 #
-# Activate by upserting a bot_settings row with bot_id='btc_5m_late'.
-# See FINAL REPORT for the exact SQL.
+# Decision rule (simplified):
+#   Entry window: 35–20 seconds remaining.
+#   BTC price > Price to Beat → enter UP.
+#   BTC price < Price to Beat → enter DOWN.
+#   No momentum, EMA, distance, ask-range, or spread filters.
+#   One trade per market slug regardless of status.
+#   Trade size always read from bot_settings.trade_size_usd.
+#   LIVE execution is impossible (mode gate + arm_live=False).
+#
+# Fast poll: 2 s cadence during final 45 s.
+# Health + status snapshot: every 10 s unconditionally.
 BTC5M_LATE_ENABLED        = os.getenv("BTC5M_LATE_ENABLED", "true").strip().lower() in (
     "1", "true", "yes",
 )
 BTC5M_LATE_BOT_ID         = "btc_5m_late"         # constant — matches bot_settings.bot_id
 BTC5M_LATE_STRATEGY_ID    = "BTC_5M_LATE"          # constant — matches paper_positions.strategy_id
-BTC5M_LATE_LOOP_INTERVAL  = int(os.getenv("BTC5M_LATE_LOOP_INTERVAL",   "10"))   # 10s eval cadence
-BTC5M_LATE_TRADE_SIZE_USD = float(os.getenv("BTC5M_LATE_TRADE_SIZE_USD", "1.0"))  # default $1
+BTC5M_LATE_LOOP_INTERVAL  = int(os.getenv("BTC5M_LATE_LOOP_INTERVAL",   "10"))   # normal cadence (5 s)
+BTC5M_LATE_TRADE_SIZE_USD = float(os.getenv("BTC5M_LATE_TRADE_SIZE_USD", "1.0"))  # fallback default only — always overridden by bot_settings
 BTC5M_LATE_SLUG_PREFIX    = "btc-updown-5m"
-BTC5M_LATE_DISTANCE_USD   = float(os.getenv("BTC5M_LATE_DISTANCE_USD",  "15.0")) # $15 threshold
-BTC5M_LATE_ASK_MIN        = float(os.getenv("BTC5M_LATE_ASK_MIN",       "0.55")) # contract ask floor
-BTC5M_LATE_ASK_MAX        = float(os.getenv("BTC5M_LATE_ASK_MAX",       "0.80")) # contract ask ceiling
-BTC5M_LATE_EVAL_START_S   = int(os.getenv("BTC5M_LATE_EVAL_START_S",    "60"))   # begin at 60s remaining
-BTC5M_LATE_ENTRY_CUTOFF_S = int(os.getenv("BTC5M_LATE_ENTRY_CUTOFF_S",  "20"))   # stop at 20s remaining
+BTC5M_LATE_DISTANCE_USD   = float(os.getenv("BTC5M_LATE_DISTANCE_USD",  "15.0")) # kept for back-compat; NOT used in SIMPLE mode
+BTC5M_LATE_ASK_MIN        = float(os.getenv("BTC5M_LATE_ASK_MIN",       "0.55")) # kept for back-compat; NOT used in SIMPLE mode
+BTC5M_LATE_ASK_MAX        = float(os.getenv("BTC5M_LATE_ASK_MAX",       "0.80")) # kept for back-compat; NOT used in SIMPLE mode
+BTC5M_LATE_EVAL_START_S   = int(os.getenv("BTC5M_LATE_EVAL_START_S",    "60"))   # health/status window start (kept for back-compat)
+BTC5M_LATE_ENTRY_CUTOFF_S = int(os.getenv("BTC5M_LATE_ENTRY_CUTOFF_S",  "20"))   # entry hard stop (seconds remaining)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

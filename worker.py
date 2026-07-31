@@ -13784,7 +13784,7 @@ def _btc5m_late_upsert_status_sync(
         "today_losses":         stats["today_losses"],
         "today_pnl":            stats["today_pnl"],
         "rotated_at":           rotated_at,
-        "strategy_mode":        "SIMPLE",
+        "strategy_mode":        "SIMPLE_PAPER_TEST",
         "trade_size_usd":       trade_size_usd,
         "updated_at":           utc_now_iso(),
     }
@@ -13893,19 +13893,15 @@ async def btc_5m_late_loop() -> None:
 
     logging.warning(
         "BTC5M_LATE_BOOT registered=true bot_id=%s strategy_id=%s "
-        "slug_prefix=%s cadence_normal=5s cadence_eval_window=2s "
-        "eval_start=%ss entry_cutoff=%ss "
-        "distance_threshold=$%.0f ask_range=[%.2f,%.2f] "
+        "strategy_mode=SIMPLE_PAPER_TEST slug_prefix=%s "
+        "entry_window_start=35s entry_window_stop=20s "
+        "cadence_normal=5s cadence_fast_window=2s fast_poll_seconds=45 "
         "health_interval=10s status_interval=10s "
+        "rule=price_vs_ref_only "
         "price_source=Binance+Coinbase resolution_source=Chainlink",
         BTC5M_LATE_BOT_ID,
         BTC5M_LATE_STRATEGY_ID,
         BTC5M_LATE_SLUG_PREFIX,
-        BTC5M_LATE_EVAL_START_S,
-        BTC5M_LATE_ENTRY_CUTOFF_S,
-        BTC5M_LATE_DISTANCE_USD,
-        BTC5M_LATE_ASK_MIN,
-        BTC5M_LATE_ASK_MAX,
     )
 
     while True:
@@ -14024,9 +14020,9 @@ async def btc_5m_late_loop() -> None:
             )
 
             # ── 5. Health state ───────────────────────────────────────────────
-            in_window = (
-                BTC5M_LATE_ENTRY_CUTOFF_S < remaining <= BTC5M_LATE_EVAL_START_S
-            )
+            # Entry window: 35–20 seconds remaining.
+            # Health and status snapshots run unconditionally (before this gate).
+            in_window = (BTC5M_LATE_ENTRY_CUTOFF_S < remaining <= 35)
             distance = (
                 round(btc_price - ref_price, 2)
                 if (btc_price is not None and ref_price is not None)
@@ -14111,17 +14107,7 @@ async def btc_5m_late_loop() -> None:
                         slug,
                     )
 
-            # ── 8. Active-zone log + BTC5M_SIMPLE_ACTIVE ─────────────────────
-            # Log BTC5M_SIMPLE_ACTIVE whenever we are in the last 60 s
-            # (throttled to the 10 s health cadence so it's not noisy).
-            if in_window and (_mono_now - _btc5m_late_last_health_ts < 0.5):
-                # health was just logged; piggyback SIMPLE_ACTIVE alongside it
-                logging.warning(
-                    "BTC5M_SIMPLE_ACTIVE slug=%s seconds_left=%s trade_size=%s",
-                    slug, remaining, trade_size,
-                )
-
-            # ── 9. Outside eval zone → skip entry (health/status still run) ──
+            # ── 8. Outside entry window → skip entry (health/status already ran) ──
             if not in_window:
                 continue
 
@@ -14173,19 +14159,7 @@ async def btc_5m_late_loop() -> None:
                 )
                 continue
 
-            # ── 13. Entry-window gate: 35–20 s remaining ──────────────────────
-            # Health and status continue from 60 s, but entry only in final 35 s.
-            if remaining > 35:
-                _btc5m_late_last_reason = "WAITING_FOR_ENTRY_WINDOW"
-                logging.warning(
-                    "BTC5M_SIMPLE_SKIP slug=%s "
-                    "reason=WAITING_FOR_ENTRY_WINDOW "
-                    "seconds_left=%s",
-                    slug, remaining,
-                )
-                continue
-
-            # ── 14. One-trade-per-market (OPEN or settled) ────────────────────
+            # ── 13. One-trade-per-market (OPEN or settled) ───────────────────
             try:
                 already_traded = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -14209,9 +14183,15 @@ async def btc_5m_late_loop() -> None:
                 )
                 continue
 
+            # ── 14b. BTC5M_SIMPLE_READY — about to evaluate direction ─────────
+            logging.warning(
+                "BTC5M_SIMPLE_READY slug=%s seconds_left=%s trade_size=%s",
+                slug, remaining, trade_size,
+            )
+
             # ── 15. SIMPLE direction logic ────────────────────────────────────
-            # No momentum, distance, ask-range, or spread filters.
-            # Direction is solely determined by current BTC price vs Price to Beat.
+            # Rule: BTC price above Price to Beat → UP, below → DOWN.
+            # No momentum, EMA, distance, ask-range, spread, or volume filters.
             side: str | None          = None
             entry_price: float | None = None
             decision:    str          = "SKIP"
@@ -14329,13 +14309,14 @@ async def btc_5m_late_loop() -> None:
         except Exception:
             logging.exception("BTC5M_LATE_LOOP_ERROR")
 
-        # ── Monotonic cadence: 2 s inside eval window, 5 s otherwise ─────────
-        # Recompute remaining at the bottom so drift from blocking work is
-        # accounted for; use the same period formula as the top of the loop.
+        # ── Monotonic cadence: 2 s during final 45 s, 5 s otherwise ─────────
+        # Poll every 2 s during the last 45 s so the 35–20 s entry window
+        # is never missed due to timing drift.  Recompute remaining so any
+        # work done above (DB writes, HTTP) is accounted for.
         _now_bottom   = int(time())
         _start_bottom = (_now_bottom // 300) * 300
         _rem_bottom   = (_start_bottom + 300) - _now_bottom
-        _in_eval_now  = BTC5M_LATE_ENTRY_CUTOFF_S < _rem_bottom <= 75
+        _in_eval_now  = _rem_bottom <= 45   # 2 s cadence inside final 45 s
         _target_s     = 2.0 if _in_eval_now else 5.0
         _elapsed_s    = _monotonic() - _tick_start
         _sleep_s      = max(0.0, _target_s - _elapsed_s)
