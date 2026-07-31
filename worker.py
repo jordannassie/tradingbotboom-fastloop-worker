@@ -5409,14 +5409,13 @@ async def paper_settlement_loop():
                         start_price or 0.0,
                         end_price or 0.0,
                     )
-                    if _btc5m_late_paper_test_mode:
-                        logging.warning(
-                            "BTC5M_TEST_SETTLED slug=%s side=%s result=%s pnl=%.4f",
-                            market_slug or "",
-                            str(row.get("side") or "").upper(),
-                            "WIN" if pnl_usd >= 0 else "LOSS",
-                            pnl_usd,
-                        )
+                    logging.warning(
+                        "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
+                        market_slug or "",
+                        str(row.get("side") or "").upper(),
+                        "WIN" if pnl_usd >= 0 else "LOSS",
+                        pnl_usd,
+                    )
                 else:
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
@@ -8315,51 +8314,54 @@ def _test_compute_copy_size() -> None:
 
 def _test_btc5m_test_mode() -> None:
     """
-    In-memory unit tests for BTC5M paper test mode direction logic.
+    In-memory unit tests for BTC5M SIMPLE paper entry direction logic.
     No database access.  Runs once at startup; results visible in Railway logs.
+    Tests: above/below Price to Beat, price equality, token-ID optionality,
+           one-trade protection semantics, LIVE always blocked.
     """
-    _test_cases = [
-        # (desc, btc_price, ref_price, up_ask, down_ask, expected_decision, live_must_remain_off)
-        ("above_ptb_buys_UP",     100100.0, 100000.0, 0.55, 0.45, "BUY_UP",   True),
-        ("below_ptb_buys_DOWN",   99900.0,  100000.0, 0.55, 0.45, "BUY_DOWN", True),
-        ("equal_ptb_skips",       100000.0, 100000.0, 0.55, 0.45, "SKIP",     True),
-        ("up_ask_out_of_range",   100100.0, 100000.0, 1.01, 0.45, "SKIP",     True),
-        ("down_ask_out_of_range", 99900.0,  100000.0, 0.55, 0.00, "SKIP",     True),
-        ("size_fixed_at_0.10",    100100.0, 100000.0, 0.55, 0.45, "BUY_UP",   True),
+    def _simulate_simple(btc_price, ref_price, up_ask, down_ask, mode="PAPER"):
+        """Simulate the SIMPLE direction logic + LIVE gate."""
+        # LIVE gate (independent of test mode)
+        if mode != "PAPER":
+            return "SKIP_WRONG_MODE"
+        # Direction
+        if btc_price > ref_price:
+            if up_ask is not None and 0.0 < up_ask < 1.0:
+                return "BUY_UP"
+            return "SKIP_ASK_MISSING"
+        elif btc_price < ref_price:
+            if down_ask is not None and 0.0 < down_ask < 1.0:
+                return "BUY_DOWN"
+            return "SKIP_ASK_MISSING"
+        return "SKIP_PRICES_EQUAL"
+
+    _cases = [
+        # (desc, btc_price, ref_price, up_ask, down_ask, mode, expected)
+        ("above_ptb_selects_UP",      100100.0, 100000.0, 0.55, 0.45, "PAPER", "BUY_UP"),
+        ("below_ptb_selects_DOWN",     99900.0, 100000.0, 0.45, 0.55, "PAPER", "BUY_DOWN"),
+        ("equal_prices_skips",        100000.0, 100000.0, 0.50, 0.50, "PAPER", "SKIP_PRICES_EQUAL"),
+        ("paper_no_token_still_works", 100100.0, 100000.0, 0.55, 0.45, "PAPER", "BUY_UP"),
+        ("missing_up_ask_skips",       100100.0, 100000.0, None, 0.45, "PAPER", "SKIP_ASK_MISSING"),
+        ("missing_down_ask_skips",      99900.0, 100000.0, 0.55, None, "PAPER", "SKIP_ASK_MISSING"),
+        ("live_mode_always_blocked",   100100.0, 100000.0, 0.55, 0.45, "LIVE",  "SKIP_WRONG_MODE"),
     ]
 
-    def _simulate_test_mode(btc_price, ref_price, up_ask, down_ask):
-        """Simulate test-mode direction logic without touching the database."""
-        if btc_price > ref_price:
-            if up_ask is not None and 0.01 <= up_ask <= 0.99:
-                return "BUY_UP"
-            return "SKIP"
-        elif btc_price < ref_price:
-            if down_ask is not None and 0.01 <= down_ask <= 0.99:
-                return "BUY_DOWN"
-            return "SKIP"
-        return "SKIP"
-
-    _size_usd = 0.10   # fixed test mode size
     all_passed = True
-
-    for desc, btc, ref, ua, da, expected, live_off in _test_cases:
-        got = _simulate_test_mode(btc, ref, ua, da)
-        size_ok = _size_usd == 0.10   # always True — just validates constant
-        live_ok = live_off             # LIVE is structurally disabled (mode gate)
-        passed  = (got == expected) and size_ok and live_ok
+    for desc, btc, ref, ua, da, mode, expected in _cases:
+        got = _simulate_simple(btc, ref, ua, da, mode)
+        passed = (got == expected)
         if not passed:
             all_passed = False
         logging.warning(
-            "BTC5M_TEST_SELFTEST %s desc=%r decision=%s expected=%s size_usd=%.2f live_off=%s",
+            "BTC5M_SIMPLE_SELFTEST %s desc=%r decision=%s expected=%s",
             "PASS" if passed else "FAIL",
-            desc, got, expected, _size_usd, live_ok,
+            desc, got, expected,
         )
 
     logging.warning(
-        "BTC5M_TEST_SELFTEST_SUMMARY %s cases=%s",
+        "BTC5M_SIMPLE_SELFTEST_SUMMARY %s cases=%s",
         "ALL_PASS" if all_passed else "FAILURES_DETECTED",
-        len(_test_cases),
+        len(_cases),
     )
 
 
@@ -13437,7 +13439,6 @@ _btc5m_late_last_decision: str   = "NONE" # last decision for status snapshot
 _btc5m_late_last_reason:   str   = "INIT" # last reason  for status snapshot
 _btc5m_late_rotated_at: float | None = None    # wall-clock time of last successful rotation
 _btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
-_btc5m_late_paper_test_mode: bool = False       # mirrors paper_test_mode from bot_settings; shared with settlement loop
 
 _BINANCE_5M_LATE_URL = (
     "https://api.binance.com/api/v3/klines"
@@ -13692,8 +13693,7 @@ def _btc5m_late_upsert_status_sync(
     up_token_id:      str | None = None,
     down_token_id:    str | None = None,
     rotated_at:       float | None = None,
-    paper_test_mode:  bool = False,
-    saved_trade_size: float | None = None,
+    trade_size_usd:   float | None = None,
 ) -> None:
     """
     Write a live status snapshot to bot_settings.strategy_settings for
@@ -13784,9 +13784,8 @@ def _btc5m_late_upsert_status_sync(
         "today_losses":         stats["today_losses"],
         "today_pnl":            stats["today_pnl"],
         "rotated_at":           rotated_at,
-        "paper_test_mode":      paper_test_mode,  # internal key
-        "test_mode":            paper_test_mode,  # BTCBOT UI key (kept in sync)
-        "saved_trade_size":     saved_trade_size,
+        "strategy_mode":        "SIMPLE",
+        "trade_size_usd":       trade_size_usd,
         "updated_at":           utc_now_iso(),
     }
 
@@ -13882,7 +13881,6 @@ async def btc_5m_late_loop() -> None:
     global _btc5m_late_last_slug, _btc5m_late_last_health_ts
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
     global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at
-    global _btc5m_late_paper_test_mode
 
     if not BTC5M_LATE_ENABLED:
         logging.warning(
@@ -14022,18 +14020,6 @@ async def btc_5m_late_loop() -> None:
             trade_size = float(
                 settings.get("trade_size_usd") or BTC5M_LATE_TRADE_SIZE_USD
             )
-            # paper_test_mode lives inside strategy_settings JSON, not as a top-level column.
-            _ss = settings.get("strategy_settings") or {}
-            if isinstance(_ss, str):
-                try:
-                    _ss = json.loads(_ss)
-                except Exception:
-                    _ss = {}
-            # Accept both "paper_test_mode" and "test_mode" so BTCBOT UI key works too.
-            paper_test_mode = bool(
-                _ss.get("paper_test_mode", False) or _ss.get("test_mode", False)
-            )
-            _btc5m_late_paper_test_mode = paper_test_mode  # share with settlement loop
 
             # ── 5. Health state ───────────────────────────────────────────────
             in_window = (
@@ -14111,7 +14097,6 @@ async def btc_5m_late_loop() -> None:
                             is_enabled, mode,
                             up_token_id, down_token_id,
                             _btc5m_late_rotated_at,
-                            paper_test_mode,
                             trade_size,
                         ),
                         timeout=10.0,
@@ -14124,60 +14109,46 @@ async def btc_5m_late_loop() -> None:
                         slug,
                     )
 
-            # ── 8. Timing gate (entry only) ───────────────────────────────────
+            # ── 8. Active-zone log + BTC5M_SIMPLE_ACTIVE ─────────────────────
+            # Log BTC5M_SIMPLE_ACTIVE whenever we are in the last 60 s
+            # (throttled to the 10 s health cadence so it's not noisy).
+            if in_window and (_mono_now - _btc5m_late_last_health_ts < 0.5):
+                # health was just logged; piggyback SIMPLE_ACTIVE alongside it
+                logging.warning(
+                    "BTC5M_SIMPLE_ACTIVE slug=%s seconds_left=%s trade_size=%s",
+                    slug, remaining, trade_size,
+                )
+
+            # ── 9. Outside eval zone → skip entry (health/status still run) ──
             if not in_window:
                 continue
 
-            # ── 9a. Disabled gate ─────────────────────────────────────────────
+            # ── 10. Disabled gate ─────────────────────────────────────────────
             if not is_enabled:
                 _btc5m_late_last_reason = "STRATEGY_DISABLED"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=STRATEGY_DISABLED "
-                    "slug=%s seconds_left=%s",
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=STRATEGY_DISABLED "
+                    "seconds_left=%s",
                     slug, remaining,
                 )
                 continue
 
-            # ── 9b. Live mode gate ────────────────────────────────────────────
+            # ── 11. PAPER-mode gate (LIVE always blocked) ─────────────────────
             if mode != "PAPER":
                 _btc5m_late_last_reason = "WRONG_MODE"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=WRONG_MODE "
-                    "slug=%s mode=%s — live not implemented; set mode=PAPER",
-                    slug, mode,
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=WRONG_MODE "
+                    "mode=%s seconds_left=%s",
+                    slug, mode, remaining,
                 )
                 continue
 
-            # ── 9c. Duplicate gate ────────────────────────────────────────────
-            try:
-                already_open = await asyncio.wait_for(
-                    has_open_paper_position_for_strategy(
-                        slug, BTC5M_LATE_STRATEGY_ID, BTC5M_LATE_BOT_ID
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                logging.warning(
-                    "BTC5M_DUPLICATE_CHECK_TIMEOUT slug=%s "
-                    "— skipping entry this tick to avoid duplicate",
-                    slug,
-                )
-                continue
-            if already_open:
-                _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
-                logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=ALREADY_TRADED_MARKET "
-                    "slug=%s seconds_left=%s",
-                    slug, remaining,
-                )
-                continue
-
-            # ── 9d. Data safety gates ─────────────────────────────────────────
+            # ── 12. Data safety gates (essential prices only) ──────────────────
             if ref_price is None:
                 _btc5m_late_last_reason = "PRICE_TO_BEAT_MISSING"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=PRICE_TO_BEAT_MISSING "
-                    "slug=%s seconds_left=%s",
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=PRICE_TO_BEAT_MISSING "
+                    "seconds_left=%s",
                     slug, remaining,
                 )
                 continue
@@ -14185,8 +14156,8 @@ async def btc_5m_late_loop() -> None:
             if btc_price is None:
                 _btc5m_late_last_reason = "REFERENCE_PRICE_MISSING"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=REFERENCE_PRICE_MISSING "
-                    "slug=%s seconds_left=%s",
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=REFERENCE_PRICE_MISSING "
+                    "seconds_left=%s",
                     slug, remaining,
                 )
                 continue
@@ -14194,179 +14165,100 @@ async def btc_5m_late_loop() -> None:
             if market_data is None:
                 _btc5m_late_last_reason = "MARKET_NOT_FOUND"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=MARKET_NOT_FOUND "
-                    "slug=%s seconds_left=%s",
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=MARKET_NOT_FOUND "
+                    "seconds_left=%s",
                     slug, remaining,
                 )
                 continue
 
-            if up_ask is None or down_ask is None:
-                _btc5m_late_last_reason = "ORDER_BOOK_MISSING"
+            # ── 13. Entry-window gate: 35–20 s remaining ──────────────────────
+            # Health and status continue from 60 s, but entry only in final 35 s.
+            if remaining > 35:
+                _btc5m_late_last_reason = "WAITING_FOR_ENTRY_WINDOW"
                 logging.warning(
-                    "BTC5M_DECISION decision=SKIP reason=ORDER_BOOK_MISSING "
-                    "slug=%s up_ask=%s down_ask=%s",
-                    slug, up_ask, down_ask,
+                    "BTC5M_SIMPLE_SKIP slug=%s "
+                    "reason=WAITING_FOR_ENTRY_WINDOW "
+                    "seconds_left=%s",
+                    slug, remaining,
                 )
                 continue
 
-            assert distance is not None  # guaranteed: both prices non-None above
-
-            # ── 10. BTC5M_EVALUATE ────────────────────────────────────────────
-            logging.warning(
-                "BTC5M_EVALUATE slug=%s seconds_left=%s "
-                "reference_price=%.2f btc_price=%.2f "
-                "distance_usd=%+.2f up_ask=%.4f down_ask=%.4f momentum=%s "
-                "paper_test_mode=%s",
-                slug, remaining,
-                ref_price, btc_price,
-                distance, up_ask, down_ask, momentum,
-                paper_test_mode,
-            )
-
-            if paper_test_mode and in_window:
-                # BTC5M_TEST_MODE — visible in Railway whenever test mode is active
-                logging.warning(
-                    "BTC5M_TEST_MODE enabled=true size_usd=%.2f slug=%s seconds_left=%s",
-                    trade_size, slug, remaining,
+            # ── 14. One-trade-per-market (OPEN or settled) ────────────────────
+            try:
+                already_traded = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _btc5m_late_has_any_position_for_market_sync, slug
+                    ),
+                    timeout=5.0,
                 )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=DUP_CHECK_TIMEOUT "
+                    "seconds_left=%s",
+                    slug, remaining,
+                )
+                continue
+            if already_traded:
+                _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
+                logging.warning(
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=ALREADY_TRADED_MARKET "
+                    "seconds_left=%s",
+                    slug, remaining,
+                )
+                continue
 
-            # ── 11. Direction logic ───────────────────────────────────────────
-            decision    = "SKIP"
-            skip_reason = "NO_SIGNAL"
+            # ── 15. SIMPLE direction logic ────────────────────────────────────
+            # No momentum, distance, ask-range, or spread filters.
+            # Direction is solely determined by current BTC price vs Price to Beat.
             side: str | None          = None
             entry_price: float | None = None
+            decision:    str          = "SKIP"
+            skip_reason: str          = "NO_SIGNAL"
 
-            if paper_test_mode:
-                # ── Paper test mode: direction by price comparison only ────────
-                # No momentum, distance, ask-range, or spread filters.
-                # Only enter in the preferred window: 45 s – 20 s remaining.
-                # LIVE remains unavailable regardless of this flag.
-                _leading = "UP" if btc_price > ref_price else ("DOWN" if btc_price < ref_price else "FLAT")
-                logging.warning(
-                    "BTC5M_TEST_EVALUATE slug=%s seconds_left=%s "
-                    "price_to_beat=%.2f btc_price=%.2f leading_side=%s "
-                    "up_price=%s down_price=%s",
-                    slug, remaining, ref_price, btc_price, _leading,
-                    f"{up_ask:.4f}" if up_ask is not None else "None",
-                    f"{down_ask:.4f}" if down_ask is not None else "None",
-                )
-                if remaining > 45:
-                    skip_reason = f"WAITING_FOR_PREFERRED_WINDOW seconds_left={remaining}"
-                    logging.warning(
-                        "BTC5M_TEST_SKIP slug=%s "
-                        "reason=WAITING_FOR_PREFERRED_WINDOW "
-                        "seconds_left=%s",
-                        slug, remaining,
-                    )
-                elif btc_price > ref_price:
-                    if up_ask is not None and 0.01 <= up_ask <= 0.99:
-                        decision    = "BUY_UP"
-                        side        = "yes"
-                        entry_price = up_ask
-                    else:
-                        skip_reason = f"TEST_UP_ASK_INVALID up_ask={up_ask}"
-                        logging.warning(
-                            "BTC5M_TEST_SKIP slug=%s reason=%s seconds_left=%s",
-                            slug, skip_reason, remaining,
-                        )
-                elif btc_price < ref_price:
-                    if down_ask is not None and 0.01 <= down_ask <= 0.99:
-                        decision    = "BUY_DOWN"
-                        side        = "no"
-                        entry_price = down_ask
-                    else:
-                        skip_reason = f"TEST_DOWN_ASK_INVALID down_ask={down_ask}"
-                        logging.warning(
-                            "BTC5M_TEST_SKIP slug=%s reason=%s seconds_left=%s",
-                            slug, skip_reason, remaining,
-                        )
-                else:
-                    skip_reason = "PRICES_EXACTLY_EQUAL"
-                    logging.warning(
-                        "BTC5M_TEST_SKIP slug=%s reason=PRICES_EXACTLY_EQUAL "
-                        "price_to_beat=%.2f btc_price=%.2f seconds_left=%s",
-                        slug, ref_price, btc_price, remaining,
-                    )
-
+            if btc_price > ref_price:
+                side        = "yes"
+                entry_price = up_ask    # may be None; checked below
+                decision    = "BUY_UP"
+            elif btc_price < ref_price:
+                side        = "no"
+                entry_price = down_ask  # may be None; checked below
+                decision    = "BUY_DOWN"
             else:
-                # ── V1 production logic ───────────────────────────────────────
-                if (
-                    distance >= BTC5M_LATE_DISTANCE_USD
-                    and momentum == "UP"
-                    and BTC5M_LATE_ASK_MIN <= up_ask <= BTC5M_LATE_ASK_MAX
-                ):
-                    decision    = "BUY_UP"
-                    side        = "yes"
-                    entry_price = up_ask
+                skip_reason = "PRICES_EXACTLY_EQUAL"
 
-                elif (
-                    distance <= -BTC5M_LATE_DISTANCE_USD
-                    and momentum == "DOWN"
-                    and BTC5M_LATE_ASK_MIN <= down_ask <= BTC5M_LATE_ASK_MAX
-                ):
-                    decision    = "BUY_DOWN"
-                    side        = "no"
-                    entry_price = down_ask
-
-                else:
-                    if abs(distance) < BTC5M_LATE_DISTANCE_USD:
-                        skip_reason = (
-                            f"DISTANCE_TOO_SMALL distance={distance:+.1f} "
-                            f"threshold={BTC5M_LATE_DISTANCE_USD:.0f}"
-                        )
-                    elif distance >= BTC5M_LATE_DISTANCE_USD and momentum != "UP":
-                        skip_reason = (
-                            f"MOMENTUM_NOT_UP momentum={momentum} "
-                            f"distance={distance:+.1f}"
-                        )
-                    elif distance <= -BTC5M_LATE_DISTANCE_USD and momentum != "DOWN":
-                        skip_reason = (
-                            f"MOMENTUM_NOT_DOWN momentum={momentum} "
-                            f"distance={distance:+.1f}"
-                        )
-                    elif distance >= BTC5M_LATE_DISTANCE_USD:
-                        skip_reason = (
-                            f"UP_ASK_OUT_OF_RANGE up_ask={up_ask:.4f} "
-                            f"range=[{BTC5M_LATE_ASK_MIN},{BTC5M_LATE_ASK_MAX}]"
-                        )
-                    elif distance <= -BTC5M_LATE_DISTANCE_USD:
-                        skip_reason = (
-                            f"DOWN_ASK_OUT_OF_RANGE down_ask={down_ask:.4f} "
-                            f"range=[{BTC5M_LATE_ASK_MIN},{BTC5M_LATE_ASK_MAX}]"
-                        )
+            # PAPER token-ID fallback: missing token IDs do not block entry,
+            # but we must have an ask price to create a valid position.
+            if decision != "SKIP" and entry_price is None:
+                skip_reason = (
+                    f"ASK_PRICE_MISSING side={'UP' if side=='yes' else 'DOWN'}"
+                )
+                decision = "SKIP"
 
             _btc5m_late_last_decision = decision
             _btc5m_late_last_reason   = (
                 skip_reason if decision == "SKIP" else "SIGNAL_MET"
             )
 
-            # ── 12. BTC5M_DECISION ────────────────────────────────────────────
             logging.warning(
-                "BTC5M_DECISION decision=%s reason=%s size_usd=%s slug=%s "
-                "paper_test_mode=%s",
+                "BTC5M_EVALUATE slug=%s seconds_left=%s "
+                "price_to_beat=%.2f btc_price=%.2f distance_usd=%s "
+                "up_ask=%s down_ask=%s decision=%s",
+                slug, remaining, ref_price, btc_price,
+                f"{distance:+.2f}" if distance is not None else "N/A",
+                f"{up_ask:.4f}" if up_ask is not None else "None",
+                f"{down_ask:.4f}" if down_ask is not None else "None",
                 decision,
-                _btc5m_late_last_reason,
-                trade_size if decision != "SKIP" else "N/A",
-                slug,
-                paper_test_mode,
             )
-            if paper_test_mode and decision == "SKIP":
-                logging.warning(
-                    "BTC5M_TEST_SKIP slug=%s reason=%s seconds_left=%s",
-                    slug, _btc5m_late_last_reason, remaining,
-                )
 
             if decision == "SKIP":
-                continue
-
-            # ── 13. Open PAPER position ───────────────────────────────────────
-            if entry_price is None or side is None:
-                logging.error(
-                    "BTC5M_LATE_LOGIC_ERROR decision=%s entry_price=%s side=%s",
-                    decision, entry_price, side,
+                logging.warning(
+                    "BTC5M_SIMPLE_SKIP slug=%s reason=%s seconds_left=%s",
+                    slug, _btc5m_late_last_reason, remaining,
                 )
                 continue
 
+            # ── 16. Open PAPER position ───────────────────────────────────────
+            assert side is not None and entry_price is not None
             logging.warning(
                 "BTC5M_SIZE configured_size_usd=%s final_size_usd=%s "
                 "slug=%s side=%s",
@@ -14389,23 +14281,20 @@ async def btc_5m_late_loop() -> None:
                 _btc5m_late_last_reason   = "PAPER_POSITION_OPENED"
                 logging.warning(
                     "BTC5M_PAPER_OPENED position_id=%s side=%s size_usd=%s "
-                    "entry_price=%.4f seconds_left=%s slug=%s "
-                    "paper_test_mode=%s",
+                    "entry_price=%.4f seconds_left=%s slug=%s",
                     row_id or "?",
                     side, trade_size, entry_price, remaining, slug,
-                    paper_test_mode,
                 )
-                if paper_test_mode:
-                    logging.warning(
-                        "BTC5M_TEST_ENTRY slug=%s side=%s size_usd=%s "
-                        "entry_price=%.4f seconds_left=%s position_id=%s",
-                        slug,
-                        ("UP" if side == "yes" else "DOWN"),
-                        trade_size,
-                        entry_price,
-                        remaining,
-                        row_id or "?",
-                    )
+                logging.warning(
+                    "BTC5M_SIMPLE_ENTRY slug=%s side=%s size_usd=%s "
+                    "entry_price=%.4f seconds_left=%s position_id=%s",
+                    slug,
+                    ("UP" if side == "yes" else "DOWN"),
+                    trade_size,
+                    entry_price,
+                    remaining,
+                    row_id or "?",
+                )
                 # Immediately publish updated snapshot after opening a position.
                 try:
                     await asyncio.wait_for(
@@ -14420,7 +14309,6 @@ async def btc_5m_late_loop() -> None:
                             is_enabled, mode,
                             up_token_id, down_token_id,
                             _btc5m_late_rotated_at,
-                            paper_test_mode,
                             trade_size,
                         ),
                         timeout=10.0,
