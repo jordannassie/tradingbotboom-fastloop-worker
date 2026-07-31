@@ -13746,7 +13746,13 @@ async def btc_5m_late_loop() -> None:
             slug      = f"{BTC5M_LATE_SLUG_PREFIX}-{start_ts}"
 
             # ── 2. Market rotation detection ──────────────────────────────────
-            if slug != _btc5m_late_last_slug:
+            # Note: we do NOT make an extra Gamma API call here.  The actual
+            # market data is fetched in step 3; rotation is confirmed once that
+            # fetch succeeds.  This avoids exhausting the thread-pool executor
+            # with a duplicate HTTP request that can queue for 30-90 s when
+            # all worker threads are busy with copy-trading / EMA fetches.
+            slug_just_changed = (slug != _btc5m_late_last_slug)
+            if slug_just_changed:
                 old_slug = _btc5m_late_last_slug
                 if old_slug is not None:
                     logging.warning(
@@ -13754,15 +13760,49 @@ async def btc_5m_late_loop() -> None:
                         "detected_at=%s",
                         old_slug, start_ts, now_int,
                     )
-                _new_market_check = await asyncio.to_thread(
-                    _btc5m_late_fetch_market_data_sync, slug
+                _btc5m_late_last_slug = slug  # update immediately; rotation confirmed below
+
+            # ── 3. Fetch price data + market prices (ALWAYS) ──────────────────
+            # All network calls go through asyncio.to_thread with tight timeouts
+            # so a slow HTTP connection never blocks this loop for > 15 s total.
+            try:
+                ref_price, btc_price, momentum = await asyncio.wait_for(
+                    asyncio.to_thread(_btc5m_late_fetch_data_sync, start_ts),
+                    timeout=15.0,
                 )
-                if _new_market_check is not None:
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "BTC5M_LATE_DATA_FETCH_TIMEOUT slug=%s — "
+                    "price data not available this tick",
+                    slug,
+                )
+                ref_price, btc_price, momentum = None, None, "FLAT"
+
+            try:
+                market_data = await asyncio.wait_for(
+                    asyncio.to_thread(_btc5m_late_fetch_market_data_sync, slug),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "BTC5M_LATE_MARKET_FETCH_TIMEOUT slug=%s — "
+                    "market data not available this tick",
+                    slug,
+                )
+                market_data = None
+            up_ask   = market_data.get("up_price")  if market_data else None
+            down_ask = market_data.get("down_price") if market_data else None
+
+            # Confirm rotation now that we have market data.
+            if slug_just_changed:
+                if market_data is not None:
                     logging.warning(
                         "BTC5M_MARKET_ROTATED old_slug=%s new_slug=%s "
-                        "market_start=%s market_end=%s rotated_at=%s",
+                        "market_start=%s market_end=%s "
+                        "up_ask=%s down_ask=%s rotated_at=%s",
                         old_slug or "NONE", slug,
-                        start_ts, end_ts, now_int,
+                        start_ts, end_ts,
+                        up_ask, down_ask, now_int,
                     )
                 else:
                     logging.warning(
@@ -13770,27 +13810,28 @@ async def btc_5m_late_loop() -> None:
                         "reason=MARKET_NOT_FOUND rotated_at=%s",
                         old_slug or "NONE", slug, now_int,
                     )
-                _btc5m_late_last_slug = slug
-            else:
-                # Slug unchanged — no separate rotation fetch needed.
-                _new_market_check = None
 
-            # ── 3. Fetch price data + market prices (ALWAYS) ──────────────────
-            ref_price, btc_price, momentum = await asyncio.to_thread(
-                _btc5m_late_fetch_data_sync, start_ts
-            )
-            # Reuse rotation-check result if it returned data (saves one Gamma call).
-            if _new_market_check is not None:
-                market_data = _new_market_check
-            else:
-                market_data = await asyncio.to_thread(
-                    _btc5m_late_fetch_market_data_sync, slug
+            # ── 4. Read bot_settings (ALWAYS, with timeout) ───────────────────
+            # Wrapped in to_thread + wait_for so a cold Supabase connection
+            # (EU-West → Supabase cold start can take 200+ s) never blocks
+            # the health log.  Falls back to safe defaults on timeout.
+            try:
+                settings = await asyncio.wait_for(
+                    asyncio.to_thread(read_strategy_settings, BTC5M_LATE_BOT_ID),
+                    timeout=8.0,
                 )
-            up_ask   = market_data.get("up_price")  if market_data else None
-            down_ask = market_data.get("down_price") if market_data else None
-
-            # ── 4. Read bot_settings (ALWAYS) ─────────────────────────────────
-            settings   = read_strategy_settings(BTC5M_LATE_BOT_ID)
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "BTC5M_SETTINGS_READ_TIMEOUT bot_id=%s "
+                    "— using previous/safe defaults this tick",
+                    BTC5M_LATE_BOT_ID,
+                )
+                settings = {
+                    "is_enabled": False,
+                    "mode": "PAPER",
+                    "trade_size_usd": BTC5M_LATE_TRADE_SIZE_USD,
+                    "arm_live": False,
+                }
             is_enabled = bool(settings.get("is_enabled", False))
             mode       = str(settings.get("mode") or "PAPER").upper()
             trade_size = float(
@@ -13850,16 +13891,26 @@ async def btc_5m_late_loop() -> None:
             # ── 7. Status snapshot → bot_settings.strategy_settings ───────────
             if now_f - _btc5m_late_last_status_ts >= 30.0:
                 _btc5m_late_last_status_ts = now_f
-                await asyncio.to_thread(
-                    _btc5m_late_upsert_status_sync,
-                    slug, start_ts, end_ts, remaining,
-                    ref_price, btc_price,
-                    up_ask, down_ask, momentum,
-                    health_state,
-                    _btc5m_late_last_decision,
-                    _btc5m_late_last_reason,
-                    is_enabled, mode,
-                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _btc5m_late_upsert_status_sync,
+                            slug, start_ts, end_ts, remaining,
+                            ref_price, btc_price,
+                            up_ask, down_ask, momentum,
+                            health_state,
+                            _btc5m_late_last_decision,
+                            _btc5m_late_last_reason,
+                            is_enabled, mode,
+                        ),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "BTC5M_STATUS_WRITE_TIMEOUT slug=%s "
+                        "— status write took >10s, skipping this tick",
+                        slug,
+                    )
 
             # ── 8. Timing gate (entry only) ───────────────────────────────────
             if not in_window:
@@ -13889,9 +13940,21 @@ async def btc_5m_late_loop() -> None:
                 continue
 
             # ── 9c. Duplicate gate ────────────────────────────────────────────
-            already_open = await has_open_paper_position_for_strategy(
-                slug, BTC5M_LATE_STRATEGY_ID, BTC5M_LATE_BOT_ID
-            )
+            try:
+                already_open = await asyncio.wait_for(
+                    has_open_paper_position_for_strategy(
+                        slug, BTC5M_LATE_STRATEGY_ID, BTC5M_LATE_BOT_ID
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "BTC5M_DUPLICATE_CHECK_TIMEOUT slug=%s "
+                    "— skipping entry this tick to avoid duplicate",
+                    slug,
+                )
+                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+                continue
             if already_open:
                 _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
                 logging.warning(
