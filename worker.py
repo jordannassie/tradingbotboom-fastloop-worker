@@ -5800,7 +5800,7 @@ def insert_wallet_trade_if_new(trade_row: dict) -> bool:
         return bool(resp.data)
     except Exception as exc:
         exc_str = str(exc).lower()
-        if any(kw in exc_str for kw in ("duplicate", "unique", "23505", "conflict")):
+        if any(kw in exc_str for kw in ("duplicate", "unique", "23505", "conflict", "409")):
             return False  # expected dedup — not an error
         logging.warning(
             "COPY_INSERT_WALLET_TRADE_FAIL wallet=%s trade_id=%s err=%s",
@@ -8713,6 +8713,9 @@ def evaluate_copy_trade_shared(
 
 
 # ── Copy trade loop ───────────────────────────────────────────────────────────
+# Tracks whether the last copy tick was in idle state so COPY_INGEST_RESUMED
+# can be logged when activity resumes.
+_copy_ingest_was_idle: bool = False
 
 async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
     """
@@ -8851,9 +8854,9 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
         )
 
     while True:
-        wallets        = load_tracked_wallets()
-        all_bots       = load_enabled_copy_bots()
-        global_settings = load_copy_global_settings()
+        wallets        = await asyncio.to_thread(load_tracked_wallets)
+        all_bots       = await asyncio.to_thread(load_enabled_copy_bots)
+        global_settings = await asyncio.to_thread(load_copy_global_settings)
 
         # ── Repeating build marker (WARNING so it's always visible in Railway) ─
         # Fires every tick — cannot be missed regardless of when you start watching.
@@ -8895,7 +8898,7 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
             _execute_paper_reset()
             # Reload global_settings so this tick sees paper_reset_pending=False
             # and the updated exposure cap.
-            global_settings = load_copy_global_settings()
+            global_settings = await asyncio.to_thread(load_copy_global_settings)
 
         # ── Live-session active? ──────────────────────────────────────────────
         # Three ENV/DB conditions must ALL be true for ANY bot to go live this
@@ -8980,6 +8983,63 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
             [b.get("name") or str(b["id"])[:8] for b in live_bots] or "none",
             float(global_settings.get("live_max_exposure_usd") or 0),
         )
+
+        # ── Idle-copy detection: suspend wallet ingestion when no active work ─
+        # Skip all 31-wallet fetches/inserts when there is nothing to copy-trade.
+        # This stops the flood of duplicate wallet_trades inserts (409 traffic)
+        # that starves the BTC5M event loop.
+        # Safety loops (auto_exit, settlement, copy_diag) run independently and
+        # are NOT gated here — only the ingestion for-loop below is skipped.
+        global _copy_ingest_was_idle
+        _arm_live_count = sum(1 for b in all_bots if bool(b.get("arm_live")))
+        _copy_idle = (
+            len(all_bots) == 0
+            and not _live_session_active
+            and _arm_live_count == 0
+        )
+        if _copy_idle:
+            # Quick bounded check for any remaining open positions.
+            try:
+                _open_for_idle = await asyncio.wait_for(
+                    asyncio.to_thread(load_open_copied_positions, 1),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                _open_for_idle = [{"id": "timeout_assume_active"}]
+            if not _open_for_idle:
+                logging.warning(
+                    "COPY_INGEST_IDLE "
+                    "reason=NO_ACTIVE_COPY_WORK "
+                    "enabled_bots=0 "
+                    "open_positions=0 "
+                    "next_check_seconds=%s",
+                    COPY_TRADE_LOOP_INTERVAL,
+                )
+                _copy_ingest_was_idle = True
+                await asyncio.sleep(COPY_TRADE_LOOP_INTERVAL)
+                continue
+            else:
+                # Open positions exist — keep exit monitoring by running the
+                # full wallet loop so that source-wallet SELL events can trigger
+                # mirrored closes.
+                logging.info(
+                    "COPY_INGEST_ACTIVE_POSITIONS "
+                    "reason=OPEN_POSITION "
+                    "open_count=%s — keeping exit monitoring alive",
+                    len(_open_for_idle),
+                )
+        elif _copy_ingest_was_idle:
+            # Was idle last tick but bots/positions are now active — log resume.
+            _resume_reason = (
+                "BOT_ENABLED" if all_bots else
+                ("LIVE_ENABLED" if _live_session_active else
+                 ("ARM_LIVE_ENABLED" if _arm_live_count else "OPEN_POSITION"))
+            )
+            logging.warning(
+                "COPY_INGEST_RESUMED reason=%s enabled_bots=%s arm_live_bots=%s",
+                _resume_reason, len(all_bots), _arm_live_count,
+            )
+            _copy_ingest_was_idle = False
 
         for wallet in wallets:
             wallet_address = wallet["wallet_address"]
@@ -10723,11 +10783,11 @@ async def copy_auto_exit_loop() -> None:
     while True:
         try:
             # ── 1. Load bots into a lookup map ────────────────────────────────
-            bots    = load_enabled_copy_bots()
+            bots    = await asyncio.to_thread(load_enabled_copy_bots)
             bot_map = {str(b["id"]): b for b in bots}
 
             # ── 2. Load OPEN positions ────────────────────────────────────────
-            open_positions = load_open_copied_positions(COPY_SETTLEMENT_BATCH_SIZE)
+            open_positions = await asyncio.to_thread(load_open_copied_positions, COPY_SETTLEMENT_BATCH_SIZE)
 
             checked   = 0
             tp_closed = 0
@@ -11004,8 +11064,8 @@ async def copy_settlement_loop() -> None:
     )
 
     while True:
-        all_bots_for_audit = load_enabled_copy_bots()
-        open_positions = load_open_copied_positions(COPY_SETTLEMENT_BATCH_SIZE)
+        all_bots_for_audit = await asyncio.to_thread(load_enabled_copy_bots)
+        open_positions = await asyncio.to_thread(load_open_copied_positions, COPY_SETTLEMENT_BATCH_SIZE)
 
         settled = 0
         skipped_unresolved = 0
@@ -13313,6 +13373,8 @@ _btc5m_late_last_health_ts: float = 0.0   # monotonic time of last BTC5M_HEALTH 
 _btc5m_late_last_status_ts: float = 0.0   # monotonic time of last strategy_settings write
 _btc5m_late_last_decision: str   = "NONE" # last decision for status snapshot
 _btc5m_late_last_reason:   str   = "INIT" # last reason  for status snapshot
+_btc5m_late_rotated_at: float | None = None    # wall-clock time of last successful rotation
+_btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
 
 _BINANCE_5M_LATE_URL = (
     "https://api.binance.com/api/v3/klines"
@@ -13462,10 +13524,22 @@ def _btc5m_late_fetch_market_data_sync(slug: str) -> dict | None:
         up_price   = float(prices[up_idx])   if len(prices) > up_idx   else None
         down_price = float(prices[down_idx]) if len(prices) > down_idx else None
 
+        # Extract clobTokenIds (may also be JSON-encoded strings)
+        clob_raw = m.get("clobTokenIds") or []
+        if isinstance(clob_raw, str):
+            try:
+                clob_raw = json.loads(clob_raw)
+            except (json.JSONDecodeError, ValueError):
+                clob_raw = []
+        up_token_id   = str(clob_raw[up_idx])   if len(clob_raw) > up_idx   else None
+        down_token_id = str(clob_raw[down_idx]) if len(clob_raw) > down_idx else None
+
         return {
-            "up_price":   up_price,
-            "down_price": down_price,
-            "question":   m.get("question") or "",
+            "up_price":     up_price,
+            "down_price":   down_price,
+            "question":     m.get("question") or "",
+            "up_token_id":  up_token_id,
+            "down_token_id": down_token_id,
         }
 
     except Exception:
@@ -13527,6 +13601,9 @@ def _btc5m_late_upsert_status_sync(
     last_reason:    str,
     is_enabled:     bool,
     mode:           str,
+    up_token_id:    str | None = None,
+    down_token_id:  str | None = None,
+    rotated_at:     float | None = None,
 ) -> None:
     """
     Write a live status snapshot to bot_settings.strategy_settings for
@@ -13600,9 +13677,11 @@ def _btc5m_late_upsert_status_sync(
         "market_end":           end_ts,
         "seconds_remaining":    remaining,
         "price_to_beat":        ref_price,
-        "reference_price":      ref_price,
+        "reference_price":      btc_price,
         "distance_usd":         distance,
         "leading_side":         leading_side,
+        "up_token_id":          up_token_id,
+        "down_token_id":        down_token_id,
         "up_ask":               up_ask,
         "down_ask":             down_ask,
         "momentum":             momentum,
@@ -13614,6 +13693,7 @@ def _btc5m_late_upsert_status_sync(
         "today_wins":           stats["today_wins"],
         "today_losses":         stats["today_losses"],
         "today_pnl":            stats["today_pnl"],
+        "rotated_at":           rotated_at,
         "updated_at":           utc_now_iso(),
     }
 
@@ -13708,6 +13788,7 @@ async def btc_5m_late_loop() -> None:
     """
     global _btc5m_late_last_slug, _btc5m_late_last_health_ts
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
+    global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at
 
     if not BTC5M_LATE_ENABLED:
         logging.warning(
@@ -13720,13 +13801,14 @@ async def btc_5m_late_loop() -> None:
 
     logging.warning(
         "BTC5M_LATE_BOOT registered=true bot_id=%s strategy_id=%s "
-        "slug_prefix=%s loop_interval=%ss eval_start=%ss entry_cutoff=%ss "
+        "slug_prefix=%s cadence_normal=5s cadence_eval_window=2s "
+        "eval_start=%ss entry_cutoff=%ss "
         "distance_threshold=$%.0f ask_range=[%.2f,%.2f] "
+        "health_interval=10s status_interval=10s "
         "price_source=Binance+Coinbase resolution_source=Chainlink",
         BTC5M_LATE_BOT_ID,
         BTC5M_LATE_STRATEGY_ID,
         BTC5M_LATE_SLUG_PREFIX,
-        BTC5M_LATE_LOOP_INTERVAL,
         BTC5M_LATE_EVAL_START_S,
         BTC5M_LATE_ENTRY_CUTOFF_S,
         BTC5M_LATE_DISTANCE_USD,
@@ -13735,7 +13817,9 @@ async def btc_5m_late_loop() -> None:
     )
 
     while True:
+        _tick_start = time.monotonic()
         try:
+
             # ── 1. Compute market timing ──────────────────────────────────────
             period    = 300
             now_int   = int(time())
@@ -13790,19 +13874,26 @@ async def btc_5m_late_loop() -> None:
                     slug,
                 )
                 market_data = None
-            up_ask   = market_data.get("up_price")  if market_data else None
-            down_ask = market_data.get("down_price") if market_data else None
+            up_ask        = market_data.get("up_price")    if market_data else None
+            down_ask      = market_data.get("down_price")   if market_data else None
+            up_token_id   = market_data.get("up_token_id")  if market_data else None
+            down_token_id = market_data.get("down_token_id") if market_data else None
 
             # Confirm rotation now that we have market data.
             if slug_just_changed:
                 if market_data is not None:
+                    _btc5m_late_rotated_at = now_f
                     logging.warning(
                         "BTC5M_MARKET_ROTATED old_slug=%s new_slug=%s "
                         "market_start=%s market_end=%s "
-                        "up_ask=%s down_ask=%s rotated_at=%s",
+                        "up_ask=%s down_ask=%s "
+                        "up_token=%s down_token=%s rotated_at=%s",
                         old_slug or "NONE", slug,
                         start_ts, end_ts,
-                        up_ask, down_ask, now_int,
+                        up_ask, down_ask,
+                        "present" if up_token_id else "missing",
+                        "present" if down_token_id else "missing",
+                        now_int,
                     )
                 else:
                     logging.warning(
@@ -13865,15 +13956,20 @@ async def btc_5m_late_loop() -> None:
             else:
                 health_state = "READY"
 
-            # ── 6. BTC5M_HEALTH — every 30 s, unconditionally ─────────────────
-            if now_f - _btc5m_late_last_health_ts >= 30.0:
-                _btc5m_late_last_health_ts = now_f
+            # ── 6. BTC5M_HEALTH — every 10 s, unconditionally ─────────────────
+            _mono_now = time.monotonic()
+            _loop_lag_ms = round((_mono_now - _tick_start) * 1000, 1)
+            _snapshot_age = round(_mono_now - _btc5m_late_snapshot_written_at, 1)
+            if _mono_now - _btc5m_late_last_health_ts >= 10.0:
+                _btc5m_late_last_health_ts = _mono_now
                 logging.warning(
                     "BTC5M_HEALTH enabled=%s mode=%s arm_live=%s "
                     "market_slug=%s seconds_left=%s "
-                    "price_to_beat=%s reference_price=%s "
+                    "price_to_beat=%s reference_price=%s distance_usd=%s "
+                    "up_token=%s down_token=%s "
                     "up_ask=%s down_ask=%s momentum=%s "
-                    "state=%s reason=%s",
+                    "state=%s reason=%s "
+                    "loop_lag_ms=%s snapshot_age_seconds=%s",
                     is_enabled,
                     mode,
                     bool(settings.get("arm_live", False)),
@@ -13881,16 +13977,21 @@ async def btc_5m_late_loop() -> None:
                     remaining,
                     ref_price,
                     btc_price,
+                    distance,
+                    "present" if up_token_id else "missing",
+                    "present" if down_token_id else "missing",
                     up_ask,
                     down_ask,
                     momentum,
                     health_state,
                     _btc5m_late_last_reason,
+                    _loop_lag_ms,
+                    _snapshot_age,
                 )
 
             # ── 7. Status snapshot → bot_settings.strategy_settings ───────────
-            if now_f - _btc5m_late_last_status_ts >= 30.0:
-                _btc5m_late_last_status_ts = now_f
+            if _mono_now - _btc5m_late_last_status_ts >= 10.0:
+                _btc5m_late_last_status_ts = _mono_now
                 try:
                     await asyncio.wait_for(
                         asyncio.to_thread(
@@ -13902,9 +14003,12 @@ async def btc_5m_late_loop() -> None:
                             _btc5m_late_last_decision,
                             _btc5m_late_last_reason,
                             is_enabled, mode,
+                            up_token_id, down_token_id,
+                            _btc5m_late_rotated_at,
                         ),
                         timeout=10.0,
                     )
+                    _btc5m_late_snapshot_written_at = time.monotonic()
                 except asyncio.TimeoutError:
                     logging.warning(
                         "BTC5M_STATUS_WRITE_TIMEOUT slug=%s "
@@ -13914,7 +14018,6 @@ async def btc_5m_late_loop() -> None:
 
             # ── 8. Timing gate (entry only) ───────────────────────────────────
             if not in_window:
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             # ── 9a. Disabled gate ─────────────────────────────────────────────
@@ -13925,7 +14028,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s seconds_left=%s",
                     slug, remaining,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             # ── 9b. Live mode gate ────────────────────────────────────────────
@@ -13936,7 +14038,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s mode=%s — live not implemented; set mode=PAPER",
                     slug, mode,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             # ── 9c. Duplicate gate ────────────────────────────────────────────
@@ -13953,7 +14054,6 @@ async def btc_5m_late_loop() -> None:
                     "— skipping entry this tick to avoid duplicate",
                     slug,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
             if already_open:
                 _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
@@ -13962,7 +14062,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s seconds_left=%s",
                     slug, remaining,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             # ── 9d. Data safety gates ─────────────────────────────────────────
@@ -13973,7 +14072,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s seconds_left=%s",
                     slug, remaining,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             if btc_price is None:
@@ -13983,7 +14081,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s seconds_left=%s",
                     slug, remaining,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             if market_data is None:
@@ -13993,7 +14090,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s seconds_left=%s",
                     slug, remaining,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             if up_ask is None or down_ask is None:
@@ -14003,7 +14099,6 @@ async def btc_5m_late_loop() -> None:
                     "slug=%s up_ask=%s down_ask=%s",
                     slug, up_ask, down_ask,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             assert distance is not None  # guaranteed: both prices non-None above
@@ -14084,7 +14179,6 @@ async def btc_5m_late_loop() -> None:
             )
 
             if decision == "SKIP":
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
             # ── 13. Open PAPER position ───────────────────────────────────────
@@ -14093,9 +14187,13 @@ async def btc_5m_late_loop() -> None:
                     "BTC5M_LATE_LOGIC_ERROR decision=%s entry_price=%s side=%s",
                     decision, entry_price, side,
                 )
-                await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
                 continue
 
+            logging.warning(
+                "BTC5M_SIZE configured_size_usd=%s final_size_usd=%s "
+                "slug=%s side=%s",
+                trade_size, trade_size, slug, side,
+            )
             shares = round(trade_size / entry_price, 4)
             ok, row_id, _ = await insert_paper_position_row(
                 bot_id      = BTC5M_LATE_BOT_ID,
@@ -14117,6 +14215,27 @@ async def btc_5m_late_loop() -> None:
                     row_id or "?",
                     side, trade_size, entry_price, remaining, slug,
                 )
+                # Immediately publish updated snapshot after opening a position.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _btc5m_late_upsert_status_sync,
+                            slug, start_ts, end_ts, remaining,
+                            ref_price, btc_price,
+                            up_ask, down_ask, momentum,
+                            "POSITION_OPEN",
+                            _btc5m_late_last_decision,
+                            _btc5m_late_last_reason,
+                            is_enabled, mode,
+                            up_token_id, down_token_id,
+                            _btc5m_late_rotated_at,
+                        ),
+                        timeout=10.0,
+                    )
+                    _btc5m_late_snapshot_written_at = time.monotonic()
+                    _btc5m_late_last_status_ts = time.monotonic()
+                except asyncio.TimeoutError:
+                    pass  # non-critical; next tick will write snapshot
             else:
                 logging.warning(
                     "BTC5M_PAPER_OPEN_FAIL slug=%s side=%s — "
@@ -14127,7 +14246,17 @@ async def btc_5m_late_loop() -> None:
         except Exception:
             logging.exception("BTC5M_LATE_LOOP_ERROR")
 
-        await asyncio.sleep(BTC5M_LATE_LOOP_INTERVAL)
+        # ── Monotonic cadence: 2 s inside eval window, 5 s otherwise ─────────
+        # Recompute remaining at the bottom so drift from blocking work is
+        # accounted for; use the same period formula as the top of the loop.
+        _now_bottom   = int(time())
+        _start_bottom = (_now_bottom // 300) * 300
+        _rem_bottom   = (_start_bottom + 300) - _now_bottom
+        _in_eval_now  = BTC5M_LATE_ENTRY_CUTOFF_S < _rem_bottom <= 75
+        _target_s     = 2.0 if _in_eval_now else 5.0
+        _elapsed_s    = time.monotonic() - _tick_start
+        _sleep_s      = max(0.0, _target_s - _elapsed_s)
+        await asyncio.sleep(_sleep_s)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
