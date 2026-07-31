@@ -13973,6 +13973,8 @@ async def btc_5m_late_loop() -> None:
 
             # Confirm rotation now that we have market data.
             if slug_just_changed:
+                _btc5m_late_last_decision = "NONE"  # reset per-market state for clean health display
+                _btc5m_late_last_reason   = "NEW_MARKET"
                 if market_data is not None:
                     _btc5m_late_rotated_at = now_f
                     logging.warning(
