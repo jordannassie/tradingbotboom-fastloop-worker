@@ -13942,7 +13942,14 @@ async def btc_5m_late_loop() -> None:
             trade_size = float(
                 settings.get("trade_size_usd") or BTC5M_LATE_TRADE_SIZE_USD
             )
-            paper_test_mode = bool(settings.get("paper_test_mode", False))
+            # paper_test_mode lives inside strategy_settings JSON, not as a top-level column.
+            _ss = settings.get("strategy_settings") or {}
+            if isinstance(_ss, str):
+                try:
+                    _ss = json.loads(_ss)
+                except Exception:
+                    _ss = {}
+            paper_test_mode = bool(_ss.get("paper_test_mode", False))
             _btc5m_late_paper_test_mode = paper_test_mode  # share with settlement loop
 
             # ── 5. Health state ───────────────────────────────────────────────
