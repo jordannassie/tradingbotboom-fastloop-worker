@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from math import floor
-from time import time
+from time import time, monotonic as _monotonic
 from urllib import parse, request
 from urllib.error import HTTPError
 
@@ -13817,7 +13817,7 @@ async def btc_5m_late_loop() -> None:
     )
 
     while True:
-        _tick_start = time.monotonic()
+        _tick_start = _monotonic()
         try:
 
             # ── 1. Compute market timing ──────────────────────────────────────
@@ -13957,7 +13957,7 @@ async def btc_5m_late_loop() -> None:
                 health_state = "READY"
 
             # ── 6. BTC5M_HEALTH — every 10 s, unconditionally ─────────────────
-            _mono_now = time.monotonic()
+            _mono_now = _monotonic()
             _loop_lag_ms = round((_mono_now - _tick_start) * 1000, 1)
             _snapshot_age = round(_mono_now - _btc5m_late_snapshot_written_at, 1)
             if _mono_now - _btc5m_late_last_health_ts >= 10.0:
@@ -14008,7 +14008,7 @@ async def btc_5m_late_loop() -> None:
                         ),
                         timeout=10.0,
                     )
-                    _btc5m_late_snapshot_written_at = time.monotonic()
+                    _btc5m_late_snapshot_written_at = _monotonic()
                 except asyncio.TimeoutError:
                     logging.warning(
                         "BTC5M_STATUS_WRITE_TIMEOUT slug=%s "
@@ -14232,8 +14232,8 @@ async def btc_5m_late_loop() -> None:
                         ),
                         timeout=10.0,
                     )
-                    _btc5m_late_snapshot_written_at = time.monotonic()
-                    _btc5m_late_last_status_ts = time.monotonic()
+                    _btc5m_late_snapshot_written_at = _monotonic()
+                    _btc5m_late_last_status_ts = _monotonic()
                 except asyncio.TimeoutError:
                     pass  # non-critical; next tick will write snapshot
             else:
@@ -14254,7 +14254,7 @@ async def btc_5m_late_loop() -> None:
         _rem_bottom   = (_start_bottom + 300) - _now_bottom
         _in_eval_now  = BTC5M_LATE_ENTRY_CUTOFF_S < _rem_bottom <= 75
         _target_s     = 2.0 if _in_eval_now else 5.0
-        _elapsed_s    = time.monotonic() - _tick_start
+        _elapsed_s    = _monotonic() - _tick_start
         _sleep_s      = max(0.0, _target_s - _elapsed_s)
         await asyncio.sleep(_sleep_s)
 
