@@ -9117,8 +9117,11 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                     if not trade_row:
                         _ingest_normalize_drop += 1
                         continue
-                    upsert_market_cache(trade_row)
-                    if insert_wallet_trade_if_new(trade_row):
+                    # Use to_thread for sync Supabase calls so the event loop
+                    # remains responsive for the BTC5M loop during ingestion.
+                    await asyncio.to_thread(upsert_market_cache, trade_row)
+                    inserted = await asyncio.to_thread(insert_wallet_trade_if_new, trade_row)
+                    if inserted:
                         newly_inserted.append(trade_row)
                         total_new_trades += 1
                     else:
@@ -9716,7 +9719,8 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                             total_errors += 1
 
                 # ── Step 4: Update wallet metrics ─────────────────────────
-                update_wallet_metrics_for_address(wallet_address)
+                # Wrapped in to_thread so the BTC5M event loop is not blocked.
+                await asyncio.to_thread(update_wallet_metrics_for_address, wallet_address)
 
             except Exception:
                 logging.exception("COPY_WALLET_ERROR wallet=%s", wallet_label)
@@ -13604,6 +13608,31 @@ def _btc5m_late_fetch_market_data_sync(slug: str) -> dict | None:
     except Exception:
         logging.exception("BTC5M_LATE_MARKET_FETCH_FAIL slug=%s", slug)
         return None
+
+
+def _btc5m_late_has_any_position_for_market_sync(market_slug: str) -> bool:
+    """
+    Return True if any btc_5m_late paper_position exists for this slug,
+    regardless of OPEN or settled status.  Used to enforce the one-trade-per-market
+    rule without blocking entry into future markets.
+    Fail-safe: returns True (assume exists) on DB error.
+    """
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("id")
+            .eq("bot_id", BTC5M_LATE_BOT_ID)
+            .eq("market_slug", market_slug)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        logging.exception(
+            "BTC5M_SIMPLE_DUP_CHECK_FAIL slug=%s — assuming traded for safety",
+            market_slug,
+        )
+        return True  # fail-safe
 
 
 def _btc5m_late_get_today_stats_sync() -> dict:
