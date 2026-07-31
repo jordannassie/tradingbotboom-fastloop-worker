@@ -13437,6 +13437,20 @@ def _btc5m_late_fetch_market_data_sync(slug: str) -> dict | None:
         prices   = m.get("outcomePrices") or []
         outcomes = m.get("outcomes") or []
 
+        # Gamma markets endpoint may return outcomePrices and outcomes as
+        # JSON-encoded strings (e.g. '["0.315","0.685"]') rather than parsed
+        # arrays.  Normalise both fields before indexing.
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except (json.JSONDecodeError, ValueError):
+                prices = []
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except (json.JSONDecodeError, ValueError):
+                outcomes = []
+
         # Gamma returns outcomes=["Up","Down"] and outcomePrices=[up_p, down_p]
         try:
             up_idx   = outcomes.index("Up")
@@ -13463,16 +13477,23 @@ def _btc5m_late_get_today_stats_sync() -> dict:
     """
     Return today's trade count, wins, losses, and PnL for bot_id='btc_5m_late'.
 
-    Queries paper_positions for rows with today's UTC date and status='CLOSED'.
+    Queries paper_positions where start_ts >= today UTC midnight.
+    (Uses start_ts instead of created_at because paper_positions may not
+    expose created_at via the REST API.)
     Returns safe zeros on any DB error.
     """
     try:
-        today_start_iso = utc_now_iso()[:10] + "T00:00:00"   # "2026-07-31T00:00:00"
+        # Compute today's UTC midnight as a Unix timestamp.
+        import datetime as _dt
+        today_midnight_dt = _dt.datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_midnight_ts = int(today_midnight_dt.timestamp())
         resp = (
             supabase.table("paper_positions")
             .select("pnl_usd, status")
             .eq("bot_id", BTC5M_LATE_BOT_ID)
-            .gte("created_at", today_start_iso)
+            .gte("start_ts", today_midnight_ts)
             .execute()
         )
         rows = resp.data or []
@@ -13750,14 +13771,21 @@ async def btc_5m_late_loop() -> None:
                         old_slug or "NONE", slug, now_int,
                     )
                 _btc5m_late_last_slug = slug
+            else:
+                # Slug unchanged — no separate rotation fetch needed.
+                _new_market_check = None
 
             # ── 3. Fetch price data + market prices (ALWAYS) ──────────────────
             ref_price, btc_price, momentum = await asyncio.to_thread(
                 _btc5m_late_fetch_data_sync, start_ts
             )
-            market_data = await asyncio.to_thread(
-                _btc5m_late_fetch_market_data_sync, slug
-            )
+            # Reuse rotation-check result if it returned data (saves one Gamma call).
+            if _new_market_check is not None:
+                market_data = _new_market_check
+            else:
+                market_data = await asyncio.to_thread(
+                    _btc5m_late_fetch_market_data_sync, slug
+                )
             up_ask   = market_data.get("up_price")  if market_data else None
             down_ask = market_data.get("down_price") if market_data else None
 
