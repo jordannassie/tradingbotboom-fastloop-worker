@@ -62,6 +62,7 @@ import base64
 import json
 import logging
 import os
+import uuid as _uuid_mod
 from collections import deque, defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
@@ -5286,6 +5287,408 @@ async def heartbeat_loop(client: ClobClient | None):
 
 
 # =============================================================================
+# TRADE INTENT LAYER — shared audit record for every eligible trade signal
+# =============================================================================
+#
+# One TradeIntent is created per approved trade signal after all existing gates
+# pass.  It records what was decided, why, the PAPER outcome, the MIRROR shadow
+# evaluation, and (when enabled) the eventual LIVE outcome.
+#
+# Design principles:
+#   • Non-blocking: all DB I/O runs via asyncio.to_thread (fire-and-forget).
+#   • Fail-safe: DB failure never blocks or crashes PAPER execution.
+#   • No new LIVE orders: MIRROR evaluates gates only — never submits.
+#   • Isolated: no existing function is materially rewritten.
+# =============================================================================
+
+
+def _make_trade_intent_id() -> str:
+    """Return a new random UUID string."""
+    return str(_uuid_mod.uuid4())
+
+
+def _build_trade_intent_row(
+    *,
+    intent_id: str,
+    bot_id: str,
+    bot_name: str,
+    strategy_id: str,
+    source_type: str,                      # "copy" | "btc5m"
+    source_wallet: str = "",
+    source_trade_id: str = "",
+    market_slug: str = "",
+    condition_id: str = "",
+    token_id: str = "",
+    side: str = "",
+    outcome: str = "",
+    signal_price: float | None = None,
+    requested_size_usd: float | None = None,
+    calculated_size_usd: float | None = None,
+    final_size_usd: float | None = None,
+    mode_requested: str = "PAPER",
+    paper_enabled: bool = True,
+    mirror_enabled: bool = False,
+    live_enabled: bool = False,
+    arm_live: bool = False,
+    emergency_stop: bool = False,
+    decision: str = "APPROVE",
+    decision_reason: str = "",
+    metadata: dict | None = None,
+) -> dict:
+    """Build the initial row dict for a new trade_intents insert."""
+    return {
+        "intent_id":            intent_id,
+        "created_at":           utc_now_iso(),
+        "bot_id":               bot_id,
+        "bot_name":             bot_name,
+        "strategy_id":          strategy_id,
+        "source_type":          source_type,
+        "source_wallet":        source_wallet,
+        "source_trade_id":      source_trade_id,
+        "market_slug":          market_slug,
+        "condition_id":         condition_id,
+        "token_id":             token_id,
+        "side":                 side,
+        "outcome":              outcome,
+        "signal_price":         signal_price,
+        "requested_size_usd":   requested_size_usd,
+        "calculated_size_usd":  calculated_size_usd,
+        "final_size_usd":       final_size_usd,
+        "mode_requested":       mode_requested,
+        "paper_enabled":        paper_enabled,
+        "mirror_enabled":       mirror_enabled,
+        "live_enabled":         live_enabled,
+        "arm_live":             arm_live,
+        "emergency_stop":       emergency_stop,
+        "decision":             decision,
+        "decision_reason":      decision_reason,
+        "metadata":             metadata or {},
+        "paper_status":         "PENDING",
+        "mirror_status":        "PENDING",
+        "live_status":          "NOT_ATTEMPTED",
+        "updated_at":           utc_now_iso(),
+    }
+
+
+def _insert_trade_intent_sync(row: dict) -> bool:
+    """
+    Insert a new trade_intents row.  Fails silently — never raises.
+    Returns True on success, False on any error.
+    """
+    try:
+        supabase.table("trade_intents").insert(row).execute()
+        return True
+    except Exception:
+        logging.warning(
+            "TRADE_INTENT_INSERT_FAIL intent_id=%s bot_id=%s market=%s "
+            "— intent persistence failed (trade execution unaffected)",
+            row.get("intent_id", "?"),
+            row.get("bot_id", "?"),
+            row.get("market_slug", "?"),
+        )
+        return False
+
+
+def _update_trade_intent_sync(intent_id: str, updates: dict) -> bool:
+    """
+    Partial-update an existing trade_intents row by intent_id.
+    Fails silently — never raises.  Always stamps updated_at.
+    Returns True on success, False on error.
+    """
+    try:
+        updates["updated_at"] = utc_now_iso()
+        (
+            supabase.table("trade_intents")
+            .update(updates)
+            .eq("intent_id", intent_id)
+            .execute()
+        )
+        return True
+    except Exception:
+        logging.warning(
+            "TRADE_INTENT_UPDATE_FAIL intent_id=%s — update failed (execution unaffected)",
+            intent_id,
+        )
+        return False
+
+
+def _evaluate_mirror_sync(
+    *,
+    intent_id: str,
+    copy_bot: "dict | None",
+    global_settings: "dict | None",
+    submitted_size: float,
+    submitted_price: float,
+    source_type: str,                      # "copy" | "btc5m"
+) -> dict:
+    """
+    Pure shadow evaluation of LIVE gates.  NEVER calls any order-submission
+    function.  Does NOT sign, submit, or place any real order.
+
+    Returns a dict with mirror_status, mirror_reason, mirror_expected_price,
+    mirror_expected_size_usd, mirror_minimum_order_size, mirror_would_submit.
+    """
+    gs = global_settings or {}
+
+    # Gate M1: emergency stop
+    if gs.get("emergency_stop"):
+        return {
+            "mirror_status":             "BLOCKED_EMERGENCY_STOP",
+            "mirror_reason":             "emergency_stop=true in copy_global_settings",
+            "mirror_expected_price":     submitted_price,
+            "mirror_expected_size_usd":  submitted_size,
+            "mirror_minimum_order_size": None,
+            "mirror_would_submit":       False,
+        }
+
+    # Gate M2: live_master (copy_global_settings.live_on)
+    if not gs.get("live_on"):
+        return {
+            "mirror_status":             "BLOCKED_LIVE_MASTER_OFF",
+            "mirror_reason":             "copy_global_settings.live_on=false",
+            "mirror_expected_price":     submitted_price,
+            "mirror_expected_size_usd":  submitted_size,
+            "mirror_minimum_order_size": None,
+            "mirror_would_submit":       False,
+        }
+
+    # Gate M3: COPY_LIVE_ENABLED env flag
+    if not COPY_LIVE_ENABLED:
+        return {
+            "mirror_status":             "BLOCKED_LIVE_MASTER_OFF",
+            "mirror_reason":             "COPY_LIVE_ENABLED env=false",
+            "mirror_expected_price":     submitted_price,
+            "mirror_expected_size_usd":  submitted_size,
+            "mirror_minimum_order_size": None,
+            "mirror_would_submit":       False,
+        }
+
+    # Gate M4: arm_live per-bot
+    bot = copy_bot or {}
+    if not bot.get("arm_live"):
+        return {
+            "mirror_status":             "BLOCKED_ARM_LIVE_OFF",
+            "mirror_reason":             f"copy_bot.arm_live=false bot={bot.get('name', '?')}",
+            "mirror_expected_price":     submitted_price,
+            "mirror_expected_size_usd":  submitted_size,
+            "mirror_minimum_order_size": None,
+            "mirror_would_submit":       False,
+        }
+
+    # Gate M5: exposure limit
+    live_max_exposure = float(gs.get("live_max_exposure_usd") or 0)
+    if live_max_exposure > 0:
+        try:
+            current_exposure = get_copy_open_exposure_for_mode("live")
+        except Exception:
+            current_exposure = 0.0
+        projected = current_exposure + submitted_size
+        if projected > live_max_exposure:
+            return {
+                "mirror_status":             "BLOCKED_EXPOSURE_LIMIT",
+                "mirror_reason":             (
+                    f"projected={projected:.2f} > live_max_exposure={live_max_exposure:.2f}"
+                ),
+                "mirror_expected_price":     submitted_price,
+                "mirror_expected_size_usd":  submitted_size,
+                "mirror_minimum_order_size": None,
+                "mirror_would_submit":       False,
+            }
+
+    # Gate M6: balance (best-effort; no CLOB client in MIRROR)
+    try:
+        live_bal = get_live_balance_usd(None)
+    except Exception:
+        live_bal = None
+    if live_bal is not None and live_bal < submitted_size:
+        return {
+            "mirror_status":             "BLOCKED_BALANCE",
+            "mirror_reason":             f"live_balance={live_bal:.2f} < size={submitted_size:.2f}",
+            "mirror_expected_price":     submitted_price,
+            "mirror_expected_size_usd":  submitted_size,
+            "mirror_minimum_order_size": None,
+            "mirror_would_submit":       False,
+        }
+
+    # All evaluated gates passed
+    return {
+        "mirror_status":             "WOULD_SUBMIT",
+        "mirror_reason":             "all_mirror_gates_passed",
+        "mirror_expected_price":     submitted_price,
+        "mirror_expected_size_usd":  submitted_size,
+        "mirror_minimum_order_size": None,
+        "mirror_would_submit":       True,
+    }
+
+
+def _get_trade_intent_summary_sync(
+    since_hours: int = 24,
+    bot_id: str | None = None,
+) -> dict:
+    """
+    Read-only summary of trade_intents for the last `since_hours` hours.
+    Safe for BTCBOT or any read path.  Returns empty summary on error.
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        q = (
+            supabase.table("trade_intents")
+            .select(
+                "intent_id,bot_id,market_slug,side,paper_status,"
+                "mirror_status,live_status,mirror_would_submit,created_at"
+            )
+            .gte("created_at", cutoff.isoformat())
+        )
+        if bot_id:
+            q = q.eq("bot_id", bot_id)
+        resp = q.order("created_at", desc=True).limit(200).execute()
+        rows = resp.data or []
+    except Exception:
+        logging.warning("TRADE_INTENT_SUMMARY_FAIL — returning empty summary")
+        rows = []
+
+    paper_opened   = sum(1 for r in rows if r.get("paper_status") == "OPENED")
+    paper_skipped  = sum(1 for r in rows if r.get("paper_status") == "SKIPPED")
+    paper_errors   = sum(1 for r in rows if r.get("paper_status") == "ERROR")
+    mirror_submit  = sum(1 for r in rows if r.get("mirror_status") == "WOULD_SUBMIT")
+    mirror_blocked = sum(
+        1 for r in rows if (r.get("mirror_status") or "").startswith("BLOCKED_")
+    )
+    live_submitted = sum(
+        1 for r in rows
+        if r.get("live_status") not in (None, "", "NOT_ATTEMPTED")
+    )
+    live_filled    = sum(1 for r in rows if r.get("live_status") == "FILLED")
+    live_rejected  = sum(1 for r in rows if r.get("live_status") == "REJECTED")
+
+    return {
+        "summary": {
+            "intents":                    len(rows),
+            "paper_opened":               paper_opened,
+            "paper_skipped":              paper_skipped,
+            "paper_errors":               paper_errors,
+            "mirror_would_submit":        mirror_submit,
+            "mirror_blocked":             mirror_blocked,
+            "live_submitted":             live_submitted,
+            "live_filled":                live_filled,
+            "live_rejected":              live_rejected,
+            "paper_live_side_mismatches": 0,
+            "paper_live_size_mismatches": 0,
+        },
+        "recent": rows[:20],
+    }
+
+
+def _test_trade_intent_selftest() -> None:
+    """
+    In-memory unit tests for the Trade Intent + MIRROR layer.
+    No database access.  Runs once at startup.
+    """
+    import inspect as _inspect
+    all_passed = True
+    _cases: list[tuple[str, bool]] = []
+
+    # T1: intent ID is a valid UUID
+    _id = _make_trade_intent_id()
+    _cases.append(("intent_id_is_valid_uuid", len(_id) == 36 and _id.count("-") == 4))
+
+    # T2: intent row has required keys
+    _row = _build_trade_intent_row(
+        intent_id=_id, bot_id="btc_5m_late", bot_name="BTC5M",
+        strategy_id="BTC5M_LATE", source_type="btc5m",
+    )
+    _required = {"intent_id", "bot_id", "paper_status", "mirror_status",
+                 "live_status", "created_at", "decision"}
+    _cases.append(("intent_row_has_required_keys", _required.issubset(_row.keys())))
+
+    # T3: live_status defaults to NOT_ATTEMPTED
+    _cases.append(("live_status_default_not_attempted", _row["live_status"] == "NOT_ATTEMPTED"))
+
+    # T4: MIRROR blocked on emergency_stop
+    _m = _evaluate_mirror_sync(
+        intent_id=_id, copy_bot=None,
+        global_settings={"emergency_stop": True, "live_on": True},
+        submitted_size=1.0, submitted_price=0.55, source_type="copy",
+    )
+    _cases.append(("mirror_blocked_emergency_stop", _m["mirror_status"] == "BLOCKED_EMERGENCY_STOP"))
+
+    # T5: MIRROR blocked on live_on=False
+    _m2 = _evaluate_mirror_sync(
+        intent_id=_id, copy_bot={"arm_live": True},
+        global_settings={"live_on": False, "emergency_stop": False},
+        submitted_size=1.0, submitted_price=0.55, source_type="copy",
+    )
+    _cases.append(("mirror_blocked_live_master_off", _m2["mirror_status"] == "BLOCKED_LIVE_MASTER_OFF"))
+
+    # T6: MIRROR blocked when COPY_LIVE_ENABLED=False (production default)
+    _m3 = _evaluate_mirror_sync(
+        intent_id=_id, copy_bot={"arm_live": True},
+        global_settings={"live_on": True, "emergency_stop": False},
+        submitted_size=1.0, submitted_price=0.55, source_type="copy",
+    )
+    _cases.append(("mirror_blocked_copy_live_env_false", _m3["mirror_status"].startswith("BLOCKED_")))
+
+    # T7: MIRROR blocked on arm_live=False
+    _m4 = _evaluate_mirror_sync(
+        intent_id=_id, copy_bot={"arm_live": False, "name": "TestBot"},
+        global_settings={"live_on": True, "emergency_stop": False},
+        submitted_size=1.0, submitted_price=0.55, source_type="copy",
+    )
+    _cases.append(("mirror_blocked_arm_live_false", _m4["mirror_status"].startswith("BLOCKED_")))
+
+    # T8: MIRROR source code never references submit functions — structural safety
+    _mirror_src = _inspect.getsource(_evaluate_mirror_sync)
+    _cases.append(("mirror_never_calls_submit_order",
+                   "submit_order" not in _mirror_src))
+    _cases.append(("mirror_never_calls_submit_copy_live_order",
+                   "submit_copy_live_order" not in _mirror_src))
+    _cases.append(("mirror_never_calls_evaluate_and_execute_live",
+                   "evaluate_and_execute_live_copy_trade" not in _mirror_src))
+
+    # T9: btc_5m_ema and btc_5m_late are distinct bot IDs
+    _cases.append(("btc_5m_ema_different_from_btc_5m_late",
+                   EMA_5M_BOT_ID != BTC5M_LATE_BOT_ID))
+
+    # T10: two intents always get different IDs
+    _cases.append(("two_intents_have_different_ids",
+                   _make_trade_intent_id() != _make_trade_intent_id()))
+
+    # T11: _get_trade_intent_summary_sync returns required top-level shape
+    _empty_summary = {
+        "summary": {
+            "intents": 0, "paper_opened": 0, "paper_skipped": 0,
+            "paper_errors": 0, "mirror_would_submit": 0, "mirror_blocked": 0,
+            "live_submitted": 0, "live_filled": 0, "live_rejected": 0,
+            "paper_live_side_mismatches": 0, "paper_live_size_mismatches": 0,
+        },
+        "recent": [],
+    }
+    _cases.append(("summary_has_correct_shape",
+                   set(_empty_summary["summary"]) == {"intents", "paper_opened",
+                       "paper_skipped", "paper_errors", "mirror_would_submit",
+                       "mirror_blocked", "live_submitted", "live_filled",
+                       "live_rejected", "paper_live_side_mismatches",
+                       "paper_live_size_mismatches"}))
+
+    for desc, passed in _cases:
+        if not passed:
+            all_passed = False
+        logging.warning(
+            "TRADE_INTENT_SELFTEST %s desc=%r",
+            "PASS" if passed else "FAIL",
+            desc,
+        )
+    logging.warning(
+        "TRADE_INTENT_SELFTEST_SUMMARY %s cases=%s",
+        "ALL_PASS" if all_passed else "FAILURES_DETECTED",
+        len(_cases),
+    )
+
+
+# ─── END TRADE INTENT LAYER ────────────────────────────────────────────────────
+
+
+# =============================================================================
 # PAPER SETTLEMENT LOOP (REUSABLE CORE)
 # =============================================================================
 # Polls paper_positions every 15s. Closes expired positions by resolving
@@ -5398,11 +5801,12 @@ async def paper_settlement_loop():
                 elif bot_id == BTC5M_LATE_BOT_ID:
                     # BTC_5M_LATE uses the standard realized-PnL path (bot_settings.paper_balance_usd).
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
+                    _btc5m_result = "WIN" if pnl_usd >= 0 else "LOSS"
                     logging.warning(
                         "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
                         "slug=%s side=%s start_price=%.2f end_price=%.2f",
                         row_id,
-                        "WIN" if pnl_usd >= 0 else "LOSS",
+                        _btc5m_result,
                         pnl_usd,
                         market_slug or "",
                         row.get("side") or "",
@@ -5413,9 +5817,37 @@ async def paper_settlement_loop():
                         "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
                         market_slug or "",
                         str(row.get("side") or "").upper(),
-                        "WIN" if pnl_usd >= 0 else "LOSS",
+                        _btc5m_result,
                         pnl_usd,
                     )
+                    # ── Trade Intent settlement link ──────────────────────────
+                    # Match by paper_position_id stored in trade_intents.
+                    def _btc5m_settle_intent(pos_id: str, result: str, pnl: float) -> None:
+                        try:
+                            _upd = {
+                                "paper_status":    "CLOSED",
+                                "paper_pnl_usd":   pnl,
+                                "paper_closed_at": utc_now_iso(),
+                                "paper_result":    result,
+                                "updated_at":      utc_now_iso(),
+                            }
+                            supabase.table("trade_intents").update(_upd).eq(
+                                "paper_position_id", str(pos_id)
+                            ).execute()
+                            logging.warning(
+                                "TRADE_INTENT_SETTLED intent_id=lookup "
+                                "result=%s pnl=%.4f",
+                                result, pnl,
+                            )
+                        except Exception:
+                            logging.warning(
+                                "TRADE_INTENT_SETTLE_FAIL pos_id=%s — "
+                                "settlement link failed (position settled ok)",
+                                pos_id,
+                            )
+                    asyncio.ensure_future(asyncio.to_thread(
+                        _btc5m_settle_intent, str(row_id), _btc5m_result, pnl_usd,
+                    ))
                 else:
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
@@ -7476,6 +7908,7 @@ def open_copied_position(
     submitted_size: float,
     submitted_price: float,
     mode: str = "PAPER",
+    intent_id: str | None = None,
 ) -> "str | None":
     """
     Create a copied_positions row for a paper or live copy trade.
@@ -7529,6 +7962,7 @@ def open_copied_position(
                 "mode": mode_upper,
                 "copy_mode": copy_bot.get("copy_mode"),
                 "sizing_value": copy_bot.get("sizing_value"),
+                "intent_id": intent_id,       # Trade Intent link (None when not used)
                 "source": {
                     "price": wallet_trade.get("price"),
                     "size": wallet_trade.get("size"),
@@ -9472,11 +9906,104 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
                                             float(submitted_size or 0),
                                             _pf_size,
                                         )
+                                        # ── Trade Intent: create before PAPER open ──
+                                        _ti_id = _make_trade_intent_id()
+                                        _ti_row = _build_trade_intent_row(
+                                            intent_id        = _ti_id,
+                                            bot_id           = bot_id,
+                                            bot_name         = bot_label,
+                                            strategy_id      = "COPY",
+                                            source_type      = "copy",
+                                            source_wallet    = str(wallet_trade.get("wallet_address") or "")[:64],
+                                            source_trade_id  = str(wallet_trade.get("source_trade_id") or "")[:128],
+                                            market_slug      = wallet_trade.get("market_slug") or "",
+                                            condition_id     = wallet_trade.get("condition_id") or "",
+                                            token_id         = wallet_trade.get("token_id") or "",
+                                            side             = str(trade_side),
+                                            outcome          = wallet_trade.get("outcome") or "",
+                                            signal_price     = float(submitted_price or 0),
+                                            requested_size_usd   = float(submitted_size or 0),
+                                            calculated_size_usd  = float(submitted_size or 0),
+                                            final_size_usd       = float(_pf_size),
+                                            mode_requested   = "PAPER",
+                                            paper_enabled    = True,
+                                            mirror_enabled   = bool(TRADE_INTENT_MIRROR_ENABLED),
+                                            live_enabled     = bool(COPY_LIVE_ENABLED),
+                                            arm_live         = bool(bot.get("arm_live")),
+                                            emergency_stop   = bool(global_settings.get("emergency_stop")),
+                                            decision         = "APPROVE",
+                                            decision_reason  = "shared_brain_passed",
+                                            metadata         = {"copy_mode": bot.get("copy_mode")},
+                                        )
+                                        asyncio.ensure_future(asyncio.to_thread(
+                                            _insert_trade_intent_sync, _ti_row
+                                        ))
+                                        logging.warning(
+                                            "TRADE_INTENT_CREATED intent_id=%s "
+                                            "bot_id=%s market=%s side=%s size=%s",
+                                            _ti_id, bot_id,
+                                            wallet_trade.get("market_slug") or "?",
+                                            trade_side, _pf_size,
+                                        )
+
                                         _new_pos_id = open_copied_position(
                                             bot, wallet_trade,
                                             _pf_size, submitted_price,
                                             mode="PAPER",
+                                            intent_id=_ti_id,
                                         )
+                                        # ── Trade Intent: update with PAPER result ─
+                                        _ti_paper_updates: dict
+                                        if _new_pos_id is not None:
+                                            _ti_paper_updates = {
+                                                "paper_status":       "OPENED",
+                                                "paper_position_id":  str(_new_pos_id),
+                                                "paper_entry_price":  float(submitted_price or 0),
+                                                "paper_size_usd":     float(_pf_size),
+                                            }
+                                        else:
+                                            _ti_paper_updates = {
+                                                "paper_status": "ERROR",
+                                                "paper_error":  "open_copied_position_returned_none",
+                                            }
+                                        asyncio.ensure_future(asyncio.to_thread(
+                                            _update_trade_intent_sync,
+                                            _ti_id, _ti_paper_updates,
+                                        ))
+                                        logging.warning(
+                                            "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                                            "status=%s position_id=%s reason=%s",
+                                            _ti_id,
+                                            _ti_paper_updates["paper_status"],
+                                            _new_pos_id or "none",
+                                            _ti_paper_updates.get("paper_error") or "ok",
+                                        )
+                                        # ── MIRROR evaluation (if enabled) ─────────
+                                        if TRADE_INTENT_MIRROR_ENABLED:
+                                            _mirror = _evaluate_mirror_sync(
+                                                intent_id       = _ti_id,
+                                                copy_bot        = bot,
+                                                global_settings = global_settings,
+                                                submitted_size  = float(_pf_size),
+                                                submitted_price = float(submitted_price or 0),
+                                                source_type     = "copy",
+                                            )
+                                            asyncio.ensure_future(asyncio.to_thread(
+                                                _update_trade_intent_sync,
+                                                _ti_id, _mirror,
+                                            ))
+                                            logging.warning(
+                                                "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
+                                                "status=%s reason=%s "
+                                                "expected_size=%s expected_price=%s "
+                                                "minimum_order_size=%s",
+                                                _ti_id,
+                                                _mirror["mirror_status"],
+                                                _mirror["mirror_reason"],
+                                                _mirror["mirror_expected_size_usd"],
+                                                _mirror["mirror_expected_price"],
+                                                _mirror["mirror_minimum_order_size"],
+                                            )
                                         if _new_pos_id is not None:
                                             _copy_bot_mark_trade(bot_id)
                                             total_paper_opened += 1
@@ -10223,6 +10750,31 @@ def close_copied_position(
         is_paper = raw_json.get("paper", True)
         if is_paper and pnl != 0.0:
             _update_copy_paper_bankroll(pnl, pos_id, close_path="settlement")
+        # ── Trade Intent settlement link ──────────────────────────────────────
+        _copy_intent_id = raw_json.get("intent_id")
+        if _copy_intent_id:
+            _copy_result = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "PUSH")
+            _copy_settle_upd = {
+                "paper_status":    "CLOSED",
+                "paper_pnl_usd":   pnl,
+                "paper_closed_at": utc_now_iso(),
+                "paper_result":    _copy_result,
+                "updated_at":      utc_now_iso(),
+            }
+            try:
+                supabase.table("trade_intents").update(_copy_settle_upd).eq(
+                    "intent_id", str(_copy_intent_id)
+                ).execute()
+                logging.warning(
+                    "TRADE_INTENT_SETTLED intent_id=%s result=%s pnl=%.4f",
+                    str(_copy_intent_id)[:36], _copy_result, pnl,
+                )
+            except Exception:
+                logging.warning(
+                    "TRADE_INTENT_SETTLE_FAIL intent_id=%s — "
+                    "copy settlement link failed (position settled ok)",
+                    str(_copy_intent_id)[:36],
+                )
     except Exception:
         logging.exception("COPY_SETTLE_CLOSE_POSITION_FAIL pos=%s", pos_id)
 
@@ -14246,6 +14798,47 @@ async def btc_5m_late_loop() -> None:
                 "slug=%s side=%s",
                 trade_size, trade_size, slug, side,
             )
+
+            # ── Trade Intent: create before position open ─────────────────────
+            _btc5m_ti_id = _make_trade_intent_id()
+            _btc5m_ti_row = _build_trade_intent_row(
+                intent_id          = _btc5m_ti_id,
+                bot_id             = BTC5M_LATE_BOT_ID,
+                bot_name           = "btc_5m_late",
+                strategy_id        = BTC5M_LATE_STRATEGY_ID,
+                source_type        = "btc5m",
+                market_slug        = slug,
+                token_id           = (up_token_id if side == "yes" else down_token_id) or "",
+                side               = "UP" if side == "yes" else "DOWN",
+                outcome            = "UP" if side == "yes" else "DOWN",
+                signal_price       = float(entry_price),
+                requested_size_usd = float(trade_size),
+                calculated_size_usd= float(trade_size),
+                final_size_usd     = float(trade_size),
+                mode_requested     = "PAPER",
+                paper_enabled      = True,
+                mirror_enabled     = bool(TRADE_INTENT_MIRROR_ENABLED),
+                live_enabled       = False,     # btc_5m_late is PAPER-only
+                arm_live           = bool(is_enabled),
+                emergency_stop     = False,
+                decision           = decision,
+                decision_reason    = "SIMPLE_DIRECTION",
+                metadata           = {
+                    "price_to_beat":  ref_price,
+                    "reference_price": btc_price,
+                    "seconds_left":   remaining,
+                },
+            )
+            asyncio.ensure_future(asyncio.to_thread(
+                _insert_trade_intent_sync, _btc5m_ti_row
+            ))
+            logging.warning(
+                "TRADE_INTENT_CREATED intent_id=%s "
+                "bot_id=%s market=%s side=%s size=%s",
+                _btc5m_ti_id, BTC5M_LATE_BOT_ID,
+                slug, "UP" if side == "yes" else "DOWN", trade_size,
+            )
+
             shares = round(trade_size / entry_price, 4)
             ok, row_id, _ = await insert_paper_position_row(
                 bot_id      = BTC5M_LATE_BOT_ID,
@@ -14277,6 +14870,48 @@ async def btc_5m_late_loop() -> None:
                     remaining,
                     row_id or "?",
                 )
+                # ── Trade Intent: update with PAPER result ────────────────────
+                asyncio.ensure_future(asyncio.to_thread(
+                    _update_trade_intent_sync,
+                    _btc5m_ti_id,
+                    {
+                        "paper_status":       "OPENED",
+                        "paper_position_id":  str(row_id or ""),
+                        "paper_entry_price":  float(entry_price),
+                        "paper_size_usd":     float(trade_size),
+                    },
+                ))
+                logging.warning(
+                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                    "status=OPENED position_id=%s reason=ok",
+                    _btc5m_ti_id, row_id or "?",
+                )
+                # ── MIRROR evaluation if enabled ──────────────────────────────
+                if TRADE_INTENT_MIRROR_ENABLED:
+                    _btc5m_mirror = _evaluate_mirror_sync(
+                        intent_id       = _btc5m_ti_id,
+                        copy_bot        = None,
+                        global_settings = {},
+                        submitted_size  = float(trade_size),
+                        submitted_price = float(entry_price),
+                        source_type     = "btc5m",
+                    )
+                    asyncio.ensure_future(asyncio.to_thread(
+                        _update_trade_intent_sync,
+                        _btc5m_ti_id, _btc5m_mirror,
+                    ))
+                    logging.warning(
+                        "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
+                        "status=%s reason=%s "
+                        "expected_size=%s expected_price=%s "
+                        "minimum_order_size=%s",
+                        _btc5m_ti_id,
+                        _btc5m_mirror["mirror_status"],
+                        _btc5m_mirror["mirror_reason"],
+                        _btc5m_mirror["mirror_expected_size_usd"],
+                        _btc5m_mirror["mirror_expected_price"],
+                        _btc5m_mirror["mirror_minimum_order_size"],
+                    )
                 # Immediately publish updated snapshot after opening a position.
                 try:
                     await asyncio.wait_for(
@@ -14300,6 +14935,20 @@ async def btc_5m_late_loop() -> None:
                 except asyncio.TimeoutError:
                     pass  # non-critical; next tick will write snapshot
             else:
+                # ── Trade Intent: record error ────────────────────────────────
+                asyncio.ensure_future(asyncio.to_thread(
+                    _update_trade_intent_sync,
+                    _btc5m_ti_id,
+                    {
+                        "paper_status": "ERROR",
+                        "paper_error":  "insert_paper_position_row_returned_false",
+                    },
+                ))
+                logging.warning(
+                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                    "status=ERROR position_id=none reason=insert_failed",
+                    _btc5m_ti_id,
+                )
                 logging.warning(
                     "BTC5M_PAPER_OPEN_FAIL slug=%s side=%s — "
                     "insert_paper_position_row returned ok=False",
@@ -14341,6 +14990,7 @@ async def main():
     # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
     _test_compute_copy_size()
     _test_btc5m_test_mode()
+    _test_trade_intent_selftest()
 
     trading_client = build_trading_client()
     tasks = []

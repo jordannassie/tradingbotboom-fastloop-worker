@@ -558,3 +558,12 @@ CLOSE_REASON_CLOSE_FAILED_FINAL   = "close_failed_final"
 #   )
 # ORDER BY table_name, column_name;
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ─── TRADE INTENT LAYER ───────────────────────────────────────────────────────
+# Controls optional MIRROR (shadow LIVE evaluation) for the shared Trade Intent.
+# Default: false.  Set TRADE_INTENT_MIRROR_ENABLED=true in Railway env to enable.
+# MIRROR never submits a real order — it evaluates LIVE gates only.
+TRADE_INTENT_MIRROR_ENABLED: bool = (
+    os.getenv("TRADE_INTENT_MIRROR_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes")
+)
