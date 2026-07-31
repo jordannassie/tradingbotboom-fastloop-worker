@@ -87,3 +87,39 @@ create index if not exists idx_candidate_wallets_score
 -- Index for quick address lookup (dedup check).
 create index if not exists idx_candidate_wallets_address
   on candidate_wallets (wallet_address);
+
+-- ── Trader rotation snapshots ──────────────────────────────────────────────
+-- Stores the latest FastLoop rotation recommendations as a single stable JSON
+-- row so BTCBOT (and any dashboard) can read the current snapshot without
+-- re-computing it.
+--
+-- Written only by the FastLoop worker (publish_trader_rotation_snapshot).
+-- Read by BTCBOT and any dashboard client via snapshot_key = 'CURRENT'.
+--
+-- Isolated from all execution tables:
+--   - No foreign keys to copy_bots, tracked_wallets, copied_positions, or trades.
+--   - No triggers.
+--   - Upsert uses snapshot_key as the conflict target.
+--
+-- Columns:
+--   id              — stable UUID primary key
+--   snapshot_key    — 'CURRENT' (single stable row)
+--   recommendations — full rotation result as JSONB
+--   generated_at    — timestamp the recommendation was generated
+--   updated_at      — last upsert timestamp (auto-set by FastLoop)
+--   source          — always 'FASTLOOP'
+--   version         — incremented on each upsert for change tracking
+
+create table if not exists trader_rotation_snapshots (
+  id              uuid primary key default gen_random_uuid(),
+  snapshot_key    text unique not null,
+  recommendations jsonb not null,
+  generated_at    timestamptz not null,
+  updated_at      timestamptz not null default now(),
+  source          text not null default 'FASTLOOP',
+  version         integer not null default 1
+);
+
+-- Fast lookup index on the single stable key (also enforces uniqueness)
+create unique index if not exists idx_trader_rotation_snapshots_key
+  on trader_rotation_snapshots (snapshot_key);

@@ -12022,6 +12022,201 @@ def _verify_get_trader_rotation_recommendations() -> None:
     )
 
 
+# =============================================================================
+# TRADER ROTATION SNAPSHOT PUBLISHER
+# -----------------------------------------------------------------------------
+# publish_trader_rotation_snapshot() calls get_trader_rotation_recommendations()
+# (read-only) and upserts one row into trader_rotation_snapshots so BTCBOT and
+# any dashboard can read the current recommendations without recomputing them.
+#
+# trader_rotation_snapshot_loop() runs this on startup (after a 30 s delay)
+# and then every 6 hours.
+#
+# These functions must remain isolated from all trade-execution paths.
+# Failure is caught and logged — it must never crash the worker or affect
+# any bot state.
+# =============================================================================
+
+# Interval in seconds between snapshot publications (6 hours)
+_ROTATION_SNAPSHOT_INTERVAL: int = 6 * 3600
+# Short startup delay before the first publication (seconds)
+_ROTATION_SNAPSHOT_STARTUP_DELAY: int = 30
+
+
+def publish_trader_rotation_snapshot(max_paper_candidates: int = 10) -> dict:
+    """
+    Calls get_trader_rotation_recommendations(), validates the result,
+    and upserts one stable row (snapshot_key='CURRENT') into
+    trader_rotation_snapshots.
+
+    Does not modify copy_bots, tracked_wallets, copied_positions, wallet_trades,
+    or any execution table.  Does not call order-execution functions.
+
+    Returns a small status dict:
+      success      — bool
+      generated_at — ISO timestamp string (or None on failure)
+      summary      — dict with paper_test_count / keep_active_count / etc.
+    """
+    try:
+        # ── Step 1: generate recommendations (read-only) ──────────────────────
+        result = get_trader_rotation_recommendations(
+            max_paper_candidates=max_paper_candidates
+        )
+
+        # ── Step 2: validate structure ────────────────────────────────────────
+        required_keys = {
+            "generated_at", "paper_test", "keep_active",
+            "exit_monitor_only", "off", "summary",
+        }
+        missing = required_keys - set(result.keys())
+        if missing:
+            raise ValueError(
+                f"Rotation result missing keys: {missing}"
+            )
+
+        summary      = result["summary"]
+        generated_at = result["generated_at"]
+
+        # ── Step 3: read current version for monotonic increment ──────────────
+        current_version = 1
+        try:
+            ver_resp = (
+                supabase.table("trader_rotation_snapshots")
+                .select("version")
+                .eq("snapshot_key", "CURRENT")
+                .execute()
+            )
+            if ver_resp.data:
+                current_version = int(
+                    ver_resp.data[0].get("version") or 1
+                ) + 1
+        except Exception:
+            pass  # safe default: version stays 1
+
+        # ── Step 4: upsert the CURRENT snapshot row ───────────────────────────
+        payload = {
+            "snapshot_key":    "CURRENT",
+            "recommendations": result,
+            "generated_at":    generated_at,
+            "updated_at":      utc_now_iso(),
+            "source":          "FASTLOOP",
+            "version":         current_version,
+        }
+        supabase.table("trader_rotation_snapshots").upsert(
+            payload, on_conflict="snapshot_key"
+        ).execute()
+
+        return {
+            "success":      True,
+            "generated_at": generated_at,
+            "summary":      summary,
+        }
+
+    except Exception as exc:
+        logging.exception(
+            "TRADER_ROTATION_SNAPSHOT_ERROR error=%s", str(exc)[:120]
+        )
+        return {"success": False, "generated_at": None, "summary": {}}
+
+
+async def trader_rotation_snapshot_loop() -> None:
+    """
+    Background loop — publishes rotation recommendations to
+    trader_rotation_snapshots (snapshot_key='CURRENT') on a fixed schedule.
+
+    Schedule:
+      - First run: _ROTATION_SNAPSHOT_STARTUP_DELAY seconds after worker start
+      - Repeat:    every _ROTATION_SNAPSHOT_INTERVAL seconds (default 6 hours)
+
+    Safety guarantees:
+      - Never calls trade execution.
+      - All exceptions are caught and logged; the loop always continues.
+      - Wrapped by _run_forever in main() so any unhandled crash restarts.
+      - Worker startup and all trading behavior are unaffected if this fails.
+
+    Logs (at WARNING level so they are always visible in Railway):
+      TRADER_ROTATION_SNAPSHOT_OK   — on success; summary counts only
+      TRADER_ROTATION_SNAPSHOT_ERROR — on any failure; safe error summary only
+    """
+    # Short delay lets the worker fully boot before the first heavy read-pass
+    await asyncio.sleep(_ROTATION_SNAPSHOT_STARTUP_DELAY)
+
+    while True:
+        try:
+            status = publish_trader_rotation_snapshot(max_paper_candidates=10)
+            if status.get("success"):
+                s = status.get("summary") or {}
+                logging.warning(
+                    "TRADER_ROTATION_SNAPSHOT_OK "
+                    "paper_test=%s keep=%s exit_monitor=%s off=%s",
+                    s.get("paper_test_count", 0),
+                    s.get("keep_active_count", 0),
+                    s.get("exit_monitor_only_count", 0),
+                    s.get("off_count", 0),
+                )
+            else:
+                logging.warning(
+                    "TRADER_ROTATION_SNAPSHOT_ERROR "
+                    "error=publish_returned_failure"
+                )
+        except Exception as exc:
+            logging.exception(
+                "TRADER_ROTATION_SNAPSHOT_ERROR error=%s", str(exc)[:120]
+            )
+
+        await asyncio.sleep(_ROTATION_SNAPSHOT_INTERVAL)
+
+
+def _verify_publish_trader_rotation_snapshot() -> None:
+    """
+    Developer verification helper — non-executing in production.
+
+    Confirms:
+      1. get_trader_rotation_recommendations() returns valid structure.
+      2. publish_trader_rotation_snapshot() succeeds and upserts a row.
+      3. The CURRENT row is readable from trader_rotation_snapshots.
+      4. No bot, position, trade, or execution table is modified.
+
+    Never auto-runs.  Call manually in a local REPL with env vars loaded.
+
+    Example:
+        from worker import _verify_publish_trader_rotation_snapshot
+        _verify_publish_trader_rotation_snapshot()
+    """
+    # Step 1: publish with a small limit to minimise API calls
+    status = publish_trader_rotation_snapshot(max_paper_candidates=3)
+    assert isinstance(status, dict), f"Expected dict, got {type(status)}"
+    assert "success" in status, "Missing 'success' key"
+    assert "generated_at" in status, "Missing 'generated_at' key"
+    assert "summary" in status, "Missing 'summary' key"
+    assert status.get("success") is True, (
+        f"publish_trader_rotation_snapshot failed: {status}"
+    )
+
+    # Step 2: confirm the CURRENT row is readable
+    row_resp = (
+        supabase.table("trader_rotation_snapshots")
+        .select("snapshot_key, source, version, generated_at")
+        .eq("snapshot_key", "CURRENT")
+        .execute()
+    )
+    assert row_resp.data, "No CURRENT row found in trader_rotation_snapshots"
+    assert row_resp.data[0]["source"] == "FASTLOOP", (
+        f"Unexpected source: {row_resp.data[0]['source']}"
+    )
+    assert row_resp.data[0]["snapshot_key"] == "CURRENT"
+
+    # Step 3: confirm no execution tables were touched
+    # (structural check only — we can't verify side-effects perfectly in a
+    #  unit test, but the functions called have no write paths to those tables)
+    logging.info(
+        "SNAPSHOT_VERIFY OK — CURRENT row confirmed in trader_rotation_snapshots; "
+        "source=FASTLOOP version=%s generated_at=%s",
+        row_resp.data[0].get("version"),
+        row_resp.data[0].get("generated_at"),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ── EMA_5M_BTC  —  5-minute BTC EMA paper strategy ───────────────────────────
 #
@@ -12650,6 +12845,10 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
     tasks.append(asyncio.create_task(_run_forever("copy_auto_exit_loop", copy_auto_exit_loop)))
     tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
+    # ── Trader rotation snapshot (read-only dashboard publisher) ───────────────
+    # Publishes rotation recommendations to trader_rotation_snapshots every 6h.
+    # Failure never crashes the worker or affects any bot state.
+    tasks.append(asyncio.create_task(_run_forever("trader_rotation_snapshot_loop", trader_rotation_snapshot_loop)))
     # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
     tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
     restart_ws_task()
