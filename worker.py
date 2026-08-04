@@ -5912,142 +5912,225 @@ def _test_crypto_global_mode_transition_selftest() -> None:
 # =============================================================================
 
 async def paper_settlement_loop():
+    # ── Bot IDs included in the PAPER settlement query ────────────────────────
+    _SETTLE_ALL_BOT_IDS = [
+        STRATEGY_FASTLOOP_BOT_ID,
+        STRATEGY_SNIPER_BOT_ID,
+        STRATEGY_CANDLE_BIAS_BOT_ID,
+        STRATEGY_SWEEP_RECLAIM_BOT_ID,
+        STRATEGY_BREAKOUT_CLOSE_BOT_ID,
+        STRATEGY_ENGULFING_LEVEL_BOT_ID,
+        STRATEGY_REJECTION_WICK_BOT_ID,
+        STRATEGY_FOLLOW_THROUGH_BOT_ID,
+        BOT_ID,
+        EMA_5M_BOT_ID,
+        BTC5M_LATE_BOT_ID,
+        ETH5M_PAPER_BOT_ID,
+        SOL5M_PAPER_BOT_ID,
+        XRP5M_PAPER_BOT_ID,
+    ]
+    # Crypto-only bot IDs that can also have LIVE_OPEN positions
+    _SETTLE_CRYPTO_BOT_IDS = [
+        BTC5M_LATE_BOT_ID,
+        ETH5M_PAPER_BOT_ID,
+        SOL5M_PAPER_BOT_ID,
+        XRP5M_PAPER_BOT_ID,
+    ]
+
     while True:
         now_ts = int(time())
+
+        # ── Query 1: expired PAPER positions (status = OPEN) ─────────────────
+        # IMPORTANT: Two separate .eq() queries replace the previous
+        # .in_("status", ["OPEN", "LIVE_OPEN"]) call, which supabase-py may
+        # serialise as status=eq.OPEN (first-element only) depending on
+        # the library version deployed on Railway, causing all positions to be
+        # silently ignored.  Two .eq() calls are always safe.
         try:
-            resp = (
+            resp_paper = (
                 supabase.table("paper_positions")
                 .select(
-                    "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id, status",
+                    "id, bot_id, market_slug, side, shares, size_usd,"
+                    " start_price, strategy_id, status",
                 )
-                .in_(
-                    "bot_id",
-                    [
-                        STRATEGY_FASTLOOP_BOT_ID,
-                        STRATEGY_SNIPER_BOT_ID,
-                        STRATEGY_CANDLE_BIAS_BOT_ID,
-                        STRATEGY_SWEEP_RECLAIM_BOT_ID,
-                        STRATEGY_BREAKOUT_CLOSE_BOT_ID,
-                        STRATEGY_ENGULFING_LEVEL_BOT_ID,
-                        STRATEGY_REJECTION_WICK_BOT_ID,
-                        STRATEGY_FOLLOW_THROUGH_BOT_ID,
-                        BOT_ID,
-                        EMA_5M_BOT_ID,         # btc_5m_ema settled via BTC price move
-                        BTC5M_LATE_BOT_ID,     # btc_5m_late settled via BTC price move
-                        ETH5M_PAPER_BOT_ID,    # eth_5m_paper settled via ETH price move
-                        SOL5M_PAPER_BOT_ID,    # sol_5m_paper settled via SOL price move
-                        XRP5M_PAPER_BOT_ID,    # xrp_5m_paper settled via XRP price move
-                    ],
-                )
-                .in_("status", ["OPEN", "LIVE_OPEN"])   # LIVE_OPEN = real CLOB order submitted
+                .in_("bot_id", _SETTLE_ALL_BOT_IDS)
+                .eq("status", "OPEN")
                 .lte("end_ts", now_ts)
                 .execute()
             )
-            rows = resp.data or []
+            rows_paper = resp_paper.data or []
         except Exception:
-            logging.exception("Failed querying OPEN paper_positions")
-            rows = []
-
-        if rows:
-            logging.info(
-                "SETTLEMENT_PENDING open_positions=%d",
-                len(rows),
+            logging.exception(
+                "CRYPTO_SETTLEMENT_QUERY_FAIL status=OPEN — will retry next tick"
             )
+            rows_paper = []
 
+        # ── Query 2: expired LIVE positions (status = LIVE_OPEN) ─────────────
+        # Separate query so a LIVE_OPEN failure never blocks PAPER processing.
+        try:
+            resp_live = (
+                supabase.table("paper_positions")
+                .select(
+                    "id, bot_id, market_slug, side, shares, size_usd,"
+                    " start_price, strategy_id, status",
+                )
+                .in_("bot_id", _SETTLE_CRYPTO_BOT_IDS)
+                .eq("status", "LIVE_OPEN")
+                .lte("end_ts", now_ts)
+                .execute()
+            )
+            rows_live = resp_live.data or []
+        except Exception:
+            logging.exception(
+                "CRYPTO_SETTLEMENT_QUERY_FAIL status=LIVE_OPEN — will retry next tick"
+            )
+            rows_live = []
+
+        rows = rows_paper + rows_live
+
+        # ── Heartbeat: count expired rows by status ───────────────────────────
+        _crypto_open_count = sum(
+            1 for r in rows_paper
+            if (r.get("bot_id") or "") in CRYPTO_PAPER_BOT_IDS
+        )
+        _crypto_live_count = len(rows_live)
+        logging.warning(
+            "CRYPTO_SETTLEMENT_LOOP_HEARTBEAT"
+            " expired_open=%d expired_live_open=%d total_all_bots=%d",
+            _crypto_open_count, _crypto_live_count, len(rows),
+        )
+        if rows:
+            logging.info("SETTLEMENT_PENDING open_positions=%d", len(rows))
+
+        # ── Process each expired position individually ────────────────────────
         for row in rows:
             row_id = row.get("id")
             if not row_id:
                 continue
-            bot_id     = row.get("bot_id") or BOT_ID
+            bot_id      = row.get("bot_id") or BOT_ID
             market_slug = row.get("market_slug")
-            row_status  = (row.get("status") or "OPEN").upper()  # "OPEN" or "LIVE_OPEN"
+            row_status  = (row.get("status") or "OPEN").upper()   # "OPEN" | "LIVE_OPEN"
             is_live_pos = row_status == "LIVE_OPEN"
-            row_side = (row.get("side") or "").lower()
-            strategy_id = row.get("strategy_id")
-            shares = float_or_none(row.get("shares")) or 0.0
-            size_usd = float_or_none(row.get("size_usd")) or 0.0
-            start_price = float_or_none(row.get("start_price"))
-            if start_price is None:
-                start_price = await fetch_btc_spot_price()
-                if start_price is not None:
-                    try:
-                        supabase.table("paper_positions").update(
-                            {"start_price": start_price}
-                        ).eq("id", row_id).execute()
-                    except Exception:
-                        logging.exception("Failed updating paper_positions start_price")
-                else:
+
+            # ── Per-row isolation: one bad row must never stop others ─────────
+            try:
+                logging.warning(
+                    "CRYPTO_SETTLEMENT_CHECK"
+                    " position_id=%s bot_id=%s market=%s status=%s",
+                    row_id, bot_id, market_slug or "", row_status,
+                )
+
+                row_side    = (row.get("side") or "").lower()
+                strategy_id = row.get("strategy_id")
+                shares      = float_or_none(row.get("shares"))   or 0.0
+                size_usd    = float_or_none(row.get("size_usd")) or 0.0
+                start_price = float_or_none(row.get("start_price"))
+
+                if start_price is None:
+                    start_price = await fetch_btc_spot_price()
+                    if start_price is not None:
+                        try:
+                            supabase.table("paper_positions").update(
+                                {"start_price": start_price}
+                            ).eq("id", row_id).execute()
+                        except Exception:
+                            logging.exception(
+                                "Failed updating paper_positions start_price id=%s", row_id
+                            )
+                    else:
+                        logging.warning(
+                            "CRYPTO_SETTLEMENT_WAITING"
+                            " position_id=%s market=%s reason=no_start_price",
+                            row_id, market_slug or "",
+                        )
+                        continue
+
+                end_price = await fetch_btc_spot_price()
+                if end_price is None:
                     logging.warning(
-                        "Skipping settlement without start_price id=%s slug=%s",
-                        row_id,
-                        market_slug,
+                        "CRYPTO_SETTLEMENT_WAITING"
+                        " position_id=%s market=%s reason=no_end_price",
+                        row_id, market_slug or "",
                     )
                     continue
 
-            end_price = await fetch_btc_spot_price()
-            if end_price is None:
-                logging.warning(
-                    "Skipping settlement without end_price id=%s slug=%s",
-                    row_id,
-                    market_slug,
-                )
-                continue
+                resolved_side = "yes" if end_price >= start_price else "no"
+                payout_usd    = shares if row_side == resolved_side else 0.0
+                pnl_usd       = payout_usd - size_usd
+                closed_at     = utc_now_iso()
 
-            resolved_side = "yes" if end_price >= start_price else "no"
-            payout_usd = shares if row_side == resolved_side else 0.0
-            pnl_usd = payout_usd - size_usd
-            closed_at = utc_now_iso()
+                position_updates = {
+                    "status":        "CLOSED",
+                    "resolved_side": resolved_side,
+                    "end_price":     end_price,
+                    "pnl_usd":       pnl_usd,
+                    "closed_at":     closed_at,
+                }
 
-            position_updates = {
-                "status": "CLOSED",
-                "resolved_side": resolved_side,
-                "end_price": end_price,
-                "pnl_usd": pnl_usd,
-                "closed_at": closed_at,
-            }
-            try:
-                supabase.table("paper_positions").update(position_updates).eq("id", row_id).execute()
-            except Exception:
-                logging.exception("Failed updating paper_positions row id=%s", row_id)
-                continue
-            else:
+                # Idempotency guard: only update if the row is still in its
+                # expected open status.  If another process already closed it,
+                # the .eq("status", row_status) filter will match 0 rows and
+                # we skip the accounting step below.
+                try:
+                    update_resp = (
+                        supabase.table("paper_positions")
+                        .update(position_updates)
+                        .eq("id", row_id)
+                        .eq("status", row_status)   # concurrency guard
+                        .execute()
+                    )
+                except Exception:
+                    logging.exception(
+                        "Failed updating paper_positions row id=%s", row_id
+                    )
+                    continue
+
+                if not (update_resp.data or []):
+                    # Row was already closed by another loop iteration or process.
+                    logging.warning(
+                        "CRYPTO_SETTLEMENT_IDEMPOTENCY_SKIP"
+                        " position_id=%s status=%s already_settled",
+                        row_id, row_status,
+                    )
+                    continue
+
+                # ── Accounting per bot type ───────────────────────────────────
                 if bot_id == EMA_5M_BOT_ID:
-                    # EMA strategy uses its own isolated accounting path with
-                    # EMA_BALANCE_BEFORE / EMA_POSITION_CLOSE_PNL / EMA_BALANCE_AFTER logs.
+                    # EMA strategy uses its own isolated accounting path.
                     _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
+
                 elif bot_id in CRYPTO_PAPER_BOT_IDS:
                     # ── Shared Crypto PAPER account ───────────────────────────
-                    # BTC, ETH, SOL and XRP all share one bankroll row.
-                    # Settlement from any asset credits/debits crypto_paper.
-                    # LIVE positions do NOT affect the PAPER balance — the real
-                    # USDC result stays in the Polymarket wallet.
+                    # BTC, ETH, SOL and XRP share one bankroll row (crypto_paper).
+                    # LIVE positions do NOT move the PAPER balance — real USDC
+                    # payout stays in the Polymarket wallet.
                     _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
 
                     if is_live_pos:
-                        # LIVE position settled — log result only (real payout in wallet)
                         logging.warning(
-                            "CRYPTO_LIVE_SETTLED bot_id=%s result=%s pnl=%.4f "
-                            "slug=%s side=%s "
-                            "NOTE:redemption_not_automatic_must_redeem_via_polymarket",
-                            bot_id, _crypto_result, pnl_usd,
-                            market_slug or "",
-                            str(row.get("side") or "").upper(),
+                            "CRYPTO_LIVE_SETTLED"
+                            " position_id=%s bot_id=%s market=%s result=%s"
+                            " NOTE:redemption_not_automatic_must_redeem_via_polymarket",
+                            row_id, bot_id, market_slug or "", _crypto_result,
                         )
                     else:
-                        update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+                        update_bot_settings_with_realized_pnl(
+                            CRYPTO_PAPER_ACCOUNT_ID, pnl_usd
+                        )
+                        logging.warning(
+                            "CRYPTO_PAPER_SETTLED"
+                            " position_id=%s bot_id=%s market=%s result=%s pnl=%.4f",
+                            row_id, bot_id, market_slug or "", _crypto_result, pnl_usd,
+                        )
 
                     if bot_id == BTC5M_LATE_BOT_ID and not is_live_pos:
                         _btc5m_result = _crypto_result
                         logging.warning(
-                            "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
-                            "slug=%s side=%s start_price=%.2f end_price=%.2f",
-                            row_id,
-                            _btc5m_result,
-                            pnl_usd,
-                            market_slug or "",
-                            row.get("side") or "",
-                            start_price or 0.0,
-                            end_price or 0.0,
+                            "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f"
+                            " slug=%s side=%s start_price=%.2f end_price=%.2f",
+                            row_id, _btc5m_result, pnl_usd,
+                            market_slug or "", row.get("side") or "",
+                            start_price or 0.0, end_price or 0.0,
                         )
                         logging.warning(
                             "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
@@ -6056,9 +6139,10 @@ async def paper_settlement_loop():
                             _btc5m_result,
                             pnl_usd,
                         )
-                        # ── Trade Intent settlement link ──────────────────────────
-                        # Match by paper_position_id stored in trade_intents.
-                        def _btc5m_settle_intent(pos_id: str, result: str, pnl: float) -> None:
+                        # ── Trade Intent settlement link ──────────────────────
+                        def _btc5m_settle_intent(
+                            pos_id: str, result: str, pnl: float
+                        ) -> None:
                             try:
                                 _upd = {
                                     "paper_status":    "CLOSED",
@@ -6071,25 +6155,26 @@ async def paper_settlement_loop():
                                     "paper_position_id", str(pos_id)
                                 ).execute()
                                 logging.warning(
-                                    "TRADE_INTENT_SETTLED intent_id=lookup "
-                                    "result=%s pnl=%.4f",
+                                    "TRADE_INTENT_SETTLED intent_id=lookup"
+                                    " result=%s pnl=%.4f",
                                     result, pnl,
                                 )
                             except Exception:
                                 logging.warning(
-                                    "TRADE_INTENT_SETTLE_FAIL pos_id=%s — "
-                                    "settlement link failed (position settled ok)",
+                                    "TRADE_INTENT_SETTLE_FAIL pos_id=%s —"
+                                    " settlement link failed (position settled ok)",
                                     pos_id,
                                 )
                         asyncio.ensure_future(asyncio.to_thread(
-                            _btc5m_settle_intent, str(row_id), _btc5m_result, pnl_usd,
+                            _btc5m_settle_intent,
+                            str(row_id), _btc5m_result, pnl_usd,
                         ))
                     else:
                         # ETH / SOL / XRP settlement
                         logging.warning(
-                            "CRYPTO5M_SETTLED bot_id=%s result=%s pnl=%.4f "
-                            "slug=%s side=%s start_price=%.2f end_price=%.2f "
-                            "shared_account=%s",
+                            "CRYPTO5M_SETTLED bot_id=%s result=%s pnl=%.4f"
+                            " slug=%s side=%s start_price=%.2f end_price=%.2f"
+                            " shared_account=%s",
                             bot_id, _crypto_result, pnl_usd,
                             market_slug or "",
                             str(row.get("side") or "").upper(),
@@ -6099,59 +6184,65 @@ async def paper_settlement_loop():
                 else:
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
-            trade_payload = {
-                "bot_id": bot_id,
-                "market": "FASTLOOP",
-                "market_slug": market_slug,
-                "strategy_id": strategy_id,
-                "side": row.get("side"),
-                "price": end_price,
-                "size": size_usd,
-                "status": "PAPER_CLOSED",
-                "meta": {
-                    "timestamp": closed_at,
-                    "pnl_usd": pnl_usd,
-                    "start_price": start_price,
-                    "end_price": end_price,
-                    "resolved_side": resolved_side,
-                    "shares": shares,
+                # ── Write bot_trades history row ──────────────────────────────
+                trade_payload = {
+                    "bot_id":      bot_id,
+                    "market":      "FASTLOOP",
                     "market_slug": market_slug,
                     "strategy_id": strategy_id,
-                },
-            }
-            try:
-                supabase.table("bot_trades").insert(trade_payload).execute()
-                logging.info(
-                    "Closed paper_position id=%s slug=%s pnl_usd=%s",
-                    row_id,
-                    market_slug,
-                    pnl_usd,
-                )
-                logging.info(
-                    "PAPER_CLOSE bot_id=%s strategy_id=%s slug=%s pnl_usd=%s",
-                    bot_id,
-                    strategy_id,
-                    market_slug,
-                    pnl_usd,
-                )
-                logging.info(
-                    "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_CLOSED slug=%s pnl=%s",
-                    strategy_id, bot_id, market_slug, pnl_usd,
-                )
-                if strategy_id in CANDLE_STRATEGY_IDS:
+                    "side":        row.get("side"),
+                    "price":       end_price,
+                    "size":        size_usd,
+                    "status":      "PAPER_CLOSED",
+                    "meta": {
+                        "timestamp":    closed_at,
+                        "pnl_usd":      pnl_usd,
+                        "start_price":  start_price,
+                        "end_price":    end_price,
+                        "resolved_side": resolved_side,
+                        "shares":       shares,
+                        "market_slug":  market_slug,
+                        "strategy_id":  strategy_id,
+                    },
+                }
+                try:
+                    supabase.table("bot_trades").insert(trade_payload).execute()
                     logging.info(
-                        "CANDLE_PAPER_SETTLEMENT strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
-                        strategy_id,
-                        market_slug,
-                        pnl_usd,
-                        resolved_side,
+                        "Closed paper_position id=%s slug=%s pnl_usd=%s",
+                        row_id, market_slug, pnl_usd,
                     )
+                    logging.info(
+                        "PAPER_CLOSE bot_id=%s strategy_id=%s slug=%s pnl_usd=%s",
+                        bot_id, strategy_id, market_slug, pnl_usd,
+                    )
+                    logging.info(
+                        "ACTIVITY_WRITE strategy=%s bot_id=%s"
+                        " status=PAPER_CLOSED slug=%s pnl=%s",
+                        strategy_id, bot_id, market_slug, pnl_usd,
+                    )
+                    if strategy_id in CANDLE_STRATEGY_IDS:
+                        logging.info(
+                            "CANDLE_PAPER_SETTLEMENT"
+                            " strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
+                            strategy_id, market_slug, pnl_usd, resolved_side,
+                        )
+                except Exception:
+                    logging.exception(
+                        "Failed inserting PAPER_CLOSED bot_trades row id=%s", row_id
+                    )
+                    logging.info(
+                        "ACTIVITY_WRITE strategy=%s bot_id=%s"
+                        " status=PAPER_CLOSED_FAILED slug=%s pnl=%s",
+                        strategy_id, bot_id, market_slug, pnl_usd,
+                    )
+
             except Exception:
-                logging.exception("Failed inserting PAPER_CLOSED bot_trades row")
-                logging.info(
-                    "ACTIVITY_WRITE strategy=%s bot_id=%s status=PAPER_CLOSED_FAILED slug=%s pnl=%s",
-                    strategy_id, bot_id, market_slug, pnl_usd,
+                logging.warning(
+                    "CRYPTO_SETTLEMENT_ERROR"
+                    " position_id=%s market=%s error=unhandled_exception",
+                    row_id, market_slug or "",
                 )
+                logging.exception("CRYPTO_SETTLEMENT_ERROR_DETAIL position_id=%s", row_id)
 
         if rows:
             update_paper_settings_from_positions()
