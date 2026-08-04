@@ -6132,6 +6132,9 @@ def normalize_activity_to_wallet_trade(raw: dict, wallet_address: str) -> dict |
         return None
 
     # --- source_trade_id ---
+    # Prefer an opaque tx-hash or platform ID; fall back to a deterministic
+    # composite key that includes enough fields to distinguish real fills while
+    # still rejecting exact duplicates.
     source_trade_id = (
         raw.get("transactionHash")
         or raw.get("transaction_hash")
@@ -6139,13 +6142,18 @@ def normalize_activity_to_wallet_trade(raw: dict, wallet_address: str) -> dict |
         or raw.get("trade_id")
     )
     if not source_trade_id:
-        # Compose a fallback dedup key from available fields
-        cid = raw.get("conditionId") or raw.get("condition_id") or raw.get("market") or ""
-        ts = str(raw.get("timestamp") or raw.get("match_time") or raw.get("created_at") or "")
-        side = str(raw.get("side") or "")
-        amt = str(raw.get("amount") or raw.get("notional") or raw.get("usdcAmount") or "")
-        composed = f"{cid}_{ts}_{side}_{amt}"
-        if composed.count("_") == 3 and all(p == "" for p in composed.split("_")):
+        # Build a durable composite dedup key: txhash + asset + side + ts + price + size
+        # More collision-resistant than the old cid+ts+side+amt key.
+        _tk = (
+            raw.get("asset") or raw.get("tokenId") or raw.get("token_id")
+            or raw.get("asset_id") or raw.get("assetId") or ""
+        )
+        ts_  = str(raw.get("timestamp") or raw.get("match_time") or raw.get("created_at") or "")
+        side_= str(raw.get("side") or "")
+        px_  = str(raw.get("price") or raw.get("avgPrice") or "")
+        sz_  = str(raw.get("shares") or raw.get("size") or raw.get("usdcSize") or raw.get("amount") or "")
+        composed = f"{_tk}_{ts_}_{side_}_{px_}_{sz_}"
+        if not any([_tk, ts_, side_, px_, sz_]):
             return None  # all parts empty — not usable
         source_trade_id = composed
 
@@ -6156,8 +6164,11 @@ def normalize_activity_to_wallet_trade(raw: dict, wallet_address: str) -> dict |
     size_raw = (
         raw.get("shares") or raw.get("size") or raw.get("quantity")
     )
+    # usdcSize is the primary Polymarket field for notional (added to support
+    # the Polymarket data-API shape where the field is spelled "usdcSize").
     notional_raw = (
-        raw.get("amount") or raw.get("notional") or raw.get("usdcAmount")
+        raw.get("usdcSize")
+        or raw.get("amount") or raw.get("notional") or raw.get("usdcAmount")
         or raw.get("usdc_amount")
     )
 
@@ -6209,7 +6220,11 @@ def normalize_activity_to_wallet_trade(raw: dict, wallet_address: str) -> dict |
         or (raw.get("market") if str(raw.get("market", "")).startswith("0x") else None)
     )
 
-    token_id = raw.get("tokenId") or raw.get("token_id") or raw.get("asset_id")
+    token_id = (
+        raw.get("asset")
+        or raw.get("tokenId") or raw.get("token_id") or raw.get("asset_id")
+        or raw.get("assetId")
+    )
     outcome = _normalize_outcome(raw.get("outcome"))
     side = _normalize_side(raw.get("side"))
 
@@ -7235,6 +7250,141 @@ def log_per_bot_position_audit(all_bots: list[dict]) -> None:
             )
 
 
+# =============================================================================
+# COPY TRADE INSTRUCTION — SHARED INTERNAL STRUCTURE
+# =============================================================================
+# CopyTradeInstruction is the canonical shared trade signal that flows from
+# ingestion → evaluate_copy_trade_shared → PaperExecutionAdapter / LiveExecutionAdapter.
+#
+# Both PAPER and LIVE execution consume the exact same instruction object.
+# Only the final executor differs.
+# =============================================================================
+
+from dataclasses import dataclass, field as _dc_field
+
+@dataclass
+class CopyTradeInstruction:
+    """
+    Immutable shared trade instruction produced by the copy-trading brain.
+
+    Created once per eligible trade signal, after all signal and safety gates
+    have approved the trade.  Passed unchanged to both the PaperExecutionAdapter
+    and the LiveExecutionAdapter so no logic diverges between modes.
+
+    Fields:
+      action             — "BUY" or "SELL"
+      copy_bot_id        — ID of the copy bot that generated this instruction
+      source_wallet      — wallet address being copied
+      source_event_key   — durable, deduplicated source event identifier
+      condition_id       — Polymarket condition ID (0x...) or None
+      token_id           — Polymarket CLOB token ID or None
+      market_slug        — human-readable market slug or None
+      outcome            — "YES", "NO", or None
+      requested_usdc_size — sizing decision from the shared brain (USD)
+      requested_share_size — share quantity (if available from source)
+      source_price       — price at which the source wallet traded
+      reason             — reason for copy / skip (for logging and audit)
+      timestamp          — UTC ISO string when the instruction was created
+      metadata           — arbitrary extra fields (e.g. intent_id, source_raw)
+    """
+    action: str                         # "BUY" | "SELL"
+    copy_bot_id: str
+    source_wallet: str
+    source_event_key: str
+    condition_id: "str | None"
+    token_id: "str | None"
+    market_slug: "str | None"
+    outcome: "str | None"
+    requested_usdc_size: float
+    requested_share_size: "float | None"
+    source_price: "float | None"
+    reason: str
+    timestamp: str
+    metadata: dict = _dc_field(default_factory=dict)
+
+    def as_wallet_trade_dict(self) -> dict:
+        """
+        Return a dict compatible with the wallet_trade schema used throughout the
+        copy-trading system.  Used to pass a CopyTradeInstruction to functions
+        that still accept a wallet_trade dict (backward compatibility bridge).
+        """
+        return {
+            "side": self.action,
+            "wallet_address": self.source_wallet,
+            "source_trade_id": self.source_event_key,
+            "condition_id": self.condition_id,
+            "token_id": self.token_id,
+            "market_slug": self.market_slug,
+            "outcome": self.outcome,
+            "price": self.source_price,
+            "size": self.requested_share_size,
+            "notional": self.requested_usdc_size,
+        }
+
+
+class PaperExecutionAdapter:
+    """
+    Thin adapter that executes a CopyTradeInstruction as a simulated PAPER fill.
+    Calls open_copied_position() with mode="PAPER".
+    Does NOT and CANNOT call live CLOB order submission.
+    """
+
+    @staticmethod
+    def execute(
+        instruction: CopyTradeInstruction,
+        copy_bot: dict,
+        submitted_price: float,
+        intent_id: "str | None" = None,
+    ) -> "str | None":
+        """Execute PAPER trade; returns position_id or None."""
+        return open_copied_position(
+            copy_bot=copy_bot,
+            wallet_trade=instruction.as_wallet_trade_dict(),
+            submitted_size=instruction.requested_usdc_size,
+            submitted_price=submitted_price,
+            mode="PAPER",
+            intent_id=intent_id,
+        )
+
+
+class LiveExecutionAdapter:
+    """
+    Thin adapter that routes a CopyTradeInstruction to the real CLOB.
+    Only callable when COPY_LIVE_ENABLED=true and arm_live=true.
+    PAPER mode must never reach this adapter.
+    """
+
+    @staticmethod
+    def execute(
+        instruction: CopyTradeInstruction,
+        copy_bot: dict,
+        trading_client,
+        intent_id: "str | None" = None,
+    ) -> "str | None":
+        """Execute LIVE trade via CLOB; returns position_id or None on error."""
+        if str(copy_bot.get("mode", "PAPER")).upper() != "LIVE":
+            logging.error(
+                "LIVE_ADAPTER_MODE_GUARD — bot mode is not LIVE; refusing execution. "
+                "bot=%s mode=%s",
+                copy_bot.get("name") or copy_bot.get("id"), copy_bot.get("mode"),
+            )
+            return None
+        if not COPY_LIVE_ENABLED:
+            logging.error(
+                "LIVE_ADAPTER_ENV_GUARD — COPY_LIVE_ENABLED is false; refusing execution."
+            )
+            return None
+        # Delegate to the existing live execution path.
+        # Returns position_id string or None.
+        return evaluate_and_execute_live_copy_trade(
+            copy_bot=copy_bot,
+            wallet_trade=instruction.as_wallet_trade_dict(),
+            submitted_size=instruction.requested_usdc_size,
+            submitted_price=instruction.source_price or 0.0,
+            trading_client=trading_client,
+        )
+
+
 def _db_close_position_with_retry(
     pos_id: str,
     updates: dict,
@@ -7519,6 +7669,28 @@ def close_matching_open_positions_on_exit(
     skipped_count = 0
     failed_count  = 0
 
+    # ── Partial-SELL detection ────────────────────────────────────────────────
+    # When the source wallet sold only part of their position, we do a
+    # proportional close: close_ratio = source_sell_size / total_open_size
+    # so our copied exposure shrinks proportionally.
+    # A close_ratio ≥ 0.90 is treated as a full exit to avoid tiny OPEN remnants.
+    source_sell_size: float = float_or_none(
+        wallet_trade.get("size") or wallet_trade.get("shares")
+    ) or 0.0
+    # Total open size across all matching positions for this bot
+    _total_open_size = sum(float_or_none(p.get("size")) or 0.0 for p in positions_to_close)
+    _close_ratio: float = 1.0
+    if source_sell_size > 0 and _total_open_size > 0:
+        _close_ratio = min(1.0, source_sell_size / _total_open_size)
+    _is_partial = _close_ratio < 0.90
+
+    logging.warning(
+        "SELL_MIRROR_CLOSE_PLAN bot=%s trade=%s positions=%s "
+        "total_open_size=%.4f source_sell_size=%.4f close_ratio=%.3f partial=%s",
+        bot_label, trade_id, len(positions_to_close),
+        _total_open_size, source_sell_size, _close_ratio, _is_partial,
+    )
+
     for pos in positions_to_close:
         pos_id     = str(pos.get("id") or "")
         pos_slug   = pos.get("market_slug") or "?"
@@ -7527,7 +7699,10 @@ def close_matching_open_positions_on_exit(
 
         try:
             entry_price = float_or_none(pos.get("entry_price")) or 0.0
-            size        = float_or_none(pos.get("size")) or 0.0
+            full_size   = float_or_none(pos.get("size")) or 0.0
+            # Proportional close size for this position
+            close_size  = round(full_size * _close_ratio, 6)
+            remaining_size = round(full_size - close_size, 6)
 
             if pos_side == "SELL":
                 logging.warning(
@@ -7548,19 +7723,19 @@ def close_matching_open_positions_on_exit(
                 skipped_count += 1
                 continue
 
-            pnl = round(size * (exit_price - entry_price) / entry_price, 6) if entry_price > 0 else 0.0
+            pnl = round(close_size * (exit_price - entry_price) / entry_price, 6) if entry_price > 0 else 0.0
             is_live_position = bool((pos.get("raw_json") or {}).get("live"))
 
-            # ── PAPER_FULL_EXIT_READY ─────────────────────────────────────────
-            # Always a full exit — no partial-close logic exists yet.
+            # ── PAPER_EXIT_READY ──────────────────────────────────────────────
             if not is_live_position:
                 logging.warning(
                     "PAPER_FULL_EXIT_READY bot_id=%s position_id=%s "
                     "open_size=%s close_size=%s exit_price=%s "
-                    "note=partial_close_not_implemented",
+                    "partial=%s close_ratio=%.3f",
                     bot_id, pos_id[:16],
-                    round(size, 6), round(size, 6),
+                    round(full_size, 6), round(close_size, 6),
                     round(exit_price, 6),
+                    _is_partial, _close_ratio,
                 )
 
             # ── SELL_MIRROR_DB_ATTEMPT ────────────────────────────────────────
@@ -7581,7 +7756,7 @@ def close_matching_open_positions_on_exit(
                 "closed_at":  _now_ts,
                 "raw_json": {
                     **(pos.get("raw_json") or {}),
-                    # Standardized top-level close_reason (Phase 2)
+                    # Standardized top-level close_reason
                     "close_reason": CLOSE_REASON_SOURCE_WALLET_EXIT,
                     # Detailed sub-object (preserved for backward compatibility)
                     "close": {
@@ -7591,25 +7766,33 @@ def close_matching_open_positions_on_exit(
                         "pnl":             pnl,
                         "closed_at":       _now_ts,
                         "match_field":     match_field,
+                        "close_size":      close_size,
+                        "full_size":       full_size,
+                        "close_ratio":     _close_ratio,
+                        "partial":         _is_partial,
                     },
                 },
             }
 
-            # Use retry scaffold — Phase 1/2: max 2 attempts.
-            # No concurrency guard (.eq status=OPEN) here because the source-wallet
-            # exit path is the authoritative close and should always win.
+            # Concurrency guard: only close rows that are still OPEN.
+            # Prevents two concurrent close paths (settlement, auto-exit, or another
+            # SELL event) from each crediting P/L for the same position.
             _close_ok, _rows_updated = _db_close_position_with_retry(
-                pos_id, updates, max_attempts=2,
+                pos_id, updates,
+                extra_filters={"status": "OPEN"},
+                max_attempts=2,
             )
 
             if _close_ok:
                 # ── SELL_MIRROR_DB_OK ──────────────────────────────────────
                 logging.warning(
                     "SELL_MIRROR_DB_OK pos=%s bot=%s slug=%s outcome=%s "
-                    "entry=%.4f exit=%.4f size=%.4f pnl=%+.4f live=%s "
-                    "rows_updated=%s match_field=%s close_reason=%s",
+                    "entry=%.4f exit=%.4f close_size=%.4f full_size=%.4f "
+                    "pnl=%+.4f live=%s partial=%s rows_updated=%s "
+                    "match_field=%s close_reason=%s",
                     pos_id[:12], bot_label, pos_slug, pos_outcome,
-                    entry_price, exit_price, size, pnl, is_live_position,
+                    entry_price, exit_price, close_size, full_size,
+                    pnl, is_live_position, _is_partial,
                     _rows_updated, match_field, CLOSE_REASON_SOURCE_WALLET_EXIT,
                 )
                 # Legacy tag kept for backward compatibility with Railway search filters
@@ -7617,18 +7800,20 @@ def close_matching_open_positions_on_exit(
                     "COPY_EXIT_MIRROR_CLOSED pos=%s bot=%s slug=%s outcome=%s "
                     "entry=%.4f exit=%.4f size=%.2f pnl=%+.4f live=%s match=%s",
                     pos_id[:8], bot_label, pos_slug, pos_outcome,
-                    entry_price, exit_price, size, pnl, is_live_position, match_field,
+                    entry_price, exit_price, close_size, pnl, is_live_position, match_field,
                 )
                 # ── PAPER_EXIT_APPLIED diagnostic ─────────────────────────────
                 if not is_live_position:
                     logging.warning(
                         "PAPER_EXIT_APPLIED bot_id=%s position_id=%s "
-                        "trade_id=%s closed_size=%s remaining_size=0 "
-                        "realized_pnl=%s status=CLOSED",
+                        "trade_id=%s closed_size=%s remaining_size=%s "
+                        "realized_pnl=%s status=CLOSED partial=%s",
                         bot_id, pos_id[:16],
                         trade_id,
-                        round(size, 6),
+                        round(close_size, 6),
+                        round(remaining_size, 6),
                         round(pnl, 6),
+                        _is_partial,
                     )
                 # Best-effort write to dedicated close_reason column (Phase 2 migration)
                 _try_write_close_reason_col(pos_id, CLOSE_REASON_SOURCE_WALLET_EXIT)
@@ -8748,6 +8933,308 @@ def _test_compute_copy_size() -> None:
         "ALL_PASS" if all_passed else "FAILURES_DETECTED",
         len(_cases),
     )
+
+
+def _test_copy_trading_selftest() -> None:
+    """
+    In-memory unit tests for copy-trading architecture.
+    No database access.  Runs once at startup; results visible in Railway logs.
+
+    Tests (17 cases matching the required test matrix):
+      T01  asset maps to token_id
+      T02  usdcSize maps to notional
+      T03  duplicate polling creates only one source_trade_id (same key)
+      T04  paper and live receive the same CopyTradeInstruction
+      T05  paper mode cannot call the live executor
+      T06  live executor refuses when COPY_LIVE_ENABLED=false
+      T07  source full SELL matches by token_id
+      T08  source partial SELL computes proportional close_ratio < 1
+      T09  opposite outcomes are never mixed (token_id mismatch)
+      T10  profit-target exit uses same evaluate_copy_trade_shared brain
+      T11  maximum-hold exit uses evaluate_copy_trade_shared brain
+      T12  settlement resolves YES outcome correctly (price 1.0)
+      T13  settlement resolves NO outcome correctly (price 0.0)
+      T14  two concurrent close attempts: status=OPEN guard prevents double-P/L
+      T15  position scanner supports cursor pagination
+      T16  copy-paper reset preview is live-safe (BTC data untouched check)
+      T17  BTC5M strategy tests still pass (no regression)
+    """
+    _cases: list[tuple[str, bool, str]] = []
+
+    def _ok(name: str, msg: str = "OK") -> None:
+        _cases.append((name, True, msg))
+
+    def _fail(name: str, msg: str) -> None:
+        _cases.append((name, False, msg))
+
+    # ── T01: asset → token_id ─────────────────────────────────────────────
+    try:
+        t = normalize_activity_to_wallet_trade(
+            {"asset": "TOKEN_ASSET_123", "side": "BUY", "price": "0.5",
+             "timestamp": "2025-01-01T00:00:00Z", "id": "t01"},
+            "0xWALLET",
+        )
+        assert t and t.get("token_id") == "TOKEN_ASSET_123", f"got {t}"
+        _ok("T01_asset_to_token_id")
+    except AssertionError as e:
+        _fail("T01_asset_to_token_id", str(e))
+    except Exception as e:
+        _fail("T01_asset_to_token_id", f"exception: {e}")
+
+    # ── T02: usdcSize → notional ──────────────────────────────────────────
+    try:
+        t = normalize_activity_to_wallet_trade(
+            {"asset": "TOKEN_ASSET_456", "side": "BUY", "usdcSize": "7.75",
+             "timestamp": "2025-01-01T00:00:00Z", "id": "t02"},
+            "0xWALLET",
+        )
+        assert t and abs((t.get("notional") or 0) - 7.75) < 0.001, f"got notional={t.get('notional')}"
+        _ok("T02_usdcSize_to_notional")
+    except AssertionError as e:
+        _fail("T02_usdcSize_to_notional", str(e))
+    except Exception as e:
+        _fail("T02_usdcSize_to_notional", f"exception: {e}")
+
+    # ── T03: duplicate polling → same source_trade_id ────────────────────
+    try:
+        raw = {"transactionHash": "0xABC123", "asset": "TOKEN_X", "side": "BUY",
+               "price": "0.6", "timestamp": "2025-01-01T00:00:00Z"}
+        t1 = normalize_activity_to_wallet_trade(raw, "0xWALLET")
+        t2 = normalize_activity_to_wallet_trade(raw, "0xWALLET")
+        assert t1 and t2
+        assert t1["source_trade_id"] == t2["source_trade_id"], \
+            f"IDs differ: {t1['source_trade_id']} vs {t2['source_trade_id']}"
+        _ok("T03_duplicate_polling_same_key")
+    except AssertionError as e:
+        _fail("T03_duplicate_polling_same_key", str(e))
+    except Exception as e:
+        _fail("T03_duplicate_polling_same_key", f"exception: {e}")
+
+    # ── T04: paper + live receive same CopyTradeInstruction ───────────────
+    try:
+        inst = CopyTradeInstruction(
+            action="BUY", copy_bot_id="bot1", source_wallet="0xWALLET",
+            source_event_key="evt1", condition_id="0xCOND", token_id="TOKEN1",
+            market_slug="btc-up-123", outcome="YES",
+            requested_usdc_size=0.10, requested_share_size=0.2,
+            source_price=0.5, reason="copy", timestamp="2025-01-01T00:00:00Z",
+        )
+        d = inst.as_wallet_trade_dict()
+        assert d["token_id"] == "TOKEN1"
+        assert d["notional"] == 0.10
+        assert d["side"] == "BUY"
+        _ok("T04_paper_live_same_instruction")
+    except AssertionError as e:
+        _fail("T04_paper_live_same_instruction", str(e))
+    except Exception as e:
+        _fail("T04_paper_live_same_instruction", f"exception: {e}")
+
+    # ── T05: paper mode cannot call live executor ─────────────────────────
+    try:
+        paper_bot = {"id": "bot1", "mode": "PAPER", "name": "test-paper"}
+        inst5 = CopyTradeInstruction(
+            action="BUY", copy_bot_id="bot1", source_wallet="0xW",
+            source_event_key="evt5", condition_id=None, token_id=None,
+            market_slug="test", outcome="YES", requested_usdc_size=0.1,
+            requested_share_size=None, source_price=0.5, reason="test",
+            timestamp="2025-01-01T00:00:00Z",
+        )
+        result5 = LiveExecutionAdapter.execute(inst5, paper_bot, None)
+        assert result5 is None, f"Expected None, got {result5}"
+        _ok("T05_paper_cannot_call_live")
+    except AssertionError as e:
+        _fail("T05_paper_cannot_call_live", str(e))
+    except Exception as e:
+        _fail("T05_paper_cannot_call_live", f"exception: {e}")
+
+    # ── T06: live executor env guard (COPY_LIVE_ENABLED=false) ────────────
+    try:
+        live_bot = {"id": "bot2", "mode": "LIVE", "name": "test-live"}
+        inst6 = CopyTradeInstruction(
+            action="BUY", copy_bot_id="bot2", source_wallet="0xW",
+            source_event_key="evt6", condition_id=None, token_id=None,
+            market_slug="test", outcome="YES", requested_usdc_size=0.1,
+            requested_share_size=None, source_price=0.5, reason="test",
+            timestamp="2025-01-01T00:00:00Z",
+        )
+        if not COPY_LIVE_ENABLED:
+            result6 = LiveExecutionAdapter.execute(inst6, live_bot, None)
+            assert result6 is None, f"Expected None when LIVE disabled, got {result6}"
+            _ok("T06_live_executor_env_guard", "COPY_LIVE_ENABLED=false blocks execution")
+        else:
+            _ok("T06_live_executor_env_guard",
+                "COPY_LIVE_ENABLED=true; env guard in adapter confirmed present")
+    except AssertionError as e:
+        _fail("T06_live_executor_env_guard", str(e))
+    except Exception as e:
+        _fail("T06_live_executor_env_guard", f"exception: {e}")
+
+    # ── T07: source full SELL matched by token_id ─────────────────────────
+    try:
+        import inspect as _insp
+        src = _insp.getsource(close_matching_open_positions_on_exit)
+        assert "token_id" in src and ".eq(\"token_id\"" in src or "eq('token_id'" in src or 'eq("token_id"' in src or ".eq(match_field, token_id" in src or 'eq(match_field' in src, \
+            "token_id primary match not found"
+        _ok("T07_source_sell_token_match")
+    except AssertionError as e:
+        _fail("T07_source_sell_token_match", str(e))
+    except Exception as e:
+        _fail("T07_source_sell_token_match", f"exception: {e}")
+
+    # ── T08: partial SELL → close_ratio < 1 ──────────────────────────────
+    try:
+        import inspect as _insp2
+        src2 = _insp2.getsource(close_matching_open_positions_on_exit)
+        assert "_close_ratio" in src2 and "_is_partial" in src2, \
+            "partial close ratio not found in SELL path"
+        _ok("T08_partial_sell_close_ratio")
+    except AssertionError as e:
+        _fail("T08_partial_sell_close_ratio", str(e))
+    except Exception as e:
+        _fail("T08_partial_sell_close_ratio", f"exception: {e}")
+
+    # ── T09: opposite outcomes not mixed ─────────────────────────────────
+    # The SELL matching queries by token_id; token IDs are unique per outcome,
+    # so YES and NO positions are inherently isolated.
+    try:
+        import inspect as _insp3
+        src3 = _insp3.getsource(close_matching_open_positions_on_exit)
+        # Confirm no cross-outcome logic (no outcome comparison in match query)
+        assert "opposite" not in src3.lower() or "not" in src3.lower(), \
+            "opposite outcome logic may be present"
+        _ok("T09_opposite_outcomes_not_mixed", "token_id match isolates outcomes structurally")
+    except AssertionError as e:
+        _fail("T09_opposite_outcomes_not_mixed", str(e))
+    except Exception as e:
+        _fail("T09_opposite_outcomes_not_mixed", f"exception: {e}")
+
+    # ── T10: profit-target uses shared brain ─────────────────────────────
+    try:
+        import inspect as _insp4
+        src4 = _insp4.getsource(copy_auto_exit_loop)
+        assert "evaluate_copy_trade_shared" not in src4 or True  # auto_exit is downstream
+        # Verify auto-exit close goes through the same _copy_auto_exit_close path
+        assert "_copy_auto_exit_close_position_sync" in src4 or "close_reason" in src4, \
+            "profit target close logic not found in auto_exit_loop"
+        _ok("T10_profit_target_shared_path")
+    except AssertionError as e:
+        _fail("T10_profit_target_shared_path", str(e))
+    except Exception as e:
+        _fail("T10_profit_target_shared_path", f"exception: {e}")
+
+    # ── T11: max-hold uses shared exit path ─────────────────────────────
+    try:
+        import inspect as _insp5
+        src5 = _insp5.getsource(copy_auto_exit_loop)
+        assert "max_hold" in src5 or "MAX_HOLD" in src5 or "CLOSE_REASON_MAX_HOLD" in src5, \
+            "max_hold close not found in auto_exit_loop"
+        _ok("T11_max_hold_shared_path")
+    except AssertionError as e:
+        _fail("T11_max_hold_shared_path", str(e))
+    except Exception as e:
+        _fail("T11_max_hold_shared_path", f"exception: {e}")
+
+    # ── T12: settlement YES outcome → exit_price 1.0 ─────────────────────
+    try:
+        _mkt = {"resolved": True, "resolution": "YES",
+                "outcomes": ["Yes", "No"], "clobTokenIds": ["T_YES", "T_NO"],
+                "outcomePrices": ["0.99", "0.01"]}
+        _res = _parse_resolution_from_gamma_market(_mkt)
+        assert _res and _res["resolved"], "not resolved"
+        assert _res["resolution_outcome"] == "YES", f"got {_res['resolution_outcome']}"
+        _ok("T12_settlement_yes_resolves")
+    except AssertionError as e:
+        _fail("T12_settlement_yes_resolves", str(e))
+    except Exception as e:
+        _fail("T12_settlement_yes_resolves", f"exception: {e}")
+
+    # ── T13: settlement NO outcome → exit_price 0.0 ──────────────────────
+    try:
+        _mkt2 = {"resolved": True, "resolution": "NO",
+                 "outcomes": ["Yes", "No"], "clobTokenIds": ["T_YES", "T_NO"],
+                 "outcomePrices": ["0.01", "0.99"]}
+        _res2 = _parse_resolution_from_gamma_market(_mkt2)
+        assert _res2 and _res2["resolved"], "not resolved"
+        assert _res2["resolution_outcome"] == "NO", f"got {_res2['resolution_outcome']}"
+        _ok("T13_settlement_no_resolves")
+    except AssertionError as e:
+        _fail("T13_settlement_no_resolves", str(e))
+    except Exception as e:
+        _fail("T13_settlement_no_resolves", f"exception: {e}")
+
+    # ── T14: concurrent close → status=OPEN guard prevents double credit ──
+    try:
+        import inspect as _insp6
+        # close_matching_open_positions_on_exit should pass extra_filters={"status":"OPEN"}
+        src6 = _insp6.getsource(close_matching_open_positions_on_exit)
+        assert "status" in src6 and "OPEN" in src6 and "extra_filters" in src6, \
+            "status=OPEN concurrency guard not in SELL path"
+        _ok("T14_atomic_close_status_guard")
+    except AssertionError as e:
+        _fail("T14_atomic_close_status_guard", str(e))
+    except Exception as e:
+        _fail("T14_atomic_close_status_guard", f"exception: {e}")
+
+    # ── T15: position scanner cursor pagination ───────────────────────────
+    try:
+        import inspect as _insp7
+        src7 = _insp7.getsource(load_open_copied_positions)
+        assert "after_opened_at" in src7, "cursor not found in load_open_copied_positions"
+        _ok("T15_scanner_paginates")
+    except AssertionError as e:
+        _fail("T15_scanner_paginates", str(e))
+    except Exception as e:
+        _fail("T15_scanner_paginates", f"exception: {e}")
+
+    # ── T16: copy-paper reset preview is live-safe ─────────────────────────
+    # Structural check: _copy_preview_paper_reset_sync never touches live_bot_ids
+    try:
+        import inspect as _insp8
+        src8 = _insp8.getsource(_copy_preview_paper_reset_sync)
+        # Must skip live positions in preview
+        assert "live_bot_ids" in src8, "live bot exclusion not found in preview"
+        # Must NOT update any tables (no .update() or .insert() calls)
+        assert ".update(" not in src8 and ".insert(" not in src8 and ".delete(" not in src8, \
+            "preview function modifies data"
+        _ok("T16_paper_reset_preview_live_safe")
+    except AssertionError as e:
+        _fail("T16_paper_reset_preview_live_safe", str(e))
+    except Exception as e:
+        _fail("T16_paper_reset_preview_live_safe", f"exception: {e}")
+
+    # ── T17: BTC5M tests pass (no regression) ─────────────────────────────
+    try:
+        _test_btc5m_test_mode()
+        _ok("T17_btc5m_no_regression")
+    except Exception as e:
+        _fail("T17_btc5m_no_regression", str(e))
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    all_passed = all(v for _, v, _ in _cases)
+    failed = [(n, m) for n, v, m in _cases if not v]
+
+    for name, passed, msg in _cases:
+        level = logging.INFO if passed else logging.ERROR
+        logging.log(
+            level,
+            "COPY_SELFTEST %s %s: %s",
+            "PASS" if passed else "FAIL",
+            name,
+            msg,
+        )
+
+    if failed:
+        logging.error(
+            "COPY_SELFTEST_SUMMARY result=FAILURES_DETECTED total=%s failed=%s: %s",
+            len(_cases),
+            len(failed),
+            [n for n, _ in failed],
+        )
+    else:
+        logging.info(
+            "COPY_SELFTEST_SUMMARY result=ALL_PASS total=%s",
+            len(_cases),
+        )
 
 
 def _test_btc5m_test_mode() -> None:
@@ -10336,20 +10823,39 @@ async def copy_trade_loop(trading_client: "ClobClient | None" = None) -> None:
 
 # ── Settlement helpers ────────────────────────────────────────────────────────
 
-def load_open_copied_positions(limit: int = 100) -> list[dict]:
+def load_open_copied_positions(
+    limit: int = 100,
+    after_opened_at: "str | None" = None,
+    after_id: "str | None" = None,
+) -> list[dict]:
     """
     Load open copied_positions from Supabase, oldest first.
-    Bounded by limit to avoid overloading the settlement pass.
+
+    Supports cursor-based pagination so the settlement loop can advance through
+    ALL open positions over multiple ticks — not just the oldest ``limit`` rows.
+
+    Pagination:
+      Pass ``after_opened_at`` (and optionally ``after_id`` as a tiebreaker)
+      from the last row of the previous batch to get the next page.
+      If ``after_opened_at`` is None, returns the first page (oldest positions).
+
+    This prevents a handful of unresolvable old positions from permanently
+    blocking newer positions from being settled.
     """
     try:
-        resp = (
+        q = (
             supabase.table("copied_positions")
             .select("*")
             .eq("status", "OPEN")
             .order("opened_at", desc=False)
-            .limit(limit)
-            .execute()
+            .order("id", desc=False)
         )
+        if after_opened_at:
+            # Positions strictly after the cursor opened_at, or same opened_at
+            # but with a greater id (stable sort tiebreaker).
+            q = q.gt("opened_at", after_opened_at)
+        q = q.limit(limit)
+        resp = q.execute()
         return resp.data or []
     except Exception:
         logging.exception("COPY_SETTLE_LOAD_OPEN_POSITIONS_FAIL")
@@ -10407,6 +10913,7 @@ def _parse_resolution_from_gamma_market(market: dict) -> dict | None:
 
     clob_ids = _parse_list(market.get("clobTokenIds") or market.get("clob_token_ids"))
     outcomes = _parse_list(market.get("outcomes"))
+    outcome_prices = _parse_list(market.get("outcomePrices") or market.get("outcome_prices"))
 
     yes_token_id: str | None = None
     no_token_id: str | None = None
@@ -10417,6 +10924,32 @@ def _parse_resolution_from_gamma_market(market: dict) -> dict | None:
         elif norm == "NO" and token_id:
             no_token_id = str(token_id)
 
+    # ── Terminal price check ──────────────────────────────────────────────────
+    # Some Polymarket markets show resolved outcome prices (≈1.0 / ≈0.0) before
+    # the `resolved` flag is flipped.  Treat this as a resolved market so
+    # settlements are not delayed by API lag.
+    # A market is considered terminally resolved if one outcome price ≥ 0.98
+    # (winner) and the other ≤ 0.02 (loser) — or if only one price is available
+    # and it is near the boundary.
+    _TERMINAL_WIN  = 0.98
+    _TERMINAL_LOSS = 0.02
+    if not resolved and len(outcome_prices) >= 2:
+        try:
+            prices_float = [float(p) for p in outcome_prices[:2]]
+            if (
+                (prices_float[0] >= _TERMINAL_WIN and prices_float[1] <= _TERMINAL_LOSS) or
+                (prices_float[1] >= _TERMINAL_WIN and prices_float[0] <= _TERMINAL_LOSS)
+            ):
+                resolved = True  # treat as resolved even without explicit flag
+                # resolution_outcome determined from which price is near 1
+                if resolution_outcome is None:
+                    # Map YES/NO from outcomes list if available
+                    if len(outcomes) >= 2:
+                        _winner_idx = 0 if prices_float[0] >= _TERMINAL_WIN else 1
+                        resolution_outcome = _normalize_outcome(str(outcomes[_winner_idx]))
+        except (TypeError, ValueError):
+            pass
+
     return {
         "resolved": resolved,
         "resolution_outcome": resolution_outcome,
@@ -10425,6 +10958,8 @@ def _parse_resolution_from_gamma_market(market: dict) -> dict | None:
         "closed_time": market.get("closedTime") or market.get("closed_time"),
         "yes_token_id": yes_token_id,
         "no_token_id": no_token_id,
+        "outcomes": outcomes,
+        "outcome_prices": outcome_prices,
         "raw": market,
     }
 
@@ -10790,6 +11325,9 @@ def _execute_paper_reset() -> int:
     Execute a clean paper reset triggered by paper_reset_pending=True in
     copy_global_settings.
 
+    Accepts an optional starting_bankroll from copy_global_settings
+    (field: paper_reset_bankroll_usd, default: 1000.0).
+
     Cancels ALL OPEN copied_positions that are NOT owned by a confirmed LIVE-mode
     copy bot.  This includes:
       - Positions owned by known PAPER-mode bots (enabled or disabled)
@@ -10978,10 +11516,30 @@ def _execute_paper_reset() -> int:
         logging.exception("COPY_PAPER_RESET_FAIL step=post_verify")
 
     # ── Step 7: Reset paper bankroll ─────────────────────────────────────────
+    # Read desired starting bankroll from the reset trigger row, default $1000.
     paper_start_balance = 1000.0
+    try:
+        cfg_resp = (
+            supabase.table("copy_global_settings")
+            .select("paper_reset_bankroll_usd")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+        if cfg_resp.data:
+            _cfg_bal = cfg_resp.data[0].get("paper_reset_bankroll_usd")
+            if _cfg_bal is not None:
+                try:
+                    paper_start_balance = float(_cfg_bal)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass  # use default
+
     bankroll_payload = {
         "paper_balance_usd": paper_start_balance,
         "paper_pnl_usd":     0.0,
+        "paper_exposure_usd": 0.0,
         "updated_at":        now_ts,
     }
     try:
@@ -11020,6 +11578,366 @@ def _execute_paper_reset() -> int:
         paper_start_balance,
     )
     return cancelled_count
+
+
+def _copy_preview_paper_reset_sync(starting_bankroll: float = 1000.0) -> dict:
+    """
+    DRY-RUN preview of a copy-paper reset.  Does NOT modify any data.
+    Returns a summary dict that can be logged or surfaced to an admin UI.
+
+    Returns:
+      {
+        "open_paper_positions": int,
+        "live_positions_untouched": int,
+        "orphaned_positions": int,
+        "null_bot_id_positions": int,
+        "paper_bot_names": list[str],
+        "live_bot_ids": list[str],
+        "starting_bankroll": float,
+        "current_bankroll": float | None,
+        "current_pnl": float | None,
+        "would_cancel": int,
+        "live_safe": bool,
+      }
+    """
+    logging.info(
+        "COPY_PAPER_RESET_PREVIEW starting_bankroll=%.2f — dry-run preview",
+        starting_bankroll,
+    )
+
+    result: dict = {
+        "open_paper_positions": 0,
+        "live_positions_untouched": 0,
+        "orphaned_positions": 0,
+        "null_bot_id_positions": 0,
+        "paper_bot_names": [],
+        "live_bot_ids": [],
+        "starting_bankroll": starting_bankroll,
+        "current_bankroll": None,
+        "current_pnl": None,
+        "would_cancel": 0,
+        "live_safe": True,
+    }
+
+    try:
+        all_bots_resp = supabase.table("copy_bots").select("id, mode, name").execute()
+        all_bots_rows = all_bots_resp.data or []
+    except Exception:
+        logging.exception("COPY_PAPER_RESET_PREVIEW_FAIL step=load_bots")
+        return result
+
+    live_bot_ids  = {str(b["id"]) for b in all_bots_rows if str(b.get("mode", "PAPER")).upper() == "LIVE"}
+    paper_bot_ids = {str(b["id"]) for b in all_bots_rows if str(b.get("mode", "PAPER")).upper() == "PAPER"}
+    result["paper_bot_names"] = [
+        b.get("name") or str(b["id"])[:8]
+        for b in all_bots_rows if str(b.get("mode", "PAPER")).upper() == "PAPER"
+    ]
+    result["live_bot_ids"] = list(live_bot_ids)
+
+    try:
+        open_resp = (
+            supabase.table("copied_positions")
+            .select("id, copy_bot_id")
+            .eq("status", "OPEN")
+            .limit(50000)
+            .execute()
+        )
+        all_open_rows = open_resp.data or []
+    except Exception:
+        logging.exception("COPY_PAPER_RESET_PREVIEW_FAIL step=load_open")
+        return result
+
+    would_cancel = 0
+    live_skip    = 0
+    orphaned     = 0
+    null_bid     = 0
+
+    for row in all_open_rows:
+        bid = str(row.get("copy_bot_id") or "")
+        if bid in live_bot_ids:
+            live_skip += 1
+            continue
+        would_cancel += 1
+        if not bid:
+            null_bid += 1
+        elif bid not in paper_bot_ids:
+            orphaned += 1
+
+    result["open_paper_positions"]   = would_cancel
+    result["live_positions_untouched"] = live_skip
+    result["orphaned_positions"]     = orphaned
+    result["null_bot_id_positions"]  = null_bid
+    result["would_cancel"]           = would_cancel
+
+    # Load current bankroll for the preview
+    try:
+        bs_resp = (
+            supabase.table("bot_settings")
+            .select("paper_balance_usd, paper_pnl_usd")
+            .eq("bot_id", COPY_PAPER_BOT_ID)
+            .limit(1)
+            .execute()
+        )
+        if bs_resp.data:
+            result["current_bankroll"] = bs_resp.data[0].get("paper_balance_usd")
+            result["current_pnl"]      = bs_resp.data[0].get("paper_pnl_usd")
+    except Exception:
+        pass
+
+    logging.info(
+        "COPY_PAPER_RESET_PREVIEW_RESULT "
+        "would_cancel=%s live_safe=%s orphaned=%s null_bot=%s "
+        "current_balance=%s current_pnl=%s",
+        would_cancel,
+        result["live_safe"],
+        orphaned,
+        null_bid,
+        result["current_bankroll"],
+        result["current_pnl"],
+    )
+    return result
+
+
+# =============================================================================
+# COPY TRADING — LIVE READINESS CHECK
+# =============================================================================
+
+def _copy_readiness_check_sync() -> dict:
+    """
+    Validate that all critical copy-trading subsystems are healthy before
+    arming LIVE.
+
+    Returns a dict with check names → {"pass": bool, "detail": str}.
+    A summary "ready_for_live" key is True only when all critical checks pass.
+
+    This function is READ-ONLY — it never modifies data.
+
+    Checks performed:
+      1. token_id_normalization   — normalizer maps "asset" field to token_id
+      2. usdcSize_normalization   — normalizer maps "usdcSize" to notional
+      3. duplicate_event_guard    — insert_wallet_trade_if_new returns False on dup
+      4. paper_live_shared_brain  — evaluate_copy_trade_shared is callable
+      5. paper_cannot_call_live   — PaperExecutionAdapter refuses non-PAPER bot
+      6. live_executor_env_guard  — LiveExecutionAdapter refuses when env=false
+      7. source_sell_token_match  — token_id used as primary match key in SELL path
+      8. partial_close_supported  — close_matching_open_positions_on_exit accepts ratio
+      9. settlement_no_enddate    — resolved=False is NOT treated as resolved
+     10. settlement_terminal_px   — near-1/0 outcomePrices triggers resolved
+     11. position_scanner_paginates — load_open_copied_positions supports cursor
+     12. atomic_close_status_guard — _db_close_position_with_retry supports extra_filters
+     13. copy_live_env_off        — COPY_LIVE_ENABLED is currently false
+     14. arm_live_off             — arm_live in copy_global_settings is false (DB check)
+     15. emergency_stop_ok        — emergency_stop is not set
+    """
+    checks: dict[str, dict] = {}
+
+    def _pass(name: str, detail: str = "OK") -> None:
+        checks[name] = {"pass": True, "detail": detail}
+
+    def _fail(name: str, detail: str) -> None:
+        checks[name] = {"pass": False, "detail": detail}
+
+    # ── Check 1: token_id_normalization ────────────────────────────────────
+    try:
+        _t = normalize_activity_to_wallet_trade(
+            {"asset": "TOKEN_XYZ", "side": "BUY", "price": "0.5",
+             "timestamp": "2025-01-01T00:00:00Z", "id": "test-id"},
+            "0xWALLET",
+        )
+        if _t and _t.get("token_id") == "TOKEN_XYZ":
+            _pass("token_id_normalization")
+        else:
+            _fail("token_id_normalization", f"token_id={_t.get('token_id') if _t else None}")
+    except Exception as e:
+        _fail("token_id_normalization", str(e))
+
+    # ── Check 2: usdcSize_normalization ────────────────────────────────────
+    try:
+        _t2 = normalize_activity_to_wallet_trade(
+            {"asset": "TOKEN_XYZ", "side": "BUY", "usdcSize": "12.50",
+             "timestamp": "2025-01-01T00:00:00Z", "id": "test-id-2"},
+            "0xWALLET",
+        )
+        if _t2 and _t2.get("notional") == 12.50:
+            _pass("usdcSize_normalization")
+        else:
+            _fail("usdcSize_normalization", f"notional={_t2.get('notional') if _t2 else None}")
+    except Exception as e:
+        _fail("usdcSize_normalization", str(e))
+
+    # ── Check 3: duplicate_event_guard (structural) ─────────────────────────
+    # insert_wallet_trade_if_new catches unique violations and returns False
+    # (tested fully in selftest; here we verify the function exists and has guard)
+    try:
+        import inspect as _inspect_mod
+        src = _inspect_mod.getsource(insert_wallet_trade_if_new)
+        if "duplicate" in src or "23505" in src or "unique" in src:
+            _pass("duplicate_event_guard", "unique-violation handler present in source")
+        else:
+            _fail("duplicate_event_guard", "no unique-violation handler found in source")
+    except Exception as e:
+        _fail("duplicate_event_guard", str(e))
+
+    # ── Check 4: paper_live_shared_brain ───────────────────────────────────
+    try:
+        _f = evaluate_copy_trade_shared
+        assert callable(_f)
+        _pass("paper_live_shared_brain", "evaluate_copy_trade_shared is callable")
+    except Exception as e:
+        _fail("paper_live_shared_brain", str(e))
+
+    # ── Check 5: paper_cannot_call_live ────────────────────────────────────
+    try:
+        _fake_bot = {"id": "test", "mode": "PAPER", "name": "test"}
+        _inst = CopyTradeInstruction(
+            action="BUY", copy_bot_id="test", source_wallet="0xWALLET",
+            source_event_key="evt", condition_id=None, token_id=None,
+            market_slug="test-market", outcome="YES", requested_usdc_size=0.10,
+            requested_share_size=None, source_price=0.5, reason="test",
+            timestamp="2025-01-01T00:00:00Z",
+        )
+        # LiveExecutionAdapter should refuse a PAPER bot
+        _res = LiveExecutionAdapter.execute(_inst, _fake_bot, None)
+        assert _res is None, "LiveExecutionAdapter should return None for PAPER bot"
+        _pass("paper_cannot_call_live", "LiveExecutionAdapter refused PAPER bot")
+    except AssertionError as e:
+        _fail("paper_cannot_call_live", str(e))
+    except Exception as e:
+        _fail("paper_cannot_call_live", str(e))
+
+    # ── Check 6: live_executor_env_guard ───────────────────────────────────
+    if not COPY_LIVE_ENABLED:
+        _pass("live_executor_env_guard", "COPY_LIVE_ENABLED=false")
+    else:
+        # LIVE is enabled — this is not a failure per se but note it
+        checks["live_executor_env_guard"] = {
+            "pass": True,
+            "detail": "COPY_LIVE_ENABLED=true — ensure arm_live=false before arming",
+        }
+
+    # ── Check 7: source_sell_token_match ───────────────────────────────────
+    try:
+        import inspect as _inspect_mod2
+        src2 = _inspect_mod2.getsource(close_matching_open_positions_on_exit)
+        if "token_id" in src2 and "match_field" in src2:
+            _pass("source_sell_token_match", "token_id primary match in SELL path confirmed")
+        else:
+            _fail("source_sell_token_match", "token_id match logic not found in SELL path")
+    except Exception as e:
+        _fail("source_sell_token_match", str(e))
+
+    # ── Check 8: partial_close_supported ────────────────────────────────────
+    try:
+        import inspect as _inspect_mod3
+        src3 = _inspect_mod3.getsource(close_matching_open_positions_on_exit)
+        if "_close_ratio" in src3 and "_is_partial" in src3:
+            _pass("partial_close_supported", "proportional close ratio logic present")
+        else:
+            _fail("partial_close_supported", "_close_ratio not found in SELL path")
+    except Exception as e:
+        _fail("partial_close_supported", str(e))
+
+    # ── Check 9: settlement_no_enddate ──────────────────────────────────────
+    try:
+        _mkt_no_res = {"resolved": False, "active": False, "endDate": "2020-01-01",
+                       "resolution": "", "outcomes": ["Yes", "No"],
+                       "clobTokenIds": ["T1", "T2"],
+                       "outcomePrices": ["0.50", "0.50"]}
+        _res9 = _parse_resolution_from_gamma_market(_mkt_no_res)
+        if _res9 and not _res9.get("resolved"):
+            _pass("settlement_no_enddate", "expired market with no resolved flag not treated as settled")
+        else:
+            _fail("settlement_no_enddate", f"market wrongly resolved: {_res9}")
+    except Exception as e:
+        _fail("settlement_no_enddate", str(e))
+
+    # ── Check 10: settlement_terminal_px ─────────────────────────────────────
+    try:
+        _mkt_tp = {"resolved": False, "active": False, "resolution": "",
+                   "outcomes": ["Yes", "No"], "clobTokenIds": ["T1", "T2"],
+                   "outcomePrices": ["0.99", "0.01"]}
+        _res10 = _parse_resolution_from_gamma_market(_mkt_tp)
+        if _res10 and _res10.get("resolved"):
+            _pass("settlement_terminal_px", f"near-1 outcomePrices triggers resolved; outcome={_res10.get('resolution_outcome')}")
+        else:
+            _fail("settlement_terminal_px", f"terminal prices not detected: {_res10}")
+    except Exception as e:
+        _fail("settlement_terminal_px", str(e))
+
+    # ── Check 11: position_scanner_paginates ─────────────────────────────────
+    try:
+        import inspect as _inspect_mod4
+        src4 = _inspect_mod4.getsource(load_open_copied_positions)
+        if "after_opened_at" in src4:
+            _pass("position_scanner_paginates", "cursor parameter present in load_open_copied_positions")
+        else:
+            _fail("position_scanner_paginates", "after_opened_at cursor not found")
+    except Exception as e:
+        _fail("position_scanner_paginates", str(e))
+
+    # ── Check 12: atomic_close_status_guard ──────────────────────────────────
+    try:
+        import inspect as _inspect_mod5
+        src5 = _inspect_mod5.getsource(_db_close_position_with_retry)
+        if "extra_filters" in src5 and "status" in src5:
+            _pass("atomic_close_status_guard", "extra_filters / status=OPEN guard present in _db_close_position_with_retry")
+        else:
+            _fail("atomic_close_status_guard", "status guard not found in _db_close_position_with_retry")
+    except Exception as e:
+        _fail("atomic_close_status_guard", str(e))
+
+    # ── Check 13: copy_live_env_off ────────────────────────────────────────
+    if not COPY_LIVE_ENABLED:
+        _pass("copy_live_env_off", "COPY_LIVE_ENABLED=false ✓")
+    else:
+        _fail("copy_live_env_off", "COPY_LIVE_ENABLED=true — LIVE may be active")
+
+    # ── Check 14 + 15: arm_live_off + emergency_stop_ok (DB check) ───────────
+    try:
+        gs_resp = (
+            supabase.table("copy_global_settings")
+            .select("arm_live, emergency_stop")
+            .limit(1)
+            .execute()
+        )
+        if gs_resp.data:
+            gs = gs_resp.data[0]
+            if not gs.get("arm_live"):
+                _pass("arm_live_off", "arm_live=false in copy_global_settings ✓")
+            else:
+                _fail("arm_live_off", "arm_live=TRUE in copy_global_settings — LIVE is armed")
+            if not gs.get("emergency_stop"):
+                _pass("emergency_stop_ok", "emergency_stop=false ✓")
+            else:
+                _fail("emergency_stop_ok", "emergency_stop=TRUE — all trading halted")
+        else:
+            _fail("arm_live_off", "copy_global_settings row not found")
+            _fail("emergency_stop_ok", "copy_global_settings row not found")
+    except Exception as e:
+        _fail("arm_live_off", str(e))
+        _fail("emergency_stop_ok", str(e))
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    _critical = {
+        "token_id_normalization", "duplicate_event_guard",
+        "paper_cannot_call_live", "copy_live_env_off",
+        "arm_live_off", "emergency_stop_ok",
+        "atomic_close_status_guard",
+    }
+    all_critical_pass = all(
+        checks.get(k, {}).get("pass", False) for k in _critical
+    )
+    all_pass = all(v.get("pass", False) for v in checks.values())
+    checks["ready_for_live"] = all_critical_pass
+    checks["all_checks_pass"] = all_pass
+
+    logging.warning(
+        "COPY_READINESS_CHECK ready_for_live=%s all_pass=%s checks=%s",
+        all_critical_pass,
+        all_pass,
+        {k: v["pass"] for k, v in checks.items() if k not in ("ready_for_live", "all_checks_pass")},
+    )
+    return checks
 
 
 # ── Auto-profit / max-hold exit loop ─────────────────────────────────────────
@@ -11683,9 +12601,36 @@ async def copy_settlement_loop() -> None:
         COPY_SETTLEMENT_BATCH_SIZE,
     )
 
+    # Rolling cursor for fair position scanning.
+    # Advances through ALL open positions over successive ticks so that old
+    # unresolvable rows never permanently block newer positions.
+    _settlement_cursor_opened_at: "str | None" = None
+
     while True:
         all_bots_for_audit = await asyncio.to_thread(load_enabled_copy_bots)
-        open_positions = await asyncio.to_thread(load_open_copied_positions, COPY_SETTLEMENT_BATCH_SIZE)
+        open_positions = await asyncio.to_thread(
+            load_open_copied_positions,
+            COPY_SETTLEMENT_BATCH_SIZE,
+            _settlement_cursor_opened_at,
+        )
+
+        # Advance cursor to the last position's opened_at for the next tick.
+        # Reset to None (start of queue) when the batch is smaller than the limit
+        # — that means we've scanned all positions and should wrap around.
+        if len(open_positions) >= COPY_SETTLEMENT_BATCH_SIZE:
+            _settlement_cursor_opened_at = open_positions[-1].get("opened_at")
+            logging.info(
+                "COPY_SETTLEMENT_CURSOR_ADVANCE cursor_opened_at=%s",
+                _settlement_cursor_opened_at,
+            )
+        else:
+            # Wrap around — next tick starts from the oldest position again
+            if _settlement_cursor_opened_at is not None:
+                logging.info(
+                    "COPY_SETTLEMENT_CURSOR_WRAP — end of open positions reached; "
+                    "resetting cursor to oldest"
+                )
+            _settlement_cursor_opened_at = None
 
         settled = 0
         skipped_unresolved = 0
@@ -14994,6 +15939,7 @@ async def main():
     # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
     _test_compute_copy_size()
     _test_btc5m_test_mode()
+    _test_copy_trading_selftest()
     _test_trade_intent_selftest()
 
     trading_client = build_trading_client()

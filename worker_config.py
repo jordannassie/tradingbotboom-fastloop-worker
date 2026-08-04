@@ -334,6 +334,19 @@ COPY_DATA_API_BASE = "https://data-api.polymarket.com"
 COPY_SETTLEMENT_LOOP_INTERVAL = int(os.getenv("COPY_SETTLEMENT_LOOP_INTERVAL", "90"))
 COPY_SETTLEMENT_BATCH_SIZE = int(os.getenv("COPY_SETTLEMENT_BATCH_SIZE", "100"))
 
+# COPY_SETTLEMENT_CURSOR_ENABLED: when true (default), the settlement loop uses
+# a rolling cursor so ALL open positions are eventually scanned, not just the
+# oldest COPY_SETTLEMENT_BATCH_SIZE rows.  Set to "false" to disable (legacy mode).
+COPY_SETTLEMENT_CURSOR_ENABLED: bool = (
+    os.getenv("COPY_SETTLEMENT_CURSOR_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+)
+
+# COPY_PAPER_BANKROLL_DEFAULT: default starting bankroll applied by the clean reset.
+# Also used as the default if copy_global_settings.paper_reset_bankroll_usd is absent.
+COPY_PAPER_BANKROLL_DEFAULT: float = float(
+    os.getenv("COPY_PAPER_BANKROLL_DEFAULT", "1000.0")
+)
+
 # COPY_AUTO_EXIT_LOOP_INTERVAL: seconds between auto-profit / max-hold scans.
 #   Default 60s — scans OPEN copied_positions for TP / max-hold triggers.
 #   Completely independent from settlement; does not touch copy trading ingestion.
