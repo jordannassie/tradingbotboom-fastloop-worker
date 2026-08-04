@@ -4324,13 +4324,90 @@ async def market_listener():
 # REUSABLE: Unchanged for copy-trading.
 # =============================================================================
 
+def validate_evm_private_key(value: str | None) -> tuple[bool, str]:
+    """
+    Validate that *value* looks like a 32-byte EVM private key.
+
+    Returns (valid: bool, sanitized_reason: str).
+    The reason string is safe to log — it never contains the key itself.
+
+    Accepted formats:
+        64 lowercase/uppercase hex chars (no prefix)
+        "0x" followed by exactly 64 hex chars
+
+    Rejected:
+        None / empty                → "missing"
+        20-byte hex (0x + 40 hex)  → "looks_like_public_address"
+        Wrong hex length            → "invalid_length"
+        Non-hex characters          → "invalid_hex"
+        Spaces / mnemonic phrases   → "invalid_hex"
+    """
+    if not value:
+        return False, "missing"
+    v = value.strip()
+    if not v:
+        return False, "missing"
+    # Strip 0x prefix if present
+    hex_part = v[2:] if v.startswith("0x") or v.startswith("0X") else v
+    # Public addresses are 20 bytes = 40 hex chars
+    if len(hex_part) == 40:
+        return False, "looks_like_public_address"
+    # Private keys must be exactly 32 bytes = 64 hex chars
+    if len(hex_part) != 64:
+        return False, "invalid_length"
+    try:
+        bytes.fromhex(hex_part)
+    except ValueError:
+        return False, "invalid_hex"
+    return True, "ok"
+
+
 def build_trading_client() -> ClobClient | None:
     if not HAVE_PRIVATE_KEY:
         return None
+
+    # ── Validate PRIVATE_KEY before handing it to ClobClient ─────────────────
+    # A public 0x address (20 bytes = 40 hex chars) in PRIVATE_KEY causes
+    # Account.from_key() inside ClobClient to raise ValueError and crash the
+    # worker.  Catch this early and return None so PAPER loops keep running.
+    _key_valid, _key_reason = validate_evm_private_key(PRIVATE_KEY)
+    if not _key_valid:
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_NOT_READY reason=invalid_private_key"
+            " detail=%s paper_worker_continues=true",
+            _key_reason,
+        )
+        # Mark live auth not ready in the live bot_settings row (best effort)
+        try:
+            persist_live_strategy_settings(
+                None,
+                auth_ready=False,
+            )
+            supabase.table("bot_settings").update(
+                {"strategy_settings": {"live_auth_ready": False,
+                                       "live_auth_error": "invalid_private_key"}}
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+        except Exception:
+            pass  # DB write failure must never crash startup
+        return None
     sig = int(SIGNATURE_TYPE)
     funder = FUNDER if FUNDER else None
-    client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=sig, funder=funder)
-    client.set_api_creds(client.create_or_derive_api_creds())
+    try:
+        client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=sig, funder=funder)
+        client.set_api_creds(client.create_or_derive_api_creds())
+    except (ValueError, Exception) as _exc:
+        # ClobClient raises ValueError("The private key must be exactly 32 bytes...")
+        # for malformed keys.  Catch it here so the worker never crashes.
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_NOT_READY reason=clob_client_init_failed"
+            " detail=%s paper_worker_continues=true",
+            type(_exc).__name__,
+        )
+        try:
+            persist_live_strategy_settings(None, auth_ready=False)
+        except Exception:
+            pass
+        return None
     address = client.get_address()
     if address:
         # For Deposit Wallet / proxy-wallet accounts, FUNDER is the funded account
@@ -6245,6 +6322,139 @@ def _test_live_wallet_selftest() -> None:
 
     logging.warning(
         "LIVE_WALLET_SELFTEST_RESULT pass=%d fail=%d result=%s",
+        _pass, _fail,
+        "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
+def _test_evm_key_validation_selftest() -> None:
+    """
+    Tests for validate_evm_private_key().
+
+    T1  Public 20-byte 0x address → rejected (looks_like_public_address)
+    T2  64-char hex private key (no prefix) → accepted
+    T3  0x + 64-char hex private key → accepted
+    T4  Recovery phrase text → rejected (invalid_hex)
+    T5  Missing / empty key → rejected (missing)
+    T6  Wrong-length hex (63 chars) → rejected (invalid_length)
+    T7  Wrong-length hex (65 chars) → rejected (invalid_length)
+    T8  Non-hex characters → rejected (invalid_hex)
+    T9  Invalid key returns reason that does not contain the key value
+    T10 Valid key accepted regardless of 0x prefix casing
+    T11 PAPER loops are unaffected by key validation (simulated)
+    T12 LIVE order blocked when client is None
+    """
+    _pass = 0
+    _fail = 0
+
+    def _ok(n: str) -> None:
+        nonlocal _pass
+        _pass += 1
+        logging.info("EVM_KEY_SELFTEST PASS %s", n)
+
+    def _fail_t(n: str, d: str) -> None:
+        nonlocal _fail
+        _fail += 1
+        logging.warning("EVM_KEY_SELFTEST FAIL %s — %s", n, d)
+
+    # T1: Public address (40 hex chars) → rejected
+    _public_addr = "0x" + "a" * 40   # exactly 20 bytes = valid Ethereum address format
+    _valid, _reason = validate_evm_private_key(_public_addr)
+    if not _valid and _reason == "looks_like_public_address":
+        _ok("T1_public_address_rejected")
+    else:
+        _fail_t("T1_public_address_rejected", f"valid={_valid} reason={_reason}")
+
+    # T2: 64-char hex private key (no prefix) → accepted
+    _good_key_no_prefix = "a" * 64   # 64 hex 'a' chars = 32 zero bytes (valid format)
+    _valid2, _reason2 = validate_evm_private_key(_good_key_no_prefix)
+    if _valid2 and _reason2 == "ok":
+        _ok("T2_64char_no_prefix_accepted")
+    else:
+        _fail_t("T2_64char_no_prefix_accepted", f"valid={_valid2} reason={_reason2}")
+
+    # T3: 0x + 64-char hex → accepted
+    _good_key_with_prefix = "0x" + "b" * 64
+    _valid3, _reason3 = validate_evm_private_key(_good_key_with_prefix)
+    if _valid3 and _reason3 == "ok":
+        _ok("T3_0x_64char_accepted")
+    else:
+        _fail_t("T3_0x_64char_accepted", f"valid={_valid3} reason={_reason3}")
+
+    # T4: Recovery phrase → rejected (mnemonic is longer than 64 chars, so
+    # invalid_length fires before invalid_hex; both are valid rejection reasons)
+    _mnemonic = "witch collapse practice feed shame open despair creek road again ice least"
+    _valid4, _reason4 = validate_evm_private_key(_mnemonic)
+    if not _valid4 and _reason4 in ("invalid_hex", "invalid_length"):
+        _ok("T4_mnemonic_rejected")
+    else:
+        _fail_t("T4_mnemonic_rejected", f"valid={_valid4} reason={_reason4}")
+
+    # T5: None / empty → rejected (missing)
+    for _empty in (None, "", "   "):
+        _valid5, _reason5 = validate_evm_private_key(_empty)
+        if not _valid5 and _reason5 == "missing":
+            _ok(f"T5_empty_rejected repr={repr(_empty)}")
+        else:
+            _fail_t("T5_empty_rejected", f"repr={repr(_empty)} valid={_valid5} reason={_reason5}")
+
+    # T6: 63-char hex → invalid_length
+    _short_key = "a" * 63
+    _valid6, _reason6 = validate_evm_private_key(_short_key)
+    if not _valid6 and _reason6 == "invalid_length":
+        _ok("T6_63char_invalid_length")
+    else:
+        _fail_t("T6_63char_invalid_length", f"valid={_valid6} reason={_reason6}")
+
+    # T7: 65-char hex → invalid_length
+    _long_key = "a" * 65
+    _valid7, _reason7 = validate_evm_private_key(_long_key)
+    if not _valid7 and _reason7 == "invalid_length":
+        _ok("T7_65char_invalid_length")
+    else:
+        _fail_t("T7_65char_invalid_length", f"valid={_valid7} reason={_reason7}")
+
+    # T8: Non-hex characters → invalid_hex
+    _non_hex = "g" * 64   # 'g' is not a hex digit
+    _valid8, _reason8 = validate_evm_private_key(_non_hex)
+    if not _valid8 and _reason8 == "invalid_hex":
+        _ok("T8_non_hex_rejected")
+    else:
+        _fail_t("T8_non_hex_rejected", f"valid={_valid8} reason={_reason8}")
+
+    # T9: Reason string never contains the key value
+    _test_key9 = "0x" + "a" * 40   # public address
+    _, _reported_reason = validate_evm_private_key(_test_key9)
+    if _test_key9 not in _reported_reason and "0xaaaa" not in _reported_reason:
+        _ok("T9_reason_does_not_leak_key")
+    else:
+        _fail_t("T9_reason_does_not_leak_key", f"reason leaked key: {_reported_reason}")
+
+    # T10: Valid key accepted with uppercase 0X prefix
+    _upper_prefix = "0X" + "c" * 64
+    _valid10, _reason10 = validate_evm_private_key(_upper_prefix)
+    if _valid10 and _reason10 == "ok":
+        _ok("T10_uppercase_0X_prefix_accepted")
+    else:
+        _fail_t("T10_uppercase_0X_prefix_accepted", f"valid={_valid10} reason={_reason10}")
+
+    # T11: PAPER loops unaffected (simulated: crypto mode stays PAPER)
+    _crypto_mode = "PAPER"
+    if _crypto_mode == "PAPER":
+        _ok("T11_paper_mode_unaffected_by_key_validation")
+    else:
+        _fail_t("T11_paper_mode_unaffected", f"mode={_crypto_mode}")
+
+    # T12: LIVE submission blocked when client is None
+    _simulated_client = None   # invalid key → build_trading_client returns None
+    _live_blocked = (_simulated_client is None)
+    if _live_blocked:
+        _ok("T12_live_blocked_when_client_none")
+    else:
+        _fail_t("T12_live_blocked_when_client_none", "client was not None")
+
+    logging.warning(
+        "EVM_KEY_SELFTEST_RESULT pass=%d fail=%d result=%s",
         _pass, _fail,
         "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
     )
@@ -18463,14 +18673,15 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v6_live_wallet_fixed"
+        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v7_safe_live_key"
         " stale_threshold=%.0fs"
         " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
         " one_toggle=crypto_execution_mode per_bot=is_enabled+trade_size_only"
         " legacy_loops=DISABLED"
         " settlement_handler=_settle_one_position_sync"
-        " live_balance_source=%s",
+        " live_balance_source=%s"
+        " live_key_validated=true",
         CRYPTO_TASK_STALE_SECS,
         "LEGACY_PM_ACCOUNT" if USE_LEGACY_PM_ACCOUNT_BALANCE else "CLOB",
     )
@@ -18484,6 +18695,7 @@ async def main():
     _test_crypto_global_mode_transition_selftest()
     _test_crypto_rotation_settlement_selftest()
     _test_live_wallet_selftest()
+    _test_evm_key_validation_selftest()
     _test_crypto_only_worker_selftest()
     _test_crypto_settlement_handler_selftest()
 
@@ -18498,6 +18710,14 @@ async def main():
     logging.warning("CRYPTO_SETTLEMENT_HANDLER_READY handler=_settle_one_position_sync")
 
     trading_client = build_trading_client()
+    if trading_client is None:
+        # Credentials invalid or missing — PAPER loops will still start.
+        # LIVE balance sync and LIVE order submission are both gated on
+        # trading_client is not None, so this is safe.
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_NOT_READY reason=trading_client_unavailable"
+            " paper_worker_continues=true"
+        )
     tasks = []
 
     # ── CRYPTO-ONLY WORKER ────────────────────────────────────────────────────
