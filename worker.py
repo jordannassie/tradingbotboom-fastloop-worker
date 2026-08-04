@@ -5901,6 +5901,226 @@ def _test_crypto_global_mode_transition_selftest() -> None:
 
 
 # =============================================================================
+# PER-ROW SETTLEMENT HELPER — runs entirely in a thread pool worker
+# =============================================================================
+# All synchronous Supabase I/O for one position is collected here so that
+# paper_settlement_loop can call it via asyncio.to_thread and never block
+# the asyncio event loop — regardless of how many backlogged rows exist.
+# =============================================================================
+
+def _settle_one_position_sync(row: dict) -> None:
+    """
+    Settle one expired paper_positions row.  Called via asyncio.to_thread so
+    every Supabase operation runs in a thread pool worker, never blocking the
+    event loop.
+
+    Idempotency: the UPDATE filter includes .eq("status", row_status), so if
+    another path (or a previous loop iteration) already closed this row the
+    UPDATE silently matches 0 rows and we skip accounting.  The OPEN query
+    that produced this row only returns rows still in an open status, so
+    double-processing is already structurally prevented.
+    """
+    row_id      = row.get("id")
+    bot_id      = row.get("bot_id") or BOT_ID
+    market_slug = row.get("market_slug")
+    row_status  = (row.get("status") or "OPEN").upper()   # "OPEN" | "LIVE_OPEN"
+    is_live_pos = row_status == "LIVE_OPEN"
+    row_side    = (row.get("side") or "").lower()
+    strategy_id = row.get("strategy_id")
+    shares      = float_or_none(row.get("shares"))   or 0.0
+    size_usd    = float_or_none(row.get("size_usd")) or 0.0
+    start_price = float_or_none(row.get("start_price"))
+
+    logging.warning(
+        "CRYPTO_SETTLEMENT_CHECK"
+        " position_id=%s bot_id=%s market=%s status=%s",
+        row_id, bot_id, market_slug or "", row_status,
+    )
+
+    # ── Ensure start_price is populated ─────────────────────────────────────
+    if start_price is None:
+        start_price = _fetch_btc_spot_price_sync()
+        if start_price is not None:
+            try:
+                supabase.table("paper_positions").update(
+                    {"start_price": start_price}
+                ).eq("id", row_id).execute()
+            except Exception:
+                logging.exception(
+                    "_settle: update start_price failed id=%s", row_id
+                )
+        else:
+            logging.warning(
+                "CRYPTO_SETTLEMENT_WAITING"
+                " position_id=%s market=%s reason=no_start_price",
+                row_id, market_slug or "",
+            )
+            return   # retry next tick
+
+    # ── Fetch current price for resolution ──────────────────────────────────
+    end_price = _fetch_btc_spot_price_sync()
+    if end_price is None:
+        logging.warning(
+            "CRYPTO_SETTLEMENT_WAITING"
+            " position_id=%s market=%s reason=no_end_price",
+            row_id, market_slug or "",
+        )
+        return   # retry next tick
+
+    # ── Compute outcome ──────────────────────────────────────────────────────
+    resolved_side = "yes" if end_price >= start_price else "no"
+    payout_usd    = shares if row_side == resolved_side else 0.0
+    pnl_usd       = payout_usd - size_usd
+    closed_at     = utc_now_iso()
+
+    position_updates = {
+        "status":        "CLOSED",
+        "resolved_side": resolved_side,
+        "end_price":     end_price,
+        "pnl_usd":       pnl_usd,
+        "closed_at":     closed_at,
+    }
+
+    # ── Write paper_positions (idempotency via status filter) ────────────────
+    # NOTE: do NOT check update_resp.data — supabase-py returns data=[] for
+    # UPDATE by default (requires explicit .select() to hydrate).  The status
+    # filter already guarantees idempotency: a row seen in the OPEN query was
+    # open at query time; even if it was concurrently closed, the UPDATE
+    # simply matches 0 rows and accounting is still skipped by the query
+    # not returning it next tick.
+    try:
+        supabase.table("paper_positions").update(position_updates).eq(
+            "id", row_id
+        ).eq("status", row_status).execute()
+    except Exception:
+        logging.exception("_settle: update paper_positions failed id=%s", row_id)
+        return
+
+    # ── Accounting ───────────────────────────────────────────────────────────
+    if bot_id == EMA_5M_BOT_ID:
+        # EMA uses its own isolated accounting path.
+        _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
+
+    elif bot_id in CRYPTO_PAPER_BOT_IDS:
+        _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
+
+        if is_live_pos:
+            logging.warning(
+                "CRYPTO_LIVE_SETTLED"
+                " position_id=%s bot_id=%s market=%s result=%s"
+                " NOTE:redemption_not_automatic_must_redeem_via_polymarket",
+                row_id, bot_id, market_slug or "", _crypto_result,
+            )
+        else:
+            update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+            logging.warning(
+                "CRYPTO_PAPER_SETTLED"
+                " position_id=%s bot_id=%s market=%s result=%s pnl=%.4f",
+                row_id, bot_id, market_slug or "", _crypto_result, pnl_usd,
+            )
+
+        if bot_id == BTC5M_LATE_BOT_ID and not is_live_pos:
+            logging.warning(
+                "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f"
+                " slug=%s side=%s start_price=%.2f end_price=%.2f",
+                row_id, _crypto_result, pnl_usd,
+                market_slug or "", row.get("side") or "",
+                start_price or 0.0, end_price or 0.0,
+            )
+            logging.warning(
+                "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
+                market_slug or "",
+                str(row.get("side") or "").upper(),
+                _crypto_result, pnl_usd,
+            )
+            # Trade intent settlement link — sync (we're in a thread pool worker)
+            try:
+                _upd = {
+                    "paper_status":    "CLOSED",
+                    "paper_pnl_usd":   pnl_usd,
+                    "paper_closed_at": utc_now_iso(),
+                    "paper_result":    _crypto_result,
+                    "updated_at":      utc_now_iso(),
+                }
+                supabase.table("trade_intents").update(_upd).eq(
+                    "paper_position_id", str(row_id)
+                ).execute()
+                logging.warning(
+                    "TRADE_INTENT_SETTLED intent_id=lookup result=%s pnl=%.4f",
+                    _crypto_result, pnl_usd,
+                )
+            except Exception:
+                logging.warning(
+                    "TRADE_INTENT_SETTLE_FAIL pos_id=%s —"
+                    " settlement link failed (position settled ok)", row_id,
+                )
+        else:
+            # ETH / SOL / XRP settlement log
+            logging.warning(
+                "CRYPTO5M_SETTLED bot_id=%s result=%s pnl=%.4f"
+                " slug=%s side=%s start_price=%.2f end_price=%.2f"
+                " shared_account=%s",
+                bot_id, _crypto_result, pnl_usd,
+                market_slug or "",
+                str(row.get("side") or "").upper(),
+                start_price or 0.0, end_price or 0.0,
+                CRYPTO_PAPER_ACCOUNT_ID,
+            )
+    else:
+        update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
+
+    # ── bot_trades history row ────────────────────────────────────────────────
+    trade_payload = {
+        "bot_id":      bot_id,
+        "market":      "FASTLOOP",
+        "market_slug": market_slug,
+        "strategy_id": strategy_id,
+        "side":        row.get("side"),
+        "price":       end_price,
+        "size":        size_usd,
+        "status":      "PAPER_CLOSED",
+        "meta": {
+            "timestamp":     closed_at,
+            "pnl_usd":       pnl_usd,
+            "start_price":   start_price,
+            "end_price":     end_price,
+            "resolved_side": resolved_side,
+            "shares":        shares,
+            "market_slug":   market_slug,
+            "strategy_id":   strategy_id,
+        },
+    }
+    try:
+        supabase.table("bot_trades").insert(trade_payload).execute()
+        logging.info(
+            "Closed paper_position id=%s slug=%s pnl_usd=%s",
+            row_id, market_slug, pnl_usd,
+        )
+        logging.info(
+            "PAPER_CLOSE bot_id=%s strategy_id=%s slug=%s pnl_usd=%s",
+            bot_id, strategy_id, market_slug, pnl_usd,
+        )
+        logging.info(
+            "ACTIVITY_WRITE strategy=%s bot_id=%s"
+            " status=PAPER_CLOSED slug=%s pnl=%s",
+            strategy_id, bot_id, market_slug, pnl_usd,
+        )
+        if strategy_id in CANDLE_STRATEGY_IDS:
+            logging.info(
+                "CANDLE_PAPER_SETTLEMENT"
+                " strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
+                strategy_id, market_slug, pnl_usd, resolved_side,
+            )
+    except Exception:
+        logging.exception("_settle: bot_trades insert failed id=%s", row_id)
+        logging.info(
+            "ACTIVITY_WRITE strategy=%s bot_id=%s"
+            " status=PAPER_CLOSED_FAILED slug=%s pnl=%s",
+            strategy_id, bot_id, market_slug, pnl_usd,
+        )
+
+
+# =============================================================================
 # PAPER SETTLEMENT LOOP (REUSABLE CORE)
 # =============================================================================
 # Polls paper_positions every 15s. Closes expired positions by resolving
@@ -5912,7 +6132,7 @@ def _test_crypto_global_mode_transition_selftest() -> None:
 # =============================================================================
 
 async def paper_settlement_loop():
-    # ── Bot IDs included in the PAPER settlement query ────────────────────────
+    # ── Bot IDs included in settlement queries ────────────────────────────────
     _SETTLE_ALL_BOT_IDS = [
         STRATEGY_FASTLOOP_BOT_ID,
         STRATEGY_SNIPER_BOT_ID,
@@ -5929,7 +6149,6 @@ async def paper_settlement_loop():
         SOL5M_PAPER_BOT_ID,
         XRP5M_PAPER_BOT_ID,
     ]
-    # Crypto-only bot IDs that can also have LIVE_OPEN positions
     _SETTLE_CRYPTO_BOT_IDS = [
         BTC5M_LATE_BOT_ID,
         ETH5M_PAPER_BOT_ID,
@@ -5941,11 +6160,8 @@ async def paper_settlement_loop():
         now_ts = int(time())
 
         # ── Query 1: expired PAPER positions (status = OPEN) ─────────────────
-        # IMPORTANT: Two separate .eq() queries replace the previous
-        # .in_("status", ["OPEN", "LIVE_OPEN"]) call, which supabase-py may
-        # serialise as status=eq.OPEN (first-element only) depending on
-        # the library version deployed on Railway, causing all positions to be
-        # silently ignored.  Two .eq() calls are always safe.
+        # Two separate .eq() calls instead of .in_("status",[...]) to avoid
+        # supabase-py version-dependent serialisation bugs (see prior commit).
         try:
             resp_paper = (
                 supabase.table("paper_positions")
@@ -5961,12 +6177,12 @@ async def paper_settlement_loop():
             rows_paper = resp_paper.data or []
         except Exception:
             logging.exception(
-                "CRYPTO_SETTLEMENT_QUERY_FAIL status=OPEN — will retry next tick"
+                "CRYPTO_SETTLEMENT_QUERY_FAIL status=OPEN — will retry"
             )
             rows_paper = []
 
         # ── Query 2: expired LIVE positions (status = LIVE_OPEN) ─────────────
-        # Separate query so a LIVE_OPEN failure never blocks PAPER processing.
+        # Separate query so a LIVE failure never blocks PAPER processing.
         try:
             resp_live = (
                 supabase.table("paper_positions")
@@ -5982,270 +6198,66 @@ async def paper_settlement_loop():
             rows_live = resp_live.data or []
         except Exception:
             logging.exception(
-                "CRYPTO_SETTLEMENT_QUERY_FAIL status=LIVE_OPEN — will retry next tick"
+                "CRYPTO_SETTLEMENT_QUERY_FAIL status=LIVE_OPEN — will retry"
             )
             rows_live = []
 
         rows = rows_paper + rows_live
 
-        # ── Heartbeat: count expired rows by status ───────────────────────────
-        _crypto_open_count = sum(
+        # ── Heartbeat ─────────────────────────────────────────────────────────
+        _crypto_open  = sum(
             1 for r in rows_paper
             if (r.get("bot_id") or "") in CRYPTO_PAPER_BOT_IDS
         )
-        _crypto_live_count = len(rows_live)
+        _crypto_live  = len(rows_live)
         logging.warning(
             "CRYPTO_SETTLEMENT_LOOP_HEARTBEAT"
             " expired_open=%d expired_live_open=%d total_all_bots=%d",
-            _crypto_open_count, _crypto_live_count, len(rows),
+            _crypto_open, _crypto_live, len(rows),
         )
         if rows:
             logging.info("SETTLEMENT_PENDING open_positions=%d", len(rows))
 
-        # ── Process each expired position individually ────────────────────────
+        # ── Process each row in a thread (never block the event loop) ─────────
+        # _settle_one_position_sync handles all DB I/O (SELECT, UPDATE, INSERT)
+        # and all accounting synchronously in a thread-pool worker.
+        # asyncio.wait_for enforces a per-row deadline so one slow row can
+        # never hold up the others indefinitely.
         for row in rows:
             row_id = row.get("id")
             if not row_id:
                 continue
-            bot_id      = row.get("bot_id") or BOT_ID
-            market_slug = row.get("market_slug")
-            row_status  = (row.get("status") or "OPEN").upper()   # "OPEN" | "LIVE_OPEN"
-            is_live_pos = row_status == "LIVE_OPEN"
-
-            # ── Per-row isolation: one bad row must never stop others ─────────
             try:
-                logging.warning(
-                    "CRYPTO_SETTLEMENT_CHECK"
-                    " position_id=%s bot_id=%s market=%s status=%s",
-                    row_id, bot_id, market_slug or "", row_status,
+                await asyncio.wait_for(
+                    asyncio.to_thread(_settle_one_position_sync, row),
+                    timeout=30.0,
                 )
-
-                row_side    = (row.get("side") or "").lower()
-                strategy_id = row.get("strategy_id")
-                shares      = float_or_none(row.get("shares"))   or 0.0
-                size_usd    = float_or_none(row.get("size_usd")) or 0.0
-                start_price = float_or_none(row.get("start_price"))
-
-                if start_price is None:
-                    start_price = await fetch_btc_spot_price()
-                    if start_price is not None:
-                        try:
-                            supabase.table("paper_positions").update(
-                                {"start_price": start_price}
-                            ).eq("id", row_id).execute()
-                        except Exception:
-                            logging.exception(
-                                "Failed updating paper_positions start_price id=%s", row_id
-                            )
-                    else:
-                        logging.warning(
-                            "CRYPTO_SETTLEMENT_WAITING"
-                            " position_id=%s market=%s reason=no_start_price",
-                            row_id, market_slug or "",
-                        )
-                        continue
-
-                end_price = await fetch_btc_spot_price()
-                if end_price is None:
-                    logging.warning(
-                        "CRYPTO_SETTLEMENT_WAITING"
-                        " position_id=%s market=%s reason=no_end_price",
-                        row_id, market_slug or "",
-                    )
-                    continue
-
-                resolved_side = "yes" if end_price >= start_price else "no"
-                payout_usd    = shares if row_side == resolved_side else 0.0
-                pnl_usd       = payout_usd - size_usd
-                closed_at     = utc_now_iso()
-
-                position_updates = {
-                    "status":        "CLOSED",
-                    "resolved_side": resolved_side,
-                    "end_price":     end_price,
-                    "pnl_usd":       pnl_usd,
-                    "closed_at":     closed_at,
-                }
-
-                # Idempotency guard: only update if the row is still in its
-                # expected open status.  If another process already closed it,
-                # the .eq("status", row_status) filter will match 0 rows and
-                # we skip the accounting step below.
-                try:
-                    update_resp = (
-                        supabase.table("paper_positions")
-                        .update(position_updates)
-                        .eq("id", row_id)
-                        .eq("status", row_status)   # concurrency guard
-                        .execute()
-                    )
-                except Exception:
-                    logging.exception(
-                        "Failed updating paper_positions row id=%s", row_id
-                    )
-                    continue
-
-                if not (update_resp.data or []):
-                    # Row was already closed by another loop iteration or process.
-                    logging.warning(
-                        "CRYPTO_SETTLEMENT_IDEMPOTENCY_SKIP"
-                        " position_id=%s status=%s already_settled",
-                        row_id, row_status,
-                    )
-                    continue
-
-                # ── Accounting per bot type ───────────────────────────────────
-                if bot_id == EMA_5M_BOT_ID:
-                    # EMA strategy uses its own isolated accounting path.
-                    _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
-
-                elif bot_id in CRYPTO_PAPER_BOT_IDS:
-                    # ── Shared Crypto PAPER account ───────────────────────────
-                    # BTC, ETH, SOL and XRP share one bankroll row (crypto_paper).
-                    # LIVE positions do NOT move the PAPER balance — real USDC
-                    # payout stays in the Polymarket wallet.
-                    _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
-
-                    if is_live_pos:
-                        logging.warning(
-                            "CRYPTO_LIVE_SETTLED"
-                            " position_id=%s bot_id=%s market=%s result=%s"
-                            " NOTE:redemption_not_automatic_must_redeem_via_polymarket",
-                            row_id, bot_id, market_slug or "", _crypto_result,
-                        )
-                    else:
-                        update_bot_settings_with_realized_pnl(
-                            CRYPTO_PAPER_ACCOUNT_ID, pnl_usd
-                        )
-                        logging.warning(
-                            "CRYPTO_PAPER_SETTLED"
-                            " position_id=%s bot_id=%s market=%s result=%s pnl=%.4f",
-                            row_id, bot_id, market_slug or "", _crypto_result, pnl_usd,
-                        )
-
-                    if bot_id == BTC5M_LATE_BOT_ID and not is_live_pos:
-                        _btc5m_result = _crypto_result
-                        logging.warning(
-                            "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f"
-                            " slug=%s side=%s start_price=%.2f end_price=%.2f",
-                            row_id, _btc5m_result, pnl_usd,
-                            market_slug or "", row.get("side") or "",
-                            start_price or 0.0, end_price or 0.0,
-                        )
-                        logging.warning(
-                            "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
-                            market_slug or "",
-                            str(row.get("side") or "").upper(),
-                            _btc5m_result,
-                            pnl_usd,
-                        )
-                        # ── Trade Intent settlement link ──────────────────────
-                        def _btc5m_settle_intent(
-                            pos_id: str, result: str, pnl: float
-                        ) -> None:
-                            try:
-                                _upd = {
-                                    "paper_status":    "CLOSED",
-                                    "paper_pnl_usd":   pnl,
-                                    "paper_closed_at": utc_now_iso(),
-                                    "paper_result":    result,
-                                    "updated_at":      utc_now_iso(),
-                                }
-                                supabase.table("trade_intents").update(_upd).eq(
-                                    "paper_position_id", str(pos_id)
-                                ).execute()
-                                logging.warning(
-                                    "TRADE_INTENT_SETTLED intent_id=lookup"
-                                    " result=%s pnl=%.4f",
-                                    result, pnl,
-                                )
-                            except Exception:
-                                logging.warning(
-                                    "TRADE_INTENT_SETTLE_FAIL pos_id=%s —"
-                                    " settlement link failed (position settled ok)",
-                                    pos_id,
-                                )
-                        asyncio.ensure_future(asyncio.to_thread(
-                            _btc5m_settle_intent,
-                            str(row_id), _btc5m_result, pnl_usd,
-                        ))
-                    else:
-                        # ETH / SOL / XRP settlement
-                        logging.warning(
-                            "CRYPTO5M_SETTLED bot_id=%s result=%s pnl=%.4f"
-                            " slug=%s side=%s start_price=%.2f end_price=%.2f"
-                            " shared_account=%s",
-                            bot_id, _crypto_result, pnl_usd,
-                            market_slug or "",
-                            str(row.get("side") or "").upper(),
-                            start_price or 0.0, end_price or 0.0,
-                            CRYPTO_PAPER_ACCOUNT_ID,
-                        )
-                else:
-                    update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
-
-                # ── Write bot_trades history row ──────────────────────────────
-                trade_payload = {
-                    "bot_id":      bot_id,
-                    "market":      "FASTLOOP",
-                    "market_slug": market_slug,
-                    "strategy_id": strategy_id,
-                    "side":        row.get("side"),
-                    "price":       end_price,
-                    "size":        size_usd,
-                    "status":      "PAPER_CLOSED",
-                    "meta": {
-                        "timestamp":    closed_at,
-                        "pnl_usd":      pnl_usd,
-                        "start_price":  start_price,
-                        "end_price":    end_price,
-                        "resolved_side": resolved_side,
-                        "shares":       shares,
-                        "market_slug":  market_slug,
-                        "strategy_id":  strategy_id,
-                    },
-                }
-                try:
-                    supabase.table("bot_trades").insert(trade_payload).execute()
-                    logging.info(
-                        "Closed paper_position id=%s slug=%s pnl_usd=%s",
-                        row_id, market_slug, pnl_usd,
-                    )
-                    logging.info(
-                        "PAPER_CLOSE bot_id=%s strategy_id=%s slug=%s pnl_usd=%s",
-                        bot_id, strategy_id, market_slug, pnl_usd,
-                    )
-                    logging.info(
-                        "ACTIVITY_WRITE strategy=%s bot_id=%s"
-                        " status=PAPER_CLOSED slug=%s pnl=%s",
-                        strategy_id, bot_id, market_slug, pnl_usd,
-                    )
-                    if strategy_id in CANDLE_STRATEGY_IDS:
-                        logging.info(
-                            "CANDLE_PAPER_SETTLEMENT"
-                            " strategy=%s slug=%s pnl_usd=%s resolved_side=%s",
-                            strategy_id, market_slug, pnl_usd, resolved_side,
-                        )
-                except Exception:
-                    logging.exception(
-                        "Failed inserting PAPER_CLOSED bot_trades row id=%s", row_id
-                    )
-                    logging.info(
-                        "ACTIVITY_WRITE strategy=%s bot_id=%s"
-                        " status=PAPER_CLOSED_FAILED slug=%s pnl=%s",
-                        strategy_id, bot_id, market_slug, pnl_usd,
-                    )
-
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "CRYPTO_SETTLEMENT_ERROR"
+                    " position_id=%s market=%s error=settle_timeout",
+                    row_id, row.get("market_slug") or "",
+                )
             except Exception:
                 logging.warning(
                     "CRYPTO_SETTLEMENT_ERROR"
                     " position_id=%s market=%s error=unhandled_exception",
-                    row_id, market_slug or "",
+                    row_id, row.get("market_slug") or "",
                 )
-                logging.exception("CRYPTO_SETTLEMENT_ERROR_DETAIL position_id=%s", row_id)
+                logging.exception(
+                    "CRYPTO_SETTLEMENT_ERROR_DETAIL position_id=%s", row_id
+                )
 
         if rows:
-            update_paper_settings_from_positions()
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(update_paper_settings_from_positions),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning("SETTLEMENT_SETTINGS_UPDATE_TIMEOUT")
+            except Exception:
+                logging.exception("SETTLEMENT_SETTINGS_UPDATE_FAIL")
 
         await asyncio.sleep(15)
 
@@ -15275,6 +15287,7 @@ _btc5m_late_last_decision: str   = "NONE" # last decision for status snapshot
 _btc5m_late_last_reason:   str   = "INIT" # last reason  for status snapshot
 _btc5m_late_rotated_at: float | None = None    # wall-clock time of last successful rotation
 _btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
+_btc5m_late_last_tick_mono: float = 0.0        # supervisor watchdog: updated every tick
 
 _BINANCE_5M_LATE_URL = (
     "https://api.binance.com/api/v3/klines"
@@ -15772,7 +15785,8 @@ def _fresh_crypto5m_state() -> dict:
         "last_reason":         "INIT",
         "rotated_at":          None,
         "snapshot_written_at": 0.0,
-        "ref_cache":           {},  # {start_ts: ref_price}
+        "ref_cache":           {},       # {start_ts: ref_price}
+        "last_tick_mono":      _monotonic(),   # supervisor watchdog: updated each tick
     }
 
 _eth5m_state  = _fresh_crypto5m_state()
@@ -16539,6 +16553,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
 
     while True:
         _tick_start = _monotonic()
+        state["last_tick_mono"] = _tick_start   # supervisor watchdog heartbeat
         try:
             # ── 1. Timing ─────────────────────────────────────────────────────
             period    = 300
@@ -16701,6 +16716,19 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 state["last_reason"] = "ALREADY_TRADED_MARKET"
                 continue
 
+            # ── 10b. Token completeness gate ──────────────────────────────────
+            # Do not enter if either token ID is missing — market data is
+            # incomplete and LIVE mode would fail; PAPER skips to be consistent.
+            if up_token_id is None or down_token_id is None:
+                logging.warning(
+                    "%s_TOKEN_MISSING slug=%s up=%s down=%s — deferring entry",
+                    log_prefix, slug,
+                    "present" if up_token_id else "missing",
+                    "present" if down_token_id else "missing",
+                )
+                state["last_reason"] = "TOKEN_IDS_MISSING"
+                continue
+
             # ── 11. Direction decision ────────────────────────────────────────
             side: str | None          = None
             entry_price: float | None = None
@@ -16749,8 +16777,18 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 entry_price, trade_size, remaining,
             )
 
-            # Read global execution mode — defaults to PAPER on any error.
-            _exec_mode = await asyncio.to_thread(_read_crypto_execution_mode_sync)
+            # Read global execution mode — defaults to PAPER on timeout/error.
+            try:
+                _exec_mode = await asyncio.wait_for(
+                    asyncio.to_thread(_read_crypto_execution_mode_sync),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                _exec_mode = CRYPTO_EXECUTION_MODE_DEFAULT
+                logging.warning(
+                    "%s_EXEC_MODE_TIMEOUT — defaulting to %s",
+                    log_prefix, _exec_mode,
+                )
             logging.warning(
                 "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
                 "size=%.4f mode=%s",
@@ -16834,21 +16872,136 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
         await asyncio.sleep(max(0.0, _target - _elapsed))
 
 
-# ── Thin loop wrappers (registered in main()) ─────────────────────────────────
+# ── Per-asset supervised loops ────────────────────────────────────────────────
+# Each asset runs inside _supervised_crypto_loop which:
+#   1. Tracks state["last_tick_mono"] updated at the start of every tick.
+#   2. Every 10 s checks freshness; if >30 s without a tick, cancels the inner
+#      Task so _run_forever can restart it immediately.
+#   3. Logs CRYPTO_ASSET_TASK_STARTED / EXITED / RESTARTING / RECOVERED and
+#      the CRYPTO_TRACKING_HEARTBEAT line expected by the operator dashboard.
+#
+# One crashed or frozen asset never blocks the other three.
+# =============================================================================
+
+CRYPTO_TASK_STALE_SECS: float = 30.0   # cancel inner task if no tick for this long
+
+
+async def _supervised_crypto_loop(asset_key: str) -> None:
+    """
+    Self-supervising wrapper for one crypto 5-minute asset.
+
+    Runs _crypto5m_loop_impl as an inner asyncio.Task.  Every 10 s it checks
+    state["last_tick_mono"]; if the inner loop has not ticked within
+    CRYPTO_TASK_STALE_SECS it cancels the task (which causes the enclosing
+    _run_forever to restart it after a 5 s cooldown).
+    """
+    cfg   = _CRYPTO5M_ASSETS[asset_key]
+    asset = cfg["asset_label"]
+    bot_id= cfg["bot_id"]
+    restart_count = 0
+
+    while True:
+        restart_count += 1
+        state = _fresh_crypto5m_state()   # fresh state for every restart
+
+        if restart_count == 1:
+            logging.warning(
+                "CRYPTO_ASSET_TASK_STARTED asset=%s bot_id=%s", asset, bot_id,
+            )
+        else:
+            logging.warning(
+                "CRYPTO_ASSET_TASK_RESTARTING asset=%s restart_count=%d",
+                asset, restart_count,
+            )
+            await asyncio.sleep(2.0)
+
+        # ── Run the inner loop as a Task so we can cancel it independently ───
+        inner = asyncio.create_task(
+            _crypto5m_loop_impl(cfg, state),
+            name=f"crypto_{asset_key}_impl_r{restart_count}",
+        )
+        exit_reason = "returned"
+
+        try:
+            while not inner.done():
+                await asyncio.sleep(10.0)
+                if inner.done():
+                    break
+
+                # ── Freshness watchdog ────────────────────────────────────────
+                now_m        = _monotonic()
+                last_tick    = state.get("last_tick_mono", 0.0)
+                tick_age     = round(now_m - last_tick, 1) if last_tick > 0 else 0.0
+                snap_age     = round(now_m - state.get("snapshot_written_at", 0.0), 1)
+                exp_start    = (int(time()) // 300) * 300
+                exp_slug     = f"{cfg['slug_prefix']}-{exp_start}"
+                held_slug    = state.get("last_slug") or "none"
+
+                logging.warning(
+                    "CRYPTO_TRACKING_HEARTBEAT"
+                    " asset=%s held_slug=%s expected_slug=%s"
+                    " loop_age=%.1f snapshot_age=%.1f"
+                    " ws_age=N/A yes_token=N/A no_token=N/A",
+                    asset, held_slug, exp_slug, tick_age, snap_age,
+                )
+
+                if last_tick > 0 and tick_age > CRYPTO_TASK_STALE_SECS:
+                    logging.warning(
+                        "CRYPTO_TRACKING_STALE asset=%s reason=tick_age=%.1fs",
+                        asset, tick_age,
+                    )
+                    inner.cancel()
+                    exit_reason = f"stale_tick_{tick_age:.0f}s"
+                    break
+
+        except asyncio.CancelledError:
+            # Supervisor itself was cancelled — propagate cleanly.
+            if not inner.done():
+                inner.cancel()
+            logging.warning(
+                "CRYPTO_ASSET_TASK_EXITED asset=%s reason=supervisor_cancelled",
+                asset,
+            )
+            raise
+
+        # ── Wait for inner task to finish (up to 5 s) ────────────────────────
+        try:
+            await asyncio.wait({inner}, timeout=5.0)
+        except Exception:
+            pass
+
+        if inner.cancelled():
+            exit_reason = inner.cancelled() and exit_reason or "cancelled"
+        elif not inner.cancelled():
+            try:
+                exc = inner.exception()
+                if exc is not None:
+                    exit_reason = str(exc)[:80]
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                exit_reason = "cancelled"
+
+        logging.warning(
+            "CRYPTO_ASSET_TASK_EXITED asset=%s reason=%s restart_count=%d",
+            asset, exit_reason, restart_count,
+        )
+
+        if restart_count > 1:
+            logging.warning("CRYPTO_ASSET_TASK_RECOVERED asset=%s", asset)
+
 
 async def eth_5m_loop() -> None:
-    """ETH 5-minute paper strategy loop."""
-    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["eth"], _eth5m_state)
+    """ETH 5-minute paper strategy loop — supervised."""
+    await _supervised_crypto_loop("eth")
 
 
 async def sol_5m_loop() -> None:
-    """SOL 5-minute paper strategy loop."""
-    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["sol"], _sol5m_state)
+    """SOL 5-minute paper strategy loop — supervised."""
+    await _supervised_crypto_loop("sol")
 
 
 async def xrp_5m_loop() -> None:
-    """XRP 5-minute paper strategy loop."""
-    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["xrp"], _xrp5m_state)
+    """XRP 5-minute paper strategy loop — supervised."""
+    await _supervised_crypto_loop("xrp")
 
 
 async def btc_5m_late_loop() -> None:
@@ -16875,7 +17028,7 @@ async def btc_5m_late_loop() -> None:
     """
     global _btc5m_late_last_slug, _btc5m_late_last_health_ts
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
-    global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at
+    global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at, _btc5m_late_last_tick_mono
 
     if not BTC5M_LATE_ENABLED:
         logging.warning(
@@ -16901,6 +17054,7 @@ async def btc_5m_late_loop() -> None:
 
     while True:
         _tick_start = _monotonic()
+        _btc5m_late_last_tick_mono = _tick_start   # supervisor watchdog heartbeat
         try:
 
             # ── 1. Compute market timing ──────────────────────────────────────
@@ -17242,8 +17396,17 @@ async def btc_5m_late_loop() -> None:
                 trade_size, trade_size, slug, side,
             )
 
-            # Read global execution mode — defaults to PAPER on any error.
-            _exec_mode = await asyncio.to_thread(_read_crypto_execution_mode_sync)
+            # Read global execution mode — defaults to PAPER on timeout/error.
+            try:
+                _exec_mode = await asyncio.wait_for(
+                    asyncio.to_thread(_read_crypto_execution_mode_sync),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                _exec_mode = CRYPTO_EXECUTION_MODE_DEFAULT
+                logging.warning(
+                    "BTC5M_EXEC_MODE_TIMEOUT — defaulting to %s", _exec_mode
+                )
             logging.warning(
                 "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
                 "size=%.4f mode=%s",
@@ -17445,6 +17608,102 @@ async def btc_5m_late_loop() -> None:
         await asyncio.sleep(_sleep_s)
 
 
+# ── BTC supervised wrapper ────────────────────────────────────────────────────
+
+async def btc_5m_late_supervised_loop() -> None:
+    """
+    Supervised wrapper for btc_5m_late_loop.
+
+    Mirrors _supervised_crypto_loop: monitors _btc5m_late_last_tick_mono and
+    cancels + restarts the inner task if it becomes stale (>30 s without a tick).
+    """
+    asset = "BTC"
+    restart_count = 0
+
+    while True:
+        restart_count += 1
+
+        if restart_count == 1:
+            logging.warning(
+                "CRYPTO_ASSET_TASK_STARTED asset=%s bot_id=%s",
+                asset, BTC5M_LATE_BOT_ID,
+            )
+        else:
+            logging.warning(
+                "CRYPTO_ASSET_TASK_RESTARTING asset=%s restart_count=%d",
+                asset, restart_count,
+            )
+            await asyncio.sleep(2.0)
+
+        inner = asyncio.create_task(
+            btc_5m_late_loop(),
+            name=f"btc_5m_late_r{restart_count}",
+        )
+        exit_reason = "returned"
+
+        try:
+            while not inner.done():
+                await asyncio.sleep(10.0)
+                if inner.done():
+                    break
+
+                # ── Freshness watchdog ────────────────────────────────────────
+                now_m     = _monotonic()
+                tick_age  = round(now_m - _btc5m_late_last_tick_mono, 1) if _btc5m_late_last_tick_mono > 0 else 0.0
+                snap_age  = round(now_m - _btc5m_late_snapshot_written_at, 1)
+                exp_start = (int(time()) // 300) * 300
+                exp_slug  = f"{BTC5M_LATE_SLUG_PREFIX}-{exp_start}"
+
+                logging.warning(
+                    "CRYPTO_TRACKING_HEARTBEAT"
+                    " asset=BTC held_slug=%s expected_slug=%s"
+                    " loop_age=%.1f snapshot_age=%.1f"
+                    " ws_age=N/A yes_token=N/A no_token=N/A",
+                    _btc5m_late_last_slug or "none", exp_slug,
+                    tick_age, snap_age,
+                )
+
+                if _btc5m_late_last_tick_mono > 0 and tick_age > CRYPTO_TASK_STALE_SECS:
+                    logging.warning(
+                        "CRYPTO_TRACKING_STALE asset=BTC reason=tick_age=%.1fs",
+                        tick_age,
+                    )
+                    inner.cancel()
+                    exit_reason = f"stale_tick_{tick_age:.0f}s"
+                    break
+
+        except asyncio.CancelledError:
+            if not inner.done():
+                inner.cancel()
+            logging.warning(
+                "CRYPTO_ASSET_TASK_EXITED asset=BTC reason=supervisor_cancelled"
+            )
+            raise
+
+        try:
+            await asyncio.wait({inner}, timeout=5.0)
+        except Exception:
+            pass
+
+        if not inner.cancelled():
+            try:
+                exc = inner.exception()
+                if exc is not None:
+                    exit_reason = str(exc)[:80]
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                exit_reason = "cancelled"
+        else:
+            exit_reason = exit_reason if "stale" in exit_reason else "cancelled"
+
+        logging.warning(
+            "CRYPTO_ASSET_TASK_EXITED asset=BTC reason=%s restart_count=%d",
+            exit_reason, restart_count,
+        )
+
+        if restart_count > 1:
+            logging.warning("CRYPTO_ASSET_TASK_RECOVERED asset=BTC")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -17495,7 +17754,7 @@ async def main():
     # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
     tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
     # ── BTC_5M_LATE strategy (isolated — paper only, btc-updown-5m-* markets) ─
-    tasks.append(asyncio.create_task(_run_forever("btc_5m_late_loop", btc_5m_late_loop)))
+    tasks.append(asyncio.create_task(_run_forever("btc_5m_late_loop", btc_5m_late_supervised_loop)))
     # ── ETH / SOL / XRP 5-minute paper bots (additive — isolated from BTC) ───
     tasks.append(asyncio.create_task(_run_forever("eth_5m_loop", eth_5m_loop)))
     tasks.append(asyncio.create_task(_run_forever("sol_5m_loop", sol_5m_loop)))
