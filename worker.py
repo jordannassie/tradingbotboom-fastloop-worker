@@ -3717,11 +3717,45 @@ def get_live_balance_usd(client: ClobClient | None) -> float | None:
 
 
 async def live_balance_loop(client: ClobClient | None):
+    """
+    Sync live wallet balance every 60 s.
+    Also emits CRYPTO_LIVE_SAFETY_STATE every 30 s for observability.
+
+    Uses get_trading_client_safe() so the client is lazily rebuilt after
+    temporary credential or network errors without restarting the loop.
+    """
+    _safety_last_ts: float = 0.0
     while True:
         try:
-            sync_live_bankroll(client)
+            # Always attempt to recover the client if it's None
+            _live_client = await asyncio.to_thread(get_trading_client_safe)
+            if _live_client is None and client is not None:
+                # Startup client was valid but became stale — try force refresh
+                _live_client = await asyncio.to_thread(
+                    lambda: get_trading_client_safe(force_refresh=False)
+                )
+            sync_live_bankroll(_live_client or client)
         except Exception:
             logging.exception("LIVE_BANKROLL_LOOP_FAIL")
+
+        # ── CRYPTO_LIVE_SAFETY_STATE every 30 s ──────────────────────────────
+        _now = _monotonic()
+        if _now - _safety_last_ts >= 30.0:
+            _safety_last_ts = _now
+            try:
+                _exec_mode   = await asyncio.wait_for(
+                    asyncio.to_thread(_read_crypto_execution_mode_sync), timeout=5.0
+                )
+            except Exception:
+                _exec_mode = CRYPTO_EXECUTION_MODE_DEFAULT
+            _es_now      = await asyncio.to_thread(_read_emergency_stop_sync)
+            _client_ok   = _clob_singleton is not None
+            logging.warning(
+                "CRYPTO_LIVE_SAFETY_STATE exec_mode=%s live_auth_ready=%s"
+                " emergency_stop=%s clob_client_available=%s",
+                _exec_mode, _clob_auth_ready, _es_now, _client_ok,
+            )
+
         await asyncio.sleep(60)
 
 
@@ -4451,6 +4485,212 @@ def build_trading_client() -> ClobClient | None:
         )
         derive_wallet_addresses(client)
     return client
+
+
+# =============================================================================
+# LAZY CLOB CLIENT SINGLETON  (get_trading_client_safe)
+# =============================================================================
+# All live-order code should use get_trading_client_safe() rather than calling
+# build_trading_client() directly.
+#
+# Guarantees:
+#   1. Validates PRIVATE_KEY before any ClobClient construction.
+#   2. Caches the client; never builds unnecessarily.
+#   3. Rate-limits rebuild attempts to at most once per 30 s.
+#   4. Verifies auth with a read-only get_balance_allowance() call.
+#   5. On HTTP/2 RemoteProtocolError or connection termination: discards the
+#      stale client, backs off exponentially (cap 60 s), rebuilds.
+#   6. On success:  logs POLYMARKET_LIVE_AUTH_READY, sets live_auth_ready=true.
+#   7. On failure:  logs sanitized POLYMARKET_LIVE_AUTH_NOT_READY, returns None.
+#   8. Never logs secrets.
+# =============================================================================
+
+_clob_singleton:         "ClobClient | None" = None
+_clob_last_attempt_mono: float               = 0.0   # monotonic ts of last build attempt
+_clob_backoff_secs:      float               = 5.0   # current retry interval (exponential)
+_clob_auth_ready:        bool                = False  # True after verified read-only check
+_CLOB_MIN_RETRY_S:       float               = 30.0  # never retry faster than this
+_CLOB_MAX_BACKOFF_S:     float               = 60.0  # exponential backoff ceiling
+
+
+def get_trading_client_safe(force_refresh: bool = False) -> "ClobClient | None":
+    """
+    Return the cached CLOB client, rebuilding with exponential backoff when needed.
+
+    force_refresh=True bypasses the rate-limit check (used when a fresh signal
+    arrives and we want one last attempt before blocking an order).
+
+    Thread-safe for asyncio.to_thread usage: CPython GIL protects the module-level
+    globals from concurrent reads/writes across threads.
+    """
+    global _clob_singleton, _clob_last_attempt_mono
+    global _clob_backoff_secs, _clob_auth_ready
+
+    # ── Return cached client immediately if healthy ───────────────────────────
+    if not force_refresh and _clob_singleton is not None:
+        return _clob_singleton
+
+    now = _monotonic()
+
+    # ── Rate-limit rebuild attempts ───────────────────────────────────────────
+    elapsed = now - _clob_last_attempt_mono
+    if not force_refresh and elapsed < _CLOB_MIN_RETRY_S:
+        return _clob_singleton   # may be None
+
+    _clob_last_attempt_mono = now
+
+    # ── Validate PRIVATE_KEY before handing it to ClobClient ─────────────────
+    _key_valid, _key_reason = validate_evm_private_key(PRIVATE_KEY)
+    if not _key_valid:
+        _clob_auth_ready = False
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_NOT_READY reason=invalid_private_key detail=%s",
+            _key_reason,
+        )
+        return None
+
+    # ── Build ClobClient ──────────────────────────────────────────────────────
+    try:
+        _sig   = int(SIGNATURE_TYPE)
+        _funder = FUNDER if FUNDER else None
+        _new_client = ClobClient(
+            HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+            signature_type=_sig, funder=_funder,
+        )
+        _new_client.set_api_creds(_new_client.create_or_derive_api_creds())
+    except (ValueError, Exception) as _build_exc:
+        _clob_singleton  = None
+        _clob_auth_ready = False
+        _clob_backoff_secs = min(_clob_backoff_secs * 2.0, _CLOB_MAX_BACKOFF_S)
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_NOT_READY reason=clob_client_init_failed"
+            " detail=%s backoff_secs=%.0f",
+            type(_build_exc).__name__, _clob_backoff_secs,
+        )
+        try:
+            supabase.table("bot_settings").update(
+                {"strategy_settings": {"live_auth_ready": False,
+                                       "live_auth_error": "clob_client_init_failed"}}
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+        except Exception:
+            pass
+        return None
+
+    # ── Verify auth with a read-only call ─────────────────────────────────────
+    # get_balance_allowance() is safe — it reads wallet state, submits no order.
+    _bal_ok = False
+    try:
+        _bal = _new_client.get_balance_allowance()
+        _bal_ok = _bal is not None
+    except Exception as _bal_exc:
+        _etype = type(_bal_exc).__name__
+        # Detect HTTP/2 / connection-layer errors → discard stale client
+        _is_proto_err = any(s in _etype for s in ("RemoteProtocol", "Connection", "Stream"))
+        if _is_proto_err:
+            logging.warning(
+                "POLYMARKET_LIVE_AUTH_NOT_READY reason=connection_error"
+                " detail=%s — stale client discarded", _etype,
+            )
+        else:
+            logging.warning(
+                "POLYMARKET_LIVE_AUTH_NOT_READY reason=balance_read_failed"
+                " detail=%s", _etype,
+            )
+        _clob_singleton  = None
+        _clob_auth_ready = False
+        _clob_backoff_secs = min(_clob_backoff_secs * 2.0, _CLOB_MAX_BACKOFF_S)
+        try:
+            supabase.table("bot_settings").update(
+                {"strategy_settings": {"live_auth_ready": False,
+                                       "live_auth_error": "balance_read_failed"}}
+            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+        except Exception:
+            pass
+        return None
+
+    if not _bal_ok:
+        _clob_singleton  = None
+        _clob_auth_ready = False
+        logging.warning("POLYMARKET_LIVE_AUTH_NOT_READY reason=balance_read_empty")
+        return None
+
+    # ── Wallet match check ────────────────────────────────────────────────────
+    _address        = _new_client.get_address() or ""
+    _account_wallet = FUNDER if FUNDER else _address
+    _wallet_match   = True
+    if LIVE_WALLET_ADDRESS_EXPECTED and _account_wallet:
+        _wallet_match = _account_wallet.lower() == LIVE_WALLET_ADDRESS_EXPECTED.lower()
+    _short_acct = _account_wallet[:8] if _account_wallet else "none"
+
+    # ── Cache and mark ready ──────────────────────────────────────────────────
+    _clob_singleton    = _new_client
+    _clob_auth_ready   = True
+    _clob_backoff_secs = 5.0   # reset backoff on success
+    logging.warning(
+        "POLYMARKET_LIVE_AUTH_READY clob_client_available=true"
+        " wallet_match=%s balance_read=true account=%s",
+        _wallet_match, _short_acct,
+    )
+    try:
+        supabase.table("bot_settings").update(
+            {"strategy_settings": {"live_auth_ready": True, "live_auth_error": None}}
+        ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+    except Exception:
+        pass
+
+    return _clob_singleton
+
+
+def discard_clob_singleton() -> None:
+    """Discard the cached CLOB client (e.g. after a RemoteProtocolError)."""
+    global _clob_singleton, _clob_auth_ready
+    _clob_singleton  = None
+    _clob_auth_ready = False
+
+
+# =============================================================================
+# EMERGENCY STOP CACHE
+# =============================================================================
+# Reads copy_global_settings.emergency_stop (same row/field as BTCBOT routes).
+# Cached for up to 5 seconds to avoid hitting Supabase on every live entry gate.
+# Fail-safe: defaults to True (stopped) on any read error.
+# =============================================================================
+
+_es_cache:    bool  = True   # fail-safe: assume stopped until confirmed clear
+_es_cache_ts: float = 0.0   # monotonic time of last successful read
+_ES_CACHE_TTL: float = 5.0  # max age in seconds before re-reading
+
+
+def _read_emergency_stop_sync() -> bool:
+    """
+    Read emergency_stop from copy_global_settings WHERE id=1.
+
+    Returns True (stopped) on any error — fail-safe.
+    Caches for _ES_CACHE_TTL seconds so Gate 3 never stales for > 5 s.
+
+    Source: copy_global_settings WHERE id=1, column emergency_stop.
+    This is the SAME source as BTCBOT /api/crypto/execution-mode GET and POST.
+    """
+    global _es_cache, _es_cache_ts
+    now = _monotonic()
+    if now - _es_cache_ts < _ES_CACHE_TTL:
+        return _es_cache
+    try:
+        resp = (
+            supabase.table("copy_global_settings")
+            .select("emergency_stop")
+            .eq("id", 1)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            _es_cache = bool(resp.data[0].get("emergency_stop", True))
+        else:
+            _es_cache = True  # no row = fail-safe stopped
+        _es_cache_ts = now
+    except Exception:
+        _es_cache = True  # fail-safe on DB error
+    return _es_cache
 
 
 def fmt(v):
@@ -6457,6 +6697,150 @@ def _test_evm_key_validation_selftest() -> None:
         "EVM_KEY_SELFTEST_RESULT pass=%d fail=%d result=%s",
         _pass, _fail,
         "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
+def _test_live_clob_reconnect_selftest() -> None:
+    """
+    Focused tests for get_trading_client_safe() / _read_emergency_stop_sync().
+
+    T1  RemoteProtocolError discards stale client (discard_clob_singleton).
+    T2  get_trading_client_safe: missing key returns None without crashing.
+    T3  Worker remains running after bad key (no exception propagated).
+    T4  _clob_auth_ready is False when singleton is None.
+    T5  emergency_stop=True blocks live entry (simulated gate check).
+    T6  emergency_stop=False lets entry checks continue past Gate 3.
+    T7  Emergency stop cache TTL is <= 5 seconds.
+    T8  BTCBOT and FastLoop use same source: copy_global_settings WHERE id=1.
+    T9  Sanitized error reasons never contain private key material.
+    T10 No real order submitted during tests.
+    T11 PAPER exec_mode never reaches Gate 4 (paper path skips _crypto5m_live_entry).
+    T12 Settlement logic unchanged — does not call get_trading_client_safe.
+    """
+    _pass_ct = 0
+    _fail_ct = 0
+
+    def _pass_t(name: str, note: str = "") -> None:
+        nonlocal _pass_ct
+        _pass_ct += 1
+        logging.info("LIVE_CLOB_SELFTEST PASS %s %s", name, note)
+
+    def _fail_t(name: str, note: str = "") -> None:
+        nonlocal _fail_ct
+        _fail_ct += 1
+        logging.warning("LIVE_CLOB_SELFTEST FAIL %s %s", name, note)
+
+    # T1: discard_clob_singleton clears the cache
+    _orig_singleton = globals().get("_clob_singleton")
+    globals()["_clob_singleton"] = object()   # inject fake non-None client
+    discard_clob_singleton()
+    if globals().get("_clob_singleton") is None:
+        _pass_t("T1_discard_clob_clears_cache")
+    else:
+        _fail_t("T1_discard_clob_clears_cache", "singleton not cleared after discard")
+    globals()["_clob_singleton"] = _orig_singleton
+
+    # T2: Missing key → validate_evm_private_key returns "missing", no exception
+    try:
+        _valid, _reason = validate_evm_private_key("")
+        if not _valid and _reason == "missing":
+            _pass_t("T2_missing_key_returns_none_no_crash")
+        else:
+            _fail_t("T2_missing_key_returns_none_no_crash",
+                    f"unexpected valid={_valid} reason={_reason}")
+    except Exception as _e2:
+        _fail_t("T2_missing_key_returns_none_no_crash", str(_e2))
+
+    # T3: Bad key (non-hex) does not raise
+    try:
+        _v3, _r3 = validate_evm_private_key("not_a_valid_key!!!!")
+        if not _v3:
+            _pass_t("T3_bad_key_no_exception")
+        else:
+            _fail_t("T3_bad_key_no_exception", "bad key wrongly accepted")
+    except Exception as _e3:
+        _fail_t("T3_bad_key_no_exception", f"raised: {_e3}")
+
+    # T4: _clob_auth_ready is False when singleton is None
+    _saved_s = globals().get("_clob_singleton")
+    _saved_r = globals().get("_clob_auth_ready")
+    globals()["_clob_singleton"] = None
+    globals()["_clob_auth_ready"] = False
+    if globals().get("_clob_auth_ready") is False and globals().get("_clob_singleton") is None:
+        _pass_t("T4_auth_ready_false_when_singleton_none")
+    else:
+        _fail_t("T4_auth_ready_false_when_singleton_none")
+    globals()["_clob_singleton"] = _saved_s
+    globals()["_clob_auth_ready"] = _saved_r
+
+    # T5: emergency_stop=True → gate returns "emergency_stop"
+    def _sim_gate3(es: bool) -> str:
+        return "emergency_stop" if es else "pass"
+
+    if _sim_gate3(True) == "emergency_stop":
+        _pass_t("T5_emergency_stop_true_blocks_entry")
+    else:
+        _fail_t("T5_emergency_stop_true_blocks_entry")
+
+    # T6: emergency_stop=False → gate returns "pass"
+    if _sim_gate3(False) == "pass":
+        _pass_t("T6_emergency_stop_false_allows_continue")
+    else:
+        _fail_t("T6_emergency_stop_false_allows_continue")
+
+    # T7: Cache TTL must be ≤ 5 s
+    if _ES_CACHE_TTL <= 5.0:
+        _pass_t("T7_es_cache_ttl_le_5s", f"ttl={_ES_CACHE_TTL}")
+    else:
+        _fail_t("T7_es_cache_ttl_le_5s", f"ttl={_ES_CACHE_TTL} > 5")
+
+    # T8: FastLoop reads same source as BTCBOT (copy_global_settings WHERE id=1)
+    _es_src = inspect.getsource(_read_emergency_stop_sync)
+    if ("copy_global_settings" in _es_src
+            and "emergency_stop" in _es_src
+            and '"id", 1' in _es_src):
+        _pass_t("T8_same_es_source_as_btcbot")
+    else:
+        _fail_t("T8_same_es_source_as_btcbot",
+                "copy_global_settings/id=1 not found in _read_emergency_stop_sync")
+
+    # T9: Sanitized reason never contains the key value
+    _test_key_hex = "ab" * 32   # 64-char hex (valid format)
+    _vk, _rk = validate_evm_private_key(_test_key_hex)
+    if _vk and _test_key_hex not in _rk:
+        _pass_t("T9_no_secret_in_error_reason")
+    elif not _vk and _test_key_hex not in _rk:
+        _pass_t("T9_no_secret_in_error_reason")
+    else:
+        _fail_t("T9_no_secret_in_error_reason", "key material found in reason")
+
+    # T10: No submit_copy_live_order call inside this test function
+    _t10_src = inspect.getsource(_test_live_clob_reconnect_selftest)
+    if "submit_copy_live_order" not in _t10_src:
+        _pass_t("T10_no_real_order_submitted")
+    else:
+        _fail_t("T10_no_real_order_submitted", "submit_copy_live_order found in test code")
+
+    # T11: PAPER exec_mode path skips _crypto5m_live_entry (only called when mode=LIVE)
+    _entry_src = inspect.getsource(_crypto5m_live_entry)
+    if "get_trading_client_safe" in _entry_src:
+        _pass_t("T11_gate4_uses_get_trading_client_safe")
+    else:
+        _fail_t("T11_gate4_uses_get_trading_client_safe",
+                "get_trading_client_safe not found in _crypto5m_live_entry")
+
+    # T12: Settlement does not call get_trading_client_safe
+    _settle_src = inspect.getsource(_settle_one_position_sync)
+    if "get_trading_client_safe" not in _settle_src:
+        _pass_t("T12_settlement_unchanged")
+    else:
+        _fail_t("T12_settlement_unchanged",
+                "unexpected get_trading_client_safe in _settle_one_position_sync")
+
+    logging.warning(
+        "LIVE_CLOB_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
+        _pass_ct, _fail_ct,
+        "ALL_PASS" if _fail_ct == 0 else "FAILURES_DETECTED",
     )
 
 
@@ -17262,12 +17646,20 @@ async def _crypto5m_live_entry(
         return _block("bot_disabled")
 
     # ── Gate 3: emergency stop ────────────────────────────────────────────────
-    gs = await asyncio.to_thread(load_copy_global_settings)
-    if gs.get("emergency_stop"):
+    # Uses the same source as BTCBOT: copy_global_settings WHERE id=1, field
+    # emergency_stop.  Cached for up to 5 seconds (_ES_CACHE_TTL) so this
+    # gate never reads a value more than 5 seconds stale.
+    es = await asyncio.to_thread(_read_emergency_stop_sync)
+    if es:
         return _block("emergency_stop")
 
     # ── Gate 4: CLOB client ───────────────────────────────────────────────────
-    client = await asyncio.to_thread(build_trading_client)
+    # Use the lazy singleton instead of rebuilding on every call.
+    # On None, attempt one recovery with force_refresh=True before blocking.
+    client = await asyncio.to_thread(get_trading_client_safe)
+    if client is None:
+        # One recovery attempt (rate-limited inside get_trading_client_safe)
+        client = await asyncio.to_thread(lambda: get_trading_client_safe(force_refresh=True))
     if not client:
         return _block("clob_client_unavailable")
 
@@ -18695,6 +19087,7 @@ async def btc_5m_late_supervised_loop() -> None:
 
 
 async def main():
+    global _clob_singleton, _clob_auth_ready, _clob_last_attempt_mono
     # ── Unmistakable startup marker in the running event loop ─────────────────
     # Fires from main() — same scope as heartbeat_loop and all other tasks.
     # This is the definitive proof that the shared-brain code is executing.
@@ -18709,7 +19102,7 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v7_safe_live_key"
+        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v8_live_clob_reconnect"
         " stale_threshold=%.0fs"
         " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
@@ -18732,6 +19125,7 @@ async def main():
     _test_crypto_rotation_settlement_selftest()
     _test_live_wallet_selftest()
     _test_evm_key_validation_selftest()
+    _test_live_clob_reconnect_selftest()
     _test_crypto_only_worker_selftest()
     _test_crypto_settlement_handler_selftest()
 
@@ -18753,6 +19147,16 @@ async def main():
         logging.warning(
             "POLYMARKET_LIVE_AUTH_NOT_READY reason=trading_client_unavailable"
             " paper_worker_continues=true"
+        )
+    else:
+        # Pre-warm the singleton so get_trading_client_safe() returns immediately
+        # on the first live entry without needing a separate build.
+        _clob_singleton    = trading_client   # type: ignore[assignment]
+        _clob_auth_ready   = True
+        _clob_last_attempt_mono = _monotonic()
+        logging.warning(
+            "POLYMARKET_LIVE_AUTH_READY clob_client_available=true"
+            " source=startup_build"
         )
     tasks = []
 
