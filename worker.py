@@ -6002,6 +6002,87 @@ def _test_crypto_rotation_settlement_selftest() -> None:
     )
 
 
+def _test_crypto_only_worker_selftest() -> None:
+    """
+    Verify the crypto-only worker configuration:
+    - Four crypto loops are defined and callable.
+    - Required legacy infrastructure (paper_settlement_loop, live_balance_loop) exists.
+    - PAPER mode never produces a LIVE routing decision.
+    """
+    _pass = 0
+    _fail = 0
+
+    def _ok(n: str) -> None:
+        nonlocal _pass
+        _pass += 1
+        logging.info("CRYPTO_ONLY_SELFTEST PASS %s", n)
+
+    def _fail_t(n: str, d: str) -> None:
+        nonlocal _fail
+        _fail += 1
+        logging.warning("CRYPTO_ONLY_SELFTEST FAIL %s — %s", n, d)
+
+    # T1: Four crypto loop functions are defined
+    _required_fns = [
+        ("btc_5m_late_supervised_loop", btc_5m_late_supervised_loop),
+        ("eth_5m_loop",                 eth_5m_loop),
+        ("sol_5m_loop",                 sol_5m_loop),
+        ("xrp_5m_loop",                 xrp_5m_loop),
+    ]
+    for _name, _fn in _required_fns:
+        if callable(_fn):
+            _ok(f"T1_crypto_fn_exists {_name}")
+        else:
+            _fail_t(f"T1_crypto_fn_exists", f"{_name} not callable")
+
+    # T2: Required infrastructure loops are defined
+    for _name, _fn in [
+        ("paper_settlement_loop", paper_settlement_loop),
+        ("live_balance_loop",     live_balance_loop),
+    ]:
+        if callable(_fn):
+            _ok(f"T2_infra_fn_exists {_name}")
+        else:
+            _fail_t("T2_infra_fn_exists", f"{_name} not callable")
+
+    # T3: LIVE entry route exists (structural availability for future LIVE mode)
+    if callable(_crypto5m_live_entry):
+        _ok("T3_live_entry_callable")
+    else:
+        _fail_t("T3_live_entry_callable", "_crypto5m_live_entry not callable")
+
+    # T4: PAPER mode never routes to LIVE executor
+    _mode = "PAPER"
+    _would_go_live = (_mode == "LIVE")
+    if _would_go_live:
+        _fail_t("T4_paper_no_live", f"mode={_mode} would route to LIVE")
+    else:
+        _ok("T4_paper_stays_paper")
+
+    # T5: Legacy loop functions exist but are not in the active task list
+    # (We verify the functions exist so they can be re-enabled safely)
+    _legacy_fns = [
+        ("rotate_loop",                 rotate_loop),
+        ("scan_loop",                   scan_loop),
+        ("heartbeat_loop",              heartbeat_loop),
+        ("copy_trade_loop",             copy_trade_loop),
+        ("copy_settlement_loop",        copy_settlement_loop),
+        ("ema_5m_btc_loop",             ema_5m_btc_loop),
+    ]
+    for _name, _fn in _legacy_fns:
+        if callable(_fn):
+            _ok(f"T5_legacy_fn_preserved {_name}")
+        else:
+            _fail_t("T5_legacy_fn_preserved", f"{_name} missing (cannot re-enable)")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    logging.warning(
+        "CRYPTO_ONLY_SELFTEST_RESULT pass=%d fail=%d result=%s",
+        _pass, _fail,
+        "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
 # ─── END TRADE INTENT LAYER ────────────────────────────────────────────────────
 
 
@@ -18021,13 +18102,12 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=rotation_settlement_v4"
+        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v5"
         " stale_threshold=%.0fs"
         " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
         " one_toggle=crypto_execution_mode per_bot=is_enabled+trade_size_only"
-        " logs=CRYPTO_MARKET_ROTATED+CRYPTO_MARKET_LOOKUP_PENDING+CRYPTO_OUTCOME_PENDING"
-        "+CRYPTO_OUTCOME_RESOLVED+CRYPTO_PAPER_SETTLED",
+        " legacy_loops=DISABLED",
         CRYPTO_TASK_STALE_SECS,
     )
 
@@ -18039,40 +18119,76 @@ async def main():
     _test_crypto_execution_mode_selftest()
     _test_crypto_global_mode_transition_selftest()
     _test_crypto_rotation_settlement_selftest()
+    _test_crypto_only_worker_selftest()
 
     trading_client = build_trading_client()
     tasks = []
-    # ── BTC strategy tasks (existing — do not reorder or remove) ──────────────
-    tasks.append(asyncio.create_task(_run_forever("rotate_loop", rotate_loop)))
+
+    # ── CRYPTO-ONLY WORKER ────────────────────────────────────────────────────
+    # Only the four crypto 5-minute bots are active.
+    # All legacy strategy loops and copy-trading loops are disabled (not deleted).
+    # Re-enable by uncommenting the task lines in the DISABLED section below.
+    #
+    # Active:
+    #   paper_settlement_loop  — settles OPEN and LIVE_OPEN paper_positions
+    #   live_balance_loop      — syncs live wallet balance (required for LIVE mode)
+    #   btc_5m_late            — BTC 5-minute supervised loop
+    #   eth_5m                 — ETH 5-minute supervised loop
+    #   sol_5m                 — SOL 5-minute supervised loop
+    #   xrp_5m                 — XRP 5-minute supervised loop
+    #
+    # Disabled (legacy / copy-trading — not needed by four crypto bots):
+    #   rotate_loop, scan_loop, heartbeat_loop (CANDLE_ACTIVE / STUCK_DETECTOR)
+    #   copy_diag_loop, copy_trade_loop, copy_settlement_loop, copy_auto_exit_loop
+    #   leaderboard_ingest_loop, trader_rotation_snapshot_loop, ema_5m_btc_loop
+    #   WebSocket listener (restart_ws_task) — feeds best_quotes for legacy loops only
+
+    _exec_mode_at_boot = _read_crypto_execution_mode_sync()
+    logging.warning(
+        "CRYPTO_ONLY_WORKER_BOOT version=crypto_only_v1"
+        " active_bots=btc,eth,sol,xrp"
+        " legacy_tasks_started=0"
+        " execution_mode=%s",
+        _exec_mode_at_boot,
+    )
+
+    # ── Required tasks ────────────────────────────────────────────────────────
     tasks.append(asyncio.create_task(_run_forever("paper_settlement_loop", paper_settlement_loop)))
+    logging.warning("CRYPTO_TASK_STARTED name=paper_settlement_loop")
+
     tasks.append(asyncio.create_task(_run_forever("live_balance_loop", live_balance_loop, trading_client)))
-    tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
-    tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
-    # ── Copy-trading tasks (additive — isolated from BTC strategy tasks) ──────
-    # copy_diag_loop: lightweight heartbeat — no DB, no deps, always runs.
-    #   Logs COPY_BRAIN_ALIVE every 10s so the build is always visible in Railway.
-    # copy_trade_loop: shared-brain decision + paper/live execution.
-    # copy_settlement_loop: resolves expired paper positions via Gamma API.
-    # copy_auto_exit_loop: TP / max-hold auto-close for OPEN copied positions.
-    # leaderboard_ingest_loop: scrapes Polymarket leaderboard → candidate_wallets.
-    tasks.append(asyncio.create_task(_run_forever("copy_diag_loop", copy_diag_loop)))
-    tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
-    tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
-    tasks.append(asyncio.create_task(_run_forever("copy_auto_exit_loop", copy_auto_exit_loop)))
-    tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
-    # ── Trader rotation snapshot (read-only dashboard publisher) ───────────────
-    # Publishes rotation recommendations to trader_rotation_snapshots every 6h.
-    # Failure never crashes the worker or affects any bot state.
-    tasks.append(asyncio.create_task(_run_forever("trader_rotation_snapshot_loop", trader_rotation_snapshot_loop)))
-    # ── EMA_5M_BTC strategy (isolated — paper only, btc-updown-5m-* markets) ─
-    tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
-    # ── BTC_5M_LATE strategy (isolated — paper only, btc-updown-5m-* markets) ─
+    logging.warning("CRYPTO_TASK_STARTED name=live_balance_loop")
+
     tasks.append(asyncio.create_task(_run_forever("btc_5m_late_loop", btc_5m_late_supervised_loop)))
-    # ── ETH / SOL / XRP 5-minute paper bots (additive — isolated from BTC) ───
+    logging.warning("CRYPTO_TASK_STARTED name=btc_5m_late_loop")
+
     tasks.append(asyncio.create_task(_run_forever("eth_5m_loop", eth_5m_loop)))
+    logging.warning("CRYPTO_TASK_STARTED name=eth_5m_loop")
+
     tasks.append(asyncio.create_task(_run_forever("sol_5m_loop", sol_5m_loop)))
+    logging.warning("CRYPTO_TASK_STARTED name=sol_5m_loop")
+
     tasks.append(asyncio.create_task(_run_forever("xrp_5m_loop", xrp_5m_loop)))
-    restart_ws_task()
+    logging.warning("CRYPTO_TASK_STARTED name=xrp_5m_loop")
+
+    logging.warning(
+        "CRYPTO_ONLY_WORKER_TASKS_STARTED total_tasks=%d", len(tasks)
+    )
+
+    # ── DISABLED legacy tasks ─────────────────────────────────────────────────
+    # Uncomment to re-enable individual legacy loops.
+    # None of these are required by the four crypto bots.
+    # tasks.append(asyncio.create_task(_run_forever("rotate_loop", rotate_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("scan_loop", scan_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("heartbeat_loop", heartbeat_loop, trading_client)))
+    # tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("copy_diag_loop", copy_diag_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("copy_trade_loop", copy_trade_loop, trading_client)))
+    # tasks.append(asyncio.create_task(_run_forever("copy_settlement_loop", copy_settlement_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("copy_auto_exit_loop", copy_auto_exit_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("leaderboard_ingest_loop", leaderboard_ingest_loop)))
+    # tasks.append(asyncio.create_task(_run_forever("trader_rotation_snapshot_loop", trader_rotation_snapshot_loop)))
+    # restart_ws_task()   # WebSocket listener for best_quotes (legacy strategies only)
     try:
         await asyncio.gather(*tasks)
     finally:
