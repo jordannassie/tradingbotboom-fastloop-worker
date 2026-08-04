@@ -584,6 +584,7 @@ CLOSE_REASON_SETTLED_MARKET       = "settled_market"
 CLOSE_REASON_MANUAL_RESET         = "manual_reset"
 CLOSE_REASON_CLOSE_FAILED_RETRY   = "close_failed_retrying"
 CLOSE_REASON_CLOSE_FAILED_FINAL   = "close_failed_final"
+CLOSE_REASON_STALE_PAPER_CLEANUP  = "stale_paper_cleanup"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

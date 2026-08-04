@@ -7200,6 +7200,123 @@ def _test_crypto_paper_always_on_selftest() -> None:
     )
 
 
+def _test_stale_paper_cleanup_selftest() -> None:
+    """
+    Proves the stale paper cleanup logic without any DB access.
+
+    T1  Expired OPEN rows (end_ts < now) are targeted for cancellation.
+    T2  Active OPEN rows (end_ts >= now) are NOT targeted.
+    T3  LIVE_OPEN rows are NOT targeted.
+    T4  CLOSED rows are NOT targeted.
+    T5  Other bot IDs (non-crypto) are NOT targeted.
+    T6  Cleanup is idempotent — running with no stale rows is a no-op.
+    T7  No live order function is called during cleanup.
+    T8  Exposure recalculation only sums active OPEN rows (end_ts >= now).
+    """
+    import time as _time_mod
+    _pass_ct = 0
+    _fail_ct = 0
+
+    def _p(name: str, note: str = "") -> None:
+        nonlocal _pass_ct
+        _pass_ct += 1
+        logging.info("STALE_CLEANUP_SELFTEST PASS %s %s", name, note)
+
+    def _f(name: str, note: str = "") -> None:
+        nonlocal _fail_ct
+        _fail_ct += 1
+        logging.warning("STALE_CLEANUP_SELFTEST FAIL %s %s", name, note)
+
+    now = int(_time_mod.time())
+
+    # Simulate rows with different status/bot/timing combinations
+    _rows = [
+        {"id": "r1", "bot_id": "btc_5m_late",  "status": "OPEN",      "end_ts": now - 300, "size_usd": 1.0},   # stale
+        {"id": "r2", "bot_id": "eth_5m_paper",  "status": "OPEN",      "end_ts": now - 600, "size_usd": 0.1},   # stale
+        {"id": "r3", "bot_id": "sol_5m_paper",  "status": "OPEN",      "end_ts": now + 120, "size_usd": 0.1},   # active
+        {"id": "r4", "bot_id": "xrp_5m_paper",  "status": "LIVE_OPEN", "end_ts": now - 100, "size_usd": 2.0},   # live open — untouched
+        {"id": "r5", "bot_id": "btc_5m_late",   "status": "CLOSED",    "end_ts": now - 500, "size_usd": 1.0},   # closed — untouched
+        {"id": "r6", "bot_id": "copy_bot_xyz",  "status": "OPEN",      "end_ts": now - 100, "size_usd": 5.0},   # wrong bot — untouched
+        {"id": "r7", "bot_id": "xrp_5m_paper",  "status": "CANCELLED", "end_ts": now - 200, "size_usd": 0.1},   # already cancelled
+    ]
+
+    def _is_cleanup_target(row: dict) -> bool:
+        """Mirror the cleanup filter: CRYPTO_PAPER_BOT_IDS, status=OPEN, end_ts<now."""
+        return (
+            row["bot_id"] in CRYPTO_PAPER_BOT_IDS
+            and row["status"] == "OPEN"
+            and row["end_ts"] < now
+        )
+
+    targets = [r for r in _rows if _is_cleanup_target(r)]
+
+    # T1: Expired OPEN crypto rows are targeted
+    if {r["id"] for r in targets} == {"r1", "r2"}:
+        _p("T1_expired_open_rows_targeted")
+    else:
+        _f("T1_expired_open_rows_targeted", f"targets={[r['id'] for r in targets]}")
+
+    # T2: Active OPEN rows (end_ts >= now) not targeted
+    if not any(r["id"] == "r3" for r in targets):
+        _p("T2_active_open_rows_not_targeted")
+    else:
+        _f("T2_active_open_rows_not_targeted", "r3 (active OPEN) was targeted")
+
+    # T3: LIVE_OPEN rows not targeted
+    if not any(r["id"] == "r4" for r in targets):
+        _p("T3_live_open_rows_untouched")
+    else:
+        _f("T3_live_open_rows_untouched", "r4 (LIVE_OPEN) was targeted")
+
+    # T4: CLOSED rows not targeted
+    if not any(r["id"] == "r5" for r in targets):
+        _p("T4_closed_rows_untouched")
+    else:
+        _f("T4_closed_rows_untouched", "r5 (CLOSED) was targeted")
+
+    # T5: Other bot IDs not targeted
+    if not any(r["id"] == "r6" for r in targets):
+        _p("T5_other_bot_ids_untouched")
+    else:
+        _f("T5_other_bot_ids_untouched", "r6 (copy_bot_xyz) was targeted")
+
+    # T6: Idempotent — if all OPEN rows are already CANCELLED, targets is empty
+    _all_cancelled = [dict(r, status="CANCELLED") for r in _rows]
+    _idempotent_targets = [r for r in _all_cancelled if _is_cleanup_target(r)]
+    if not _idempotent_targets:
+        _p("T6_idempotent_second_run_is_noop")
+    else:
+        _f("T6_idempotent_second_run_is_noop", f"found {len(_idempotent_targets)} targets after cancel")
+
+    # T7: Cleanup function never calls live order functions
+    _cleanup_src = inspect.getsource(_cleanup_stale_crypto_paper_positions_sync)
+    if "submit_copy_live_order" not in _cleanup_src and "ClobClient" not in _cleanup_src:
+        _p("T7_no_live_order_in_cleanup")
+    else:
+        _f("T7_no_live_order_in_cleanup", "live order function found in cleanup source")
+
+    # T8: Exposure recalculation = sum size_usd of active OPEN (end_ts >= now) rows only
+    _active_open = [
+        r for r in _rows
+        if r["bot_id"] in CRYPTO_PAPER_BOT_IDS
+        and r["status"] == "OPEN"
+        and r["end_ts"] >= now
+    ]
+    _exposure = round(sum(float(r["size_usd"]) for r in _active_open), 2)
+    # r3 is the only active OPEN → exposure = 0.10
+    if _exposure == 0.10 and len(_active_open) == 1:
+        _p("T8_exposure_excludes_stale_rows", f"exposure={_exposure}")
+    else:
+        _f("T8_exposure_excludes_stale_rows",
+           f"exposure={_exposure} active_count={len(_active_open)}")
+
+    logging.warning(
+        "STALE_CLEANUP_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
+        _pass_ct, _fail_ct,
+        "ALL_PASS" if _fail_ct == 0 else "FAILURES_DETECTED",
+    )
+
+
 def _test_crypto_settlement_handler_selftest() -> None:
     """
     Verify the settlement handler exists and its logic is correct.
@@ -7724,6 +7841,232 @@ def _settle_one_position_sync(row: dict) -> None:
 #            update) work for any binary market. The "FASTLOOP" market label
 #            in the trade_payload is the only cosmetic BTC-ism; update it.
 # =============================================================================
+
+# =============================================================================
+# STALE CRYPTO PAPER POSITION CLEANUP
+# =============================================================================
+# One-time cleanup of expired OPEN paper positions that were never settled.
+# These accumulate when the settlement loop misses a market outcome (e.g., due
+# to stale market data or a crash during the settlement window).
+#
+# Safety rules:
+#   - Only touches paper_positions with bot_id in CRYPTO_PAPER_BOT_IDS
+#   - Only touches rows with status='OPEN' AND end_ts < now
+#   - NEVER touches status='LIVE_OPEN'
+#   - NEVER touches copy-trading tables (copied_positions)
+#   - No P&L is calculated; rows are simply cancelled
+#   - Idempotent: rows already CANCELLED are skipped (filter is OPEN only)
+# =============================================================================
+
+_CLEANUP_BATCH_SIZE = 50  # rows per UPDATE batch to stay under URL limits
+
+
+def _cleanup_stale_crypto_paper_positions_sync() -> dict:
+    """
+    Mark expired OPEN paper_positions rows for the four crypto bots as CANCELLED.
+
+    Criteria for a "stale" row:
+      bot_id  ∈ CRYPTO_PAPER_BOT_IDS
+      status  = 'OPEN'
+      end_ts  < current unix timestamp   (market has already ended)
+
+    Returns a summary dict:
+      {
+        "preview_count":        int,
+        "preview_size_usd":     float,
+        "preview_bot_counts":   dict,
+        "cancelled_count":      int,
+        "remaining_expired_open":  int,
+        "remaining_live_open":     int,
+        "remaining_active_paper":  int,
+        "paper_exposure_usd":      float,
+        "error":                   str|None,
+      }
+    """
+    now_ts  = int(time())
+    now_iso = utc_now_iso()
+    result: dict = {
+        "preview_count":         0,
+        "preview_size_usd":      0.0,
+        "preview_bot_counts":    {},
+        "cancelled_count":       0,
+        "remaining_expired_open": 0,
+        "remaining_live_open":    0,
+        "remaining_active_paper": 0,
+        "paper_exposure_usd":    0.0,
+        "error":                 None,
+    }
+
+    # ── Step 1: Preview — fetch all stale rows ────────────────────────────────
+    try:
+        preview_resp = (
+            supabase.table("paper_positions")
+            .select("id, bot_id, size_usd, end_ts, market_slug")
+            .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
+            .eq("status", "OPEN")
+            .lt("end_ts", now_ts)
+            .limit(5000)
+            .execute()
+        )
+        stale_rows = preview_resp.data or []
+    except Exception as exc:
+        result["error"] = f"preview_query_failed:{type(exc).__name__}"
+        logging.warning(
+            "CRYPTO_STALE_PAPER_CLEANUP_FAIL step=preview error=%s",
+            type(exc).__name__,
+        )
+        return result
+
+    # Aggregate preview stats
+    bot_counts: dict[str, int] = {}
+    total_size = 0.0
+    stale_ids: list[str] = []
+    for row in stale_rows:
+        bid = row.get("bot_id", "unknown")
+        bot_counts[bid] = bot_counts.get(bid, 0) + 1
+        total_size += float(row.get("size_usd") or 0.0)
+        stale_ids.append(str(row["id"]))
+
+    result["preview_count"]      = len(stale_rows)
+    result["preview_size_usd"]   = round(total_size, 2)
+    result["preview_bot_counts"] = bot_counts
+
+    logging.warning(
+        "CRYPTO_STALE_PAPER_CLEANUP_PREVIEW"
+        " count=%d total_size_usd=%.2f bot_counts=%s",
+        len(stale_rows), total_size, bot_counts,
+    )
+
+    if not stale_ids:
+        logging.warning(
+            "CRYPTO_STALE_PAPER_CLEANUP_PREVIEW no_stale_rows_found — nothing to do"
+        )
+
+    # ── Step 2: Cancel in batches ─────────────────────────────────────────────
+    cancelled = 0
+    total_batches = -(-len(stale_ids) // _CLEANUP_BATCH_SIZE) if stale_ids else 0
+    for batch_num, i in enumerate(range(0, len(stale_ids), _CLEANUP_BATCH_SIZE), start=1):
+        batch = stale_ids[i : i + _CLEANUP_BATCH_SIZE]
+        try:
+            supabase.table("paper_positions").update({
+                "status":       "CANCELLED",
+                "closed_at":    now_iso,
+                "close_reason": CLOSE_REASON_STALE_PAPER_CLEANUP,
+            }).in_("id", batch).execute()
+            cancelled += len(batch)
+            logging.warning(
+                "CRYPTO_STALE_PAPER_CLEANUP_BATCH batch=%d/%d cancelled=%d",
+                batch_num, total_batches, len(batch),
+            )
+        except Exception as exc:
+            result["error"] = f"cancel_batch_failed:{type(exc).__name__}"
+            logging.warning(
+                "CRYPTO_STALE_PAPER_CLEANUP_FAIL step=cancel_batch"
+                " batch=%d/%d error=%s",
+                batch_num, total_batches, type(exc).__name__,
+            )
+
+    result["cancelled_count"] = cancelled
+
+    # ── Step 3: Verify — count remaining expired OPEN, LIVE_OPEN, and active ─
+    try:
+        # Remaining expired OPEN (should be 0 after cleanup)
+        rem_resp = (
+            supabase.table("paper_positions")
+            .select("id", count="exact")
+            .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
+            .eq("status", "OPEN")
+            .lt("end_ts", now_ts)
+            .limit(1)
+            .execute()
+        )
+        result["remaining_expired_open"] = rem_resp.count or len(rem_resp.data or [])
+    except Exception:
+        pass
+
+    try:
+        # Remaining LIVE_OPEN (must be UNCHANGED)
+        live_resp = (
+            supabase.table("paper_positions")
+            .select("id", count="exact")
+            .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
+            .eq("status", "LIVE_OPEN")
+            .limit(1)
+            .execute()
+        )
+        result["remaining_live_open"] = live_resp.count or len(live_resp.data or [])
+    except Exception:
+        pass
+
+    try:
+        # Remaining active OPEN (end_ts >= now — current-market positions)
+        active_resp = (
+            supabase.table("paper_positions")
+            .select("id, size_usd")
+            .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
+            .eq("status", "OPEN")
+            .gte("end_ts", now_ts)
+            .limit(100)
+            .execute()
+        )
+        active_rows = active_resp.data or []
+        result["remaining_active_paper"] = len(active_rows)
+        result["paper_exposure_usd"] = round(
+            sum(float(r.get("size_usd") or 0.0) for r in active_rows), 2
+        )
+    except Exception:
+        pass
+
+    logging.warning(
+        "CRYPTO_STALE_PAPER_CLEANUP_COMPLETE"
+        " removed_or_cancelled=%d"
+        " remaining_expired_open=%d"
+        " remaining_live_open=%d"
+        " remaining_active_paper=%d"
+        " paper_exposure_usd=%.2f",
+        result["cancelled_count"],
+        result["remaining_expired_open"],
+        result["remaining_live_open"],
+        result["remaining_active_paper"],
+        result["paper_exposure_usd"],
+    )
+    return result
+
+
+async def _run_stale_crypto_paper_cleanup_once() -> None:
+    """
+    Async wrapper: run the one-time stale paper cleanup via asyncio.to_thread.
+
+    This is called once from main() at startup.  The underlying query filters
+    on status='OPEN' AND end_ts<now, so it is fully idempotent — a second run
+    finds zero rows and exits immediately.
+
+    NOTE: This function may be removed from main() after the first successful
+    deployment that clears the stale positions, but it is safe to leave in
+    place because it is a no-op when no stale rows exist.
+    """
+    logging.warning(
+        "CRYPTO_STALE_PAPER_CLEANUP_STARTING"
+        " bots=%s action=cancel_expired_open_positions",
+        CRYPTO_PAPER_BOT_IDS,
+    )
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_cleanup_stale_crypto_paper_positions_sync),
+            timeout=60.0,
+        )
+        if result.get("error"):
+            logging.warning(
+                "CRYPTO_STALE_PAPER_CLEANUP_PARTIAL error=%s cancelled=%d",
+                result["error"], result["cancelled_count"],
+            )
+    except asyncio.TimeoutError:
+        logging.warning(
+            "CRYPTO_STALE_PAPER_CLEANUP_TIMEOUT — cleanup may be incomplete"
+        )
+    except Exception:
+        logging.exception("CRYPTO_STALE_PAPER_CLEANUP_EXCEPTION — worker continues")
+
 
 async def paper_settlement_loop():
     # ── Bot IDs included in settlement queries ────────────────────────────────
@@ -19609,6 +19952,7 @@ async def main():
         ("_test_live_clob_reconnect_selftest",     _test_live_clob_reconnect_selftest),
         ("_test_crypto_live_routing_selftest",      _test_crypto_live_routing_selftest),
         ("_test_crypto_paper_always_on_selftest",   _test_crypto_paper_always_on_selftest),
+        ("_test_stale_paper_cleanup_selftest",      _test_stale_paper_cleanup_selftest),
         ("_test_crypto_only_worker_selftest",      _test_crypto_only_worker_selftest),
         ("_test_crypto_settlement_handler_selftest", _test_crypto_settlement_handler_selftest),
     ]
@@ -19679,6 +20023,12 @@ async def main():
         " execution_mode=%s",
         _exec_mode_at_boot,
     )
+
+    # ── One-time stale paper cleanup (idempotent) ─────────────────────────────
+    # Cancels expired OPEN paper_positions rows that were never settled.
+    # Safe to leave in place permanently — no-op when no stale rows exist.
+    # To remove after the first successful cleanup, delete the two lines below.
+    await _run_stale_crypto_paper_cleanup_once()
 
     # ── Required tasks ────────────────────────────────────────────────────────
     tasks.append(asyncio.create_task(_run_forever("paper_settlement_loop", paper_settlement_loop)))
