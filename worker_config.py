@@ -179,6 +179,27 @@ PM_ACCESS_KEY = os.getenv("PM_ACCESS_KEY")
 PM_ED25519_PRIVATE_KEY_B64 = os.getenv("PM_ED25519_PRIVATE_KEY_B64")
 PM_ACCOUNT_HOST = os.getenv("PM_ACCOUNT_HOST", "https://api.polymarket.us")
 
+# ── 8b. Live balance source selection ─────────────────────────────────────────
+#
+# USE_LEGACY_PM_ACCOUNT_BALANCE controls which API supplies live_balance_usd.
+#
+# false (default):
+#   - Skip fetch_account_buying_power_usd() entirely.
+#   - Use the authenticated CLOB client (PRIVATE_KEY + FUNDER) as the
+#     sole balance source.  Correct for Deposit Wallet / proxy-wallet accounts.
+#
+# true:
+#   - Use PM_ACCESS_KEY + PM_ED25519_PRIVATE_KEY_B64 to call the legacy
+#     Polymarket account API and return buyingPower.
+#   - Only enable this for old direct accounts where the CLOB signer IS the
+#     funded account (no separate FUNDER).
+#
+# This flag must never silently override the current FUNDER wallet balance
+# with data from a different Polymarket account.
+USE_LEGACY_PM_ACCOUNT_BALANCE = os.getenv(
+    "USE_LEGACY_PM_ACCOUNT_BALANCE", "false"
+).strip().lower() in ("1", "true", "yes", "y")
+
 
 # ── 9. Core trading parameters ────────────────────────────────────────────────
 

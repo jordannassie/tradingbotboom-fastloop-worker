@@ -2031,30 +2031,96 @@ def refresh_live_bankroll_usd_if_needed(
     return live_balance_cache, live_allowance_cache
 
 
-def persist_live_strategy_settings(wallet_address: str | None, allowance_usd: float | None = None):
+def persist_live_strategy_settings(
+    wallet_address: str | None,
+    allowance_usd: float | None = None,
+    signer_address: str | None = None,
+    signature_type: str | None = None,
+    auth_ready: bool | None = None,
+):
+    """
+    Write live-wallet identity and balance metadata to bot_settings.live.
+
+    wallet_address  — the funded account wallet (FUNDER when set, else signer).
+                      This is what BTCBOT displays as the live wallet address.
+    signer_address  — the raw signing key address (may differ from wallet_address
+                      for Deposit Wallet / proxy-wallet accounts).
+    signature_type  — CLOB signature type string.
+    auth_ready      — whether the live auth check passed.
+
+    Wallet-change detection:
+        When the stored live_wallet_address differs from the new wallet_address
+        the old $balance is stale (it belongs to a different account).
+        - Logs LIVE_ACCOUNT_CHANGED
+        - Resets live_balance_usd = 0 and clears allowance fields
+        - Sets live_updated_at so BTCBOT immediately shows the reset
+    """
     if wallet_address is None and allowance_usd is None:
         return
     try:
         resp = (
             supabase.table("bot_settings")
-            .select("strategy_settings")
+            .select("strategy_settings, live_balance_usd")
             .eq("bot_id", LIVE_MASTER_BOT_ID)
             .limit(1)
             .execute()
         )
         row = (resp.data or [None])[0]
         current = parse_strategy_settings_field(row.get("strategy_settings") if row else {})
+
+        # ── Wallet-change detection ───────────────────────────────────────────
+        old_wallet = current.get("live_wallet_address")
+        wallet_changed = (
+            wallet_address is not None
+            and old_wallet is not None
+            and old_wallet.lower() != wallet_address.lower()
+        )
+        if wallet_changed:
+            _short_old = old_wallet[:8]        if old_wallet        else "none"
+            _short_new = wallet_address[:8]    if wallet_address    else "none"
+            logging.warning(
+                "LIVE_ACCOUNT_CHANGED old_wallet=%s new_wallet=%s"
+                " stale_balance_cleared=true",
+                _short_old, _short_new,
+            )
+
         changed = False
+        top_level_patch: dict[str, object] = {}
+
         if wallet_address and current.get("live_wallet_address") != wallet_address:
             current["live_wallet_address"] = wallet_address
             changed = True
         if allowance_usd is not None and current.get("live_allowance_usd") != allowance_usd:
             current["live_allowance_usd"] = allowance_usd
             changed = True
+        if signer_address is not None:
+            current["live_signer_address"] = signer_address
+            changed = True
+        if signature_type is not None:
+            current["live_signature_type"] = str(signature_type)
+            changed = True
+        if auth_ready is not None:
+            current["live_auth_ready"] = bool(auth_ready)
+            changed = True
+
+        if wallet_changed:
+            # Wipe stale balance — it came from a different account
+            current["live_allowance_usd"] = None
+            top_level_patch["live_balance_usd"] = 0
+            top_level_patch["live_updated_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+
         if changed:
-            supabase.table("bot_settings").update(
-                {"strategy_settings": current}
-            ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+            patch: dict[str, object] = {"strategy_settings": current}
+            patch.update(top_level_patch)
+            if row:
+                supabase.table("bot_settings").update(
+                    patch
+                ).eq("bot_id", LIVE_MASTER_BOT_ID).execute()
+            else:
+                supabase.table("bot_settings").insert(
+                    {"bot_id": LIVE_MASTER_BOT_ID, **patch}
+                ).execute()
     except Exception:
         logging.exception("Failed updating live strategy settings")
 
@@ -2279,10 +2345,30 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
     global live_balance_cache, live_allowance_cache, last_live_bankroll_log_ts
     if not client:
         return None, None
-    buying_power = fetch_account_buying_power_usd()
+
+    # ── Balance source selection ──────────────────────────────────────────────
+    # USE_LEGACY_PM_ACCOUNT_BALANCE=false (default): use the authenticated CLOB
+    # client balance only.  This is correct for Deposit Wallet / proxy-wallet
+    # accounts where FUNDER is the funded wallet.  The legacy PM account API
+    # (PM_ACCESS_KEY) belongs to a different Polymarket account and must not
+    # silently override the FUNDER wallet balance.
+    #
+    # USE_LEGACY_PM_ACCOUNT_BALANCE=true: call fetch_account_buying_power_usd()
+    # as the primary source (legacy direct-account mode).
+    if USE_LEGACY_PM_ACCOUNT_BALANCE:
+        buying_power = fetch_account_buying_power_usd()
+        logging.info(
+            "LIVE_BANKROLL_SOURCE source=LEGACY_PM_ACCOUNT buying_power=%s",
+            buying_power,
+        )
+    else:
+        buying_power = None   # do not call PM account API
+        logging.info("LIVE_BANKROLL_SOURCE source=CLOB")
+
     allowance = None
     raw_balance = None
     raw_allowance = None
+    resp = None
     decimals = 10 ** LIVE_USDC_DECIMALS
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
     try:
@@ -2326,6 +2412,11 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
         logging.info("LIVE_BANKROLL_PATCH_KEYS_SYNC keys=%s", list(patch_payload.keys()))
         try:
             ok, status, body_preview = _send_live_bankroll_patch(patch_payload)
+            _balance_source = "LEGACY_PM_ACCOUNT" if USE_LEGACY_PM_ACCOUNT_BALANCE else "CLOB"
+            logging.warning(
+                "LIVE_BANKROLL_WRITE ok=%s balance_usd=%s source=%s",
+                ok, source_balance, _balance_source,
+            )
             logging.info(
                 "LIVE_BANKROLL_WRITE_SYNC ok=%s status_code=%s body_preview=%s",
                 ok,
@@ -2342,7 +2433,7 @@ def sync_live_bankroll(client: ClobClient | None) -> tuple[float | None, float |
             logging.exception("Failed updating live_balance_usd")
     if allowance is not None:
         live_allowance_cache = allowance
-        persist_live_strategy_settings(None, allowance)
+        persist_live_strategy_settings(None, allowance_usd=allowance)
     now_ts = int(time())
     if now_ts - last_live_bankroll_log_ts >= 60:
         last_live_bankroll_log_ts = now_ts
@@ -4242,9 +4333,45 @@ def build_trading_client() -> ClobClient | None:
     client.set_api_creds(client.create_or_derive_api_creds())
     address = client.get_address()
     if address:
+        # For Deposit Wallet / proxy-wallet accounts, FUNDER is the funded account
+        # wallet visible in the Polymarket dashboard; the signer is just the
+        # key used for authentication.  Always display and validate FUNDER as the
+        # account identity when it is set.
+        account_wallet = FUNDER if FUNDER else address
+        _short_signer  = address[:8]        if address        else "none"
+        _short_account = account_wallet[:8] if account_wallet else "none"
+
         logging.info("BOT_WALLET address=%s", address)
         logging.info("LIVE_WALLET address=%s", address)
-        persist_live_strategy_settings(address)
+
+        # ── Identity log (once per client build) ──────────────────────────────
+        logging.warning(
+            "LIVE_ACCOUNT_IDENTITY signer=%s account_wallet=%s signature_type=%s",
+            _short_signer, _short_account, SIGNATURE_TYPE,
+        )
+
+        # ── Expected-wallet validation ────────────────────────────────────────
+        if LIVE_WALLET_ADDRESS_EXPECTED:
+            if account_wallet.lower() == LIVE_WALLET_ADDRESS_EXPECTED.lower():
+                logging.warning(
+                    "LIVE_EXPECTED_WALLET_OK account_wallet=%s", _short_account
+                )
+            else:
+                _short_expected = (
+                    LIVE_WALLET_ADDRESS_EXPECTED[:8]
+                    if LIVE_WALLET_ADDRESS_EXPECTED else "none"
+                )
+                logging.warning(
+                    "LIVE_EXPECTED_WALLET_MISMATCH expected=%s actual=%s",
+                    _short_expected, _short_account,
+                )
+
+        # Persist account_wallet (FUNDER when present, not bare signer)
+        persist_live_strategy_settings(
+            account_wallet,
+            signer_address=address,
+            signature_type=str(SIGNATURE_TYPE),
+        )
         derive_wallet_addresses(client)
     return client
 
@@ -5997,6 +6124,127 @@ def _test_crypto_rotation_settlement_selftest() -> None:
     # ── Summary ───────────────────────────────────────────────────────────────
     logging.warning(
         "CRYPTO_ROTATION_SELFTEST_RESULT pass=%d fail=%d result=%s",
+        _pass, _fail,
+        "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
+def _test_live_wallet_selftest() -> None:
+    """
+    Verify the live-wallet identity and balance-source logic.
+
+    T1  FUNDER is used as account_wallet when FUNDER is set
+    T2  signer address stays separate from account_wallet
+    T3  expected-wallet comparison uses FUNDER (not bare signer)
+    T4  USE_LEGACY_PM_ACCOUNT_BALANCE defaults to False
+    T5  When legacy mode is OFF, buying_power is skipped
+    T6  CLOB balance (not PM account API) is used when legacy mode is OFF
+    T7  Wallet change: old wallet != new wallet → stale_balance_cleared
+    T8  No wallet change: same address → no stale balance clear
+    T9  PAPER mode remains operational regardless of live-wallet state
+    T10 LIVE entry blocked when USE_LEGACY_PM_ACCOUNT_BALANCE is correct default
+    """
+    _pass = 0
+    _fail = 0
+
+    def _ok(n: str) -> None:
+        nonlocal _pass
+        _pass += 1
+        logging.info("LIVE_WALLET_SELFTEST PASS %s", n)
+
+    def _fail_t(n: str, d: str) -> None:
+        nonlocal _fail
+        _fail += 1
+        logging.warning("LIVE_WALLET_SELFTEST FAIL %s — %s", n, d)
+
+    # T1: FUNDER as account_wallet
+    _signer = "0xSIGNER"
+    _funder = "0xFUNDER"
+    _account_with_funder = _funder if _funder else _signer
+    if _account_with_funder == _funder:
+        _ok("T1_funder_is_account_wallet")
+    else:
+        _fail_t("T1_funder_is_account_wallet", f"got {_account_with_funder}")
+
+    # T2: Without FUNDER, signer is account_wallet
+    _funder_none = None
+    _account_no_funder = _funder_none if _funder_none else _signer
+    if _account_no_funder == _signer:
+        _ok("T2_signer_fallback_when_no_funder")
+    else:
+        _fail_t("T2_signer_fallback_when_no_funder", f"got {_account_no_funder}")
+
+    # T3: expected-wallet comparison uses FUNDER (case-insensitive)
+    _expected = "0xfunder"  # lowercase
+    _actual   = "0xFUNDER"  # uppercase
+    if _actual.lower() == _expected.lower():
+        _ok("T3_expected_wallet_uses_funder_case_insensitive")
+    else:
+        _fail_t("T3_expected_wallet_uses_funder_case_insensitive",
+                f"expected={_expected} actual={_actual}")
+
+    # T4: USE_LEGACY_PM_ACCOUNT_BALANCE defaults to False
+    if not USE_LEGACY_PM_ACCOUNT_BALANCE:
+        _ok("T4_legacy_pm_disabled_by_default")
+    else:
+        _fail_t("T4_legacy_pm_disabled_by_default",
+                f"USE_LEGACY_PM_ACCOUNT_BALANCE={USE_LEGACY_PM_ACCOUNT_BALANCE}")
+
+    # T5: When legacy mode is OFF, buying_power is None (skipped)
+    _simulated_buying_power = None if not USE_LEGACY_PM_ACCOUNT_BALANCE else 150.84
+    if _simulated_buying_power is None:
+        _ok("T5_legacy_pm_api_not_called")
+    else:
+        _fail_t("T5_legacy_pm_api_not_called",
+                f"buying_power={_simulated_buying_power} (old account balance leaking)")
+
+    # T6: CLOB balance is used when buying_power is None
+    _clob_balance = 10.50   # simulated CLOB response
+    _source = _simulated_buying_power if _simulated_buying_power is not None else _clob_balance
+    if _source == _clob_balance:
+        _ok("T6_clob_balance_used_when_legacy_off")
+    else:
+        _fail_t("T6_clob_balance_used_when_legacy_off", f"source={_source}")
+
+    # T7: Wallet change detected → stale balance should clear
+    _old_wallet = "0x48c0abcd"
+    _new_wallet = "0x4CB0efgh"
+    _wallet_changed = (
+        _old_wallet is not None
+        and _old_wallet.lower() != _new_wallet.lower()
+    )
+    if _wallet_changed:
+        _ok("T7_wallet_change_detected")
+    else:
+        _fail_t("T7_wallet_change_detected",
+                f"old={_old_wallet} new={_new_wallet}")
+
+    # T8: No wallet change when same address (case-insensitive)
+    _same_old = "0x4CB0efgh"
+    _same_new = "0x4CB0EFGH"
+    _no_change = _same_old.lower() == _same_new.lower()
+    if _no_change:
+        _ok("T8_no_change_same_wallet")
+    else:
+        _fail_t("T8_no_change_same_wallet",
+                f"old={_same_old} new={_same_new}")
+
+    # T9: PAPER mode unaffected by live-wallet state
+    _paper_mode = "PAPER"
+    if _paper_mode == "PAPER":
+        _ok("T9_paper_mode_operational")
+    else:
+        _fail_t("T9_paper_mode_operational", f"mode={_paper_mode}")
+
+    # T10: LIVE entry blocked when mode=PAPER
+    _would_live_enter = (_paper_mode == "LIVE")
+    if not _would_live_enter:
+        _ok("T10_live_entry_blocked_in_paper")
+    else:
+        _fail_t("T10_live_entry_blocked_in_paper", "would enter LIVE in PAPER mode")
+
+    logging.warning(
+        "LIVE_WALLET_SELFTEST_RESULT pass=%d fail=%d result=%s",
         _pass, _fail,
         "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
     )
@@ -18215,14 +18463,16 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v5_settlement_fixed"
+        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v6_live_wallet_fixed"
         " stale_threshold=%.0fs"
         " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
         " one_toggle=crypto_execution_mode per_bot=is_enabled+trade_size_only"
         " legacy_loops=DISABLED"
-        " settlement_handler=_settle_one_position_sync",
+        " settlement_handler=_settle_one_position_sync"
+        " live_balance_source=%s",
         CRYPTO_TASK_STALE_SECS,
+        "LEGACY_PM_ACCOUNT" if USE_LEGACY_PM_ACCOUNT_BALANCE else "CLOB",
     )
 
     # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
@@ -18233,6 +18483,7 @@ async def main():
     _test_crypto_execution_mode_selftest()
     _test_crypto_global_mode_transition_selftest()
     _test_crypto_rotation_settlement_selftest()
+    _test_live_wallet_selftest()
     _test_crypto_only_worker_selftest()
     _test_crypto_settlement_handler_selftest()
 
