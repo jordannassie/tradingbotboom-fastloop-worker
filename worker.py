@@ -16143,6 +16143,10 @@ _btc5m_late_rotated_at: float | None = None    # wall-clock time of last success
 _btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
 _btc5m_late_last_tick_mono: float = 0.0        # supervisor watchdog: updated every tick
 _btc5m_late_rotation_attempts: int = 0         # consecutive ticks market_data=None after rotation
+# Global execution mode cache — refreshed every 30s so BTC5M_HEALTH always
+# shows the real PAPER/LIVE toggle state, not the per-bot mode column.
+_btc5m_late_exec_mode_cache: str   = CRYPTO_EXECUTION_MODE_DEFAULT
+_btc5m_late_exec_mode_cache_ts: float = 0.0
 
 _BINANCE_5M_LATE_URL = (
     "https://api.binance.com/api/v3/klines"
@@ -16645,6 +16649,9 @@ def _fresh_crypto5m_state() -> dict:
         # Rotation / entry state
         "has_position_this_market":  False,    # True after PAPER_POSITION_OPENED for current slug
         "rotation_attempts":         0,        # how many ticks we've tried to find the new market
+        # Global execution mode cache (refreshed every 30s; avoids reading DB every 5s tick)
+        "exec_mode_cache":           CRYPTO_EXECUTION_MODE_DEFAULT,
+        "exec_mode_cache_ts":        0.0,
     }
 
 _eth5m_state  = _fresh_crypto5m_state()
@@ -17521,13 +17528,25 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
             _mono_now   = _monotonic()
             _loop_lag   = round((_mono_now - _tick_start) * 1000, 1)
             _snap_age   = round(_mono_now - state["snapshot_written_at"], 1)
+            # Refresh global execution mode every 30 seconds so the health
+            # log always reflects the current PAPER/LIVE toggle state.
+            if _mono_now - state["exec_mode_cache_ts"] >= 30.0:
+                try:
+                    state["exec_mode_cache"] = await asyncio.wait_for(
+                        asyncio.to_thread(_read_crypto_execution_mode_sync),
+                        timeout=5.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass  # keep previous cached value
+                state["exec_mode_cache_ts"] = _mono_now
+            _health_exec_mode = state["exec_mode_cache"]
             if _mono_now - state["last_health_ts"] >= 10.0:
                 state["last_health_ts"] = _mono_now
                 logging.warning(
-                    "%s_HEALTH enabled=%s mode=%s slug=%s seconds_left=%s "
+                    "%s_HEALTH enabled=%s exec_mode=%s slug=%s seconds_left=%s "
                     "ref=%s spot=%s up_ask=%s down_ask=%s state=%s "
                     "loop_lag_ms=%s snap_age=%s",
-                    log_prefix, is_enabled, mode, slug, remaining,
+                    log_prefix, is_enabled, _health_exec_mode, slug, remaining,
                     ref_price, spot_price, up_ask, down_ask,
                     health_state, _loop_lag, _snap_age,
                 )
@@ -17662,18 +17681,19 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
             # ── 12. Build shared trade instruction then route PAPER or LIVE ──────────
             assert side is not None and entry_price is not None
 
-            # Read global execution mode — defaults to PAPER on timeout/error.
-            try:
-                _exec_mode = await asyncio.wait_for(
-                    asyncio.to_thread(_read_crypto_execution_mode_sync),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                _exec_mode = CRYPTO_EXECUTION_MODE_DEFAULT
-                logging.warning(
-                    "%s_EXEC_MODE_TIMEOUT — defaulting to %s",
-                    log_prefix, _exec_mode,
-                )
+            # Use the global execution mode cached by the health-log refresh above.
+            # Re-read only if the cache is stale (> 30s) — avoids double Supabase
+            # read on the same tick when the health log already refreshed it.
+            if _mono_now - state["exec_mode_cache_ts"] >= 30.0:
+                try:
+                    state["exec_mode_cache"] = await asyncio.wait_for(
+                        asyncio.to_thread(_read_crypto_execution_mode_sync),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # keep cached value — fail-safe PAPER
+                state["exec_mode_cache_ts"] = _mono_now
+            _exec_mode = state["exec_mode_cache"]
 
             # ONE shared instruction built before PAPER/LIVE split.
             # PAPER and LIVE receive identical market/side/timing/size/decision.
@@ -17929,6 +17949,7 @@ async def btc_5m_late_loop() -> None:
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
     global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at, _btc5m_late_last_tick_mono
     global _btc5m_late_rotation_attempts
+    global _btc5m_late_exec_mode_cache, _btc5m_late_exec_mode_cache_ts
 
     if not BTC5M_LATE_ENABLED:
         logging.warning(
@@ -18113,10 +18134,21 @@ async def btc_5m_late_loop() -> None:
             _mono_now = _monotonic()
             _loop_lag_ms = round((_mono_now - _tick_start) * 1000, 1)
             _snapshot_age = round(_mono_now - _btc5m_late_snapshot_written_at, 1)
+            # Refresh global execution mode every 30 seconds so the health
+            # log always reflects the current PAPER/LIVE toggle state.
+            if _mono_now - _btc5m_late_exec_mode_cache_ts >= 30.0:
+                try:
+                    _btc5m_late_exec_mode_cache = await asyncio.wait_for(
+                        asyncio.to_thread(_read_crypto_execution_mode_sync),
+                        timeout=5.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass  # keep previous cached value
+                _btc5m_late_exec_mode_cache_ts = _mono_now
             if _mono_now - _btc5m_late_last_health_ts >= 10.0:
                 _btc5m_late_last_health_ts = _mono_now
                 logging.warning(
-                    "BTC5M_HEALTH enabled=%s mode=%s arm_live=%s "
+                    "BTC5M_HEALTH enabled=%s exec_mode=%s arm_live=%s "
                     "market_slug=%s seconds_left=%s "
                     "price_to_beat=%s reference_price=%s distance_usd=%s "
                     "up_token=%s down_token=%s "
@@ -18124,7 +18156,7 @@ async def btc_5m_late_loop() -> None:
                     "state=%s reason=%s "
                     "loop_lag_ms=%s snapshot_age_seconds=%s",
                     is_enabled,
-                    mode,
+                    _btc5m_late_exec_mode_cache,
                     bool(settings.get("arm_live", False)),
                     slug,
                     remaining,
@@ -18328,17 +18360,21 @@ async def btc_5m_late_loop() -> None:
                 trade_size, trade_size, slug, side,
             )
 
-            # Read global execution mode — defaults to PAPER on timeout/error.
-            try:
-                _exec_mode = await asyncio.wait_for(
-                    asyncio.to_thread(_read_crypto_execution_mode_sync),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                _exec_mode = CRYPTO_EXECUTION_MODE_DEFAULT
-                logging.warning(
-                    "BTC5M_EXEC_MODE_TIMEOUT — defaulting to %s", _exec_mode
-                )
+            # Use the global execution mode cached by the health-log refresh
+            # above (refreshed every 30 s). Re-read only if the cache is stale
+            # so we never hit Supabase twice on the same tick.
+            if _monotonic() - _btc5m_late_exec_mode_cache_ts >= 30.0:
+                try:
+                    _btc5m_late_exec_mode_cache = await asyncio.wait_for(
+                        asyncio.to_thread(_read_crypto_execution_mode_sync),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("BTC5M_EXEC_MODE_TIMEOUT — defaulting to %s", CRYPTO_EXECUTION_MODE_DEFAULT)
+                except Exception:
+                    pass
+                _btc5m_late_exec_mode_cache_ts = _monotonic()
+            _exec_mode = _btc5m_late_exec_mode_cache
 
             # ONE shared instruction built before PAPER/LIVE split.
             # PAPER and LIVE receive identical market/side/timing/size/decision.
