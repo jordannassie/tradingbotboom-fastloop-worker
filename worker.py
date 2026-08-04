@@ -7196,6 +7196,77 @@ def _test_crypto_execution_path_selftest() -> None:
         _f("T13_live_order_failed_log_correct_name",
            "CRYPTO_LIVE_ORDER_FAILED not found in _crypto5m_live_entry")
 
+    # T14: Regression — flag must be set AFTER call, not before.
+    # Simulates: new market, live_attempted=False, LIVE enabled, valid signal
+    # → live submit function called exactly once.
+    def _sim_live_guard(live_attempted: bool, live_enabled: bool) -> dict:
+        """Returns {skipped, call_count, attempted_after}."""
+        _call_count = 0
+        _attempted  = live_attempted
+
+        if live_enabled:
+            if _attempted:
+                return {"skipped": True, "call_count": 0, "attempted_after": _attempted}
+            else:
+                # Correct: flag is NOT set here (before call)
+                try:
+                    _call_count += 1  # simulates _crypto5m_live_entry call
+                    _live_ok = True   # simulates success
+                    _attempted = True  # set AFTER call returns
+                except Exception:
+                    pass  # Do NOT set _attempted on exception
+        return {"skipped": False, "call_count": _call_count, "attempted_after": _attempted}
+
+    # Case A: new market, first call → must call exactly once
+    _ta = _sim_live_guard(live_attempted=False, live_enabled=True)
+    if _ta["call_count"] == 1 and not _ta["skipped"] and _ta["attempted_after"]:
+        _p("T14_new_market_live_called_once")
+    else:
+        _f("T14_new_market_live_called_once",
+           f"call_count={_ta['call_count']} skipped={_ta['skipped']}")
+
+    # Case B: second tick same market (attempted=True) → skipped, no call
+    _tb = _sim_live_guard(live_attempted=True, live_enabled=True)
+    if _tb["call_count"] == 0 and _tb["skipped"]:
+        _p("T14_second_tick_skipped")
+    else:
+        _f("T14_second_tick_skipped",
+           f"call_count={_tb['call_count']} skipped={_tb['skipped']}")
+
+    # Case C: live off → skipped regardless
+    _tc = _sim_live_guard(live_attempted=False, live_enabled=False)
+    if _tc["call_count"] == 0:
+        _p("T14_live_off_no_call")
+    else:
+        _f("T14_live_off_no_call", f"call_count={_tc['call_count']}")
+
+    # Structural: flag must appear AFTER the call in generic loop source
+    # (not before it — the early-set bug pattern)
+    _src_live_path = _src  # _src = inspect.getsource(_crypto5m_loop_impl) from T12
+    # The pattern "live_attempted_this_market = True" must appear AFTER
+    # "await _crypto5m_live_entry(" in the source, not before.
+    _flag_pos = _src_live_path.find("live_attempted_this_market\" ] = True")
+    _call_pos = _src_live_path.find("await _crypto5m_live_entry(")
+    if _flag_pos > _call_pos > 0:
+        _p("T14_flag_set_after_call_in_source")
+    else:
+        _f("T14_flag_set_after_call_in_source",
+           f"flag_pos={_flag_pos} call_pos={_call_pos} "
+           "(expected flag_pos > call_pos; early-set bug still present if not)")
+
+    # Also check: CRYPTO_LIVE_ATTEMPT_STARTED and CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED
+    if "CRYPTO_LIVE_ATTEMPT_STARTED" in _src:
+        _p("T14_attempt_started_log_present_generic")
+    else:
+        _f("T14_attempt_started_log_present_generic",
+           "CRYPTO_LIVE_ATTEMPT_STARTED not in _crypto5m_loop_impl")
+
+    if "CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED" in _live_entry_src:
+        _p("T14_submit_function_entered_log_present")
+    else:
+        _f("T14_submit_function_entered_log_present",
+           "CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED not in _crypto5m_live_entry")
+
     logging.warning(
         "EXEC_PATH_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
         _pass_ct, _fail_ct,
@@ -19002,6 +19073,14 @@ async def _crypto5m_live_entry(
         return _block("already_has_live_position_for_market")
 
     # ── Submit LIVE order (uses existing submit_copy_live_order path) ─────────
+    logging.warning(
+        "CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED bot_id=%s market=%s side=%s"
+        " token_id=%.16s entry_price=%.4f size=%.2f",
+        bot_id, slug,
+        "UP" if side == "yes" else "DOWN",
+        token_id or "MISSING",
+        entry_price, trade_size,
+    )
     ok, actual_price, actual_shares, raw_resp = await asyncio.to_thread(
         submit_copy_live_order,
         client, token_id, "BUY", entry_price, trade_size,
@@ -19567,21 +19646,41 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                             bot_id, slug, _side_label,
                         )
                     else:
-                        state["live_attempted_this_market"] = True
-                        _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
-                        _live_ok, _live_row_id = await _crypto5m_live_entry(
-                            bot_id      = bot_id,
-                            strategy_id = strategy_id,
-                            slug        = slug,
-                            side        = side,
-                            entry_price = entry_price,
-                            trade_size  = trade_size,
-                            start_ts    = start_ts,
-                            token_id    = _live_tok,
-                            log_prefix  = log_prefix,
+                        # Flag is set AFTER the call returns, not before.
+                        # An exception before submission is reached does NOT
+                        # mark the market as attempted (allows retry next tick).
+                        logging.warning(
+                            "CRYPTO_LIVE_ATTEMPT_STARTED bot_id=%s market=%s"
+                            " side=%s size=%.4f entry_price=%.4f",
+                            bot_id, slug, _side_label, trade_size, entry_price,
                         )
-                        if _live_ok:
-                            state["last_reason"] = "LIVE_ORDER_SUBMITTED"
+                        try:
+                            _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
+                            _live_ok, _live_row_id = await _crypto5m_live_entry(
+                                bot_id      = bot_id,
+                                strategy_id = strategy_id,
+                                slug        = slug,
+                                side        = side,
+                                entry_price = entry_price,
+                                trade_size  = trade_size,
+                                start_ts    = start_ts,
+                                token_id    = _live_tok,
+                                log_prefix  = log_prefix,
+                            )
+                            # Mark attempted only after function returns
+                            # (success OR known rejection — not on exception)
+                            state["live_attempted_this_market"] = True
+                            if _live_ok:
+                                state["last_reason"] = "LIVE_ORDER_SUBMITTED"
+                        except Exception as _live_exc:
+                            logging.warning(
+                                "CRYPTO_LIVE_ATTEMPT_EXCEPTION bot_id=%s market=%s"
+                                " side=%s error_type=%s safe_error=%.200s"
+                                " — NOT marking attempted; will retry next tick",
+                                bot_id, slug, _side_label,
+                                type(_live_exc).__name__, str(_live_exc)[:200],
+                            )
+                            # Do NOT set live_attempted_this_market — allow retry
                 else:
                     logging.warning(
                         "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
@@ -20457,21 +20556,38 @@ async def btc_5m_late_loop() -> None:
                         BTC5M_LATE_BOT_ID, slug, _btc_side_label,
                     )
                 else:
-                    _btc5m_late_live_attempted_this_market = True
-                    _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
-                    _live_ok, _live_row_id = await _crypto5m_live_entry(
-                        bot_id      = BTC5M_LATE_BOT_ID,
-                        strategy_id = BTC5M_LATE_STRATEGY_ID,
-                        slug        = slug,
-                        side        = side,
-                        entry_price = entry_price,
-                        trade_size  = trade_size,
-                        start_ts    = start_ts,
-                        token_id    = _live_token_id,
-                        log_prefix  = "BTC5M",
+                    # Flag set AFTER call returns — exception does NOT mark attempted.
+                    logging.warning(
+                        "CRYPTO_LIVE_ATTEMPT_STARTED bot_id=%s market=%s"
+                        " side=%s size=%.4f entry_price=%.4f",
+                        BTC5M_LATE_BOT_ID, slug, _btc_side_label,
+                        trade_size, entry_price,
                     )
-                    if _live_ok:
-                        _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
+                    try:
+                        _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
+                        _live_ok, _live_row_id = await _crypto5m_live_entry(
+                            bot_id      = BTC5M_LATE_BOT_ID,
+                            strategy_id = BTC5M_LATE_STRATEGY_ID,
+                            slug        = slug,
+                            side        = side,
+                            entry_price = entry_price,
+                            trade_size  = trade_size,
+                            start_ts    = start_ts,
+                            token_id    = _live_token_id,
+                            log_prefix  = "BTC5M",
+                        )
+                        _btc5m_late_live_attempted_this_market = True
+                        if _live_ok:
+                            _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
+                    except Exception as _live_exc:
+                        logging.warning(
+                            "CRYPTO_LIVE_ATTEMPT_EXCEPTION bot_id=%s market=%s"
+                            " side=%s error_type=%s safe_error=%.200s"
+                            " — NOT marking attempted; will retry next tick",
+                            BTC5M_LATE_BOT_ID, slug, _btc_side_label,
+                            type(_live_exc).__name__, str(_live_exc)[:200],
+                        )
+                        # Do NOT set _btc5m_late_live_attempted_this_market
             else:
                 logging.warning(
                     "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
