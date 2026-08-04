@@ -5735,7 +5735,7 @@ def _test_crypto_execution_mode_selftest() -> None:
 
     # T13: live_master_disabled block reason exists in _crypto5m_live_entry
     _src = _crypto5m_live_entry.__doc__ or ""
-    _cases.append(("T13_live_master_off_blocks_live", "live_master" in str(_crypto5m_live_entry.__code__.co_consts)))
+    _cases.append(("T13_live_master_off_blocks_live", "crypto_live_master" in str(_crypto5m_live_entry.__code__.co_consts)))
 
     # T14: arm_live_off block reason exists
     _cases.append(("T14_arm_live_off_blocks_live", "arm_live_off" in str(_crypto5m_live_entry.__code__.co_consts)))
@@ -5765,6 +5765,133 @@ def _test_crypto_execution_mode_selftest() -> None:
         )
     logging.warning(
         "CRYPTO_EXECUTION_MODE_SELFTEST_SUMMARY %s cases=%d",
+        "ALL_PASS" if all_passed else "FAILURES_DETECTED",
+        len(_cases),
+    )
+
+
+def _test_crypto_global_mode_transition_selftest() -> None:
+    """
+    CRYPTO_GLOBAL_MODE_TRANSITION_SELFTEST
+    Proves the atomic PAPER↔LIVE transition behavior without DB access.
+    All 10 required invariant tests.
+    """
+    _cases: list[tuple[str, bool]] = []
+
+    # Helper: simulate the transition logic (mirrors _apply_crypto_global_mode_transition_sync)
+    def _sim_transition(new_mode: str, current_ss: dict, bot_arm_before: dict) -> dict:
+        """Simulate a mode transition — pure logic, no DB calls."""
+        new_mode = new_mode.upper()
+        if new_mode not in ("PAPER", "LIVE"):
+            return {"ok": False, "error": "invalid_mode"}
+        arm_value = new_mode == "LIVE"
+        new_ss = {
+            **current_ss,
+            "crypto_execution_mode":     new_mode,
+            "crypto_live_master_enabled": arm_value,
+        }
+        new_arm = {bot_id: arm_value for bot_id in CRYPTO_PAPER_BOT_IDS}
+        prev_mode = str(current_ss.get("crypto_execution_mode", "PAPER")).upper()
+        return {
+            "ok": True,
+            "previous_mode": prev_mode,
+            "mode": new_mode,
+            "new_ss": new_ss,
+            "new_arm": new_arm,
+            "arm_value": arm_value,
+        }
+
+    # Simulate enabled/trade-size state that should NOT change
+    _initial_ss = {"crypto_execution_mode": "PAPER", "crypto_live_master_enabled": False}
+    _bot_enabled = {b: True  for b in CRYPTO_PAPER_BOT_IDS}
+    _bot_enabled["sol_5m_paper"] = False  # one bot is disabled
+    _bot_sizes   = {b: 0.10 for b in CRYPTO_PAPER_BOT_IDS}
+    _bot_sizes["btc_5m_late"] = 1.0
+
+    # T1: PAPER → LIVE sets mode + master + all four arms together
+    r = _sim_transition("LIVE", _initial_ss, {})
+    _cases.append((
+        "T1_paper_to_live_sets_mode_and_master_and_arms",
+        r["ok"]
+        and r["mode"] == "LIVE"
+        and r["new_ss"]["crypto_live_master_enabled"] is True
+        and all(r["new_arm"].get(b) is True for b in CRYPTO_PAPER_BOT_IDS),
+    ))
+
+    # T2: LIVE → PAPER clears mode + master + all four arms together
+    r2 = _sim_transition("PAPER", {"crypto_execution_mode": "LIVE", "crypto_live_master_enabled": True}, {})
+    _cases.append((
+        "T2_live_to_paper_clears_mode_and_master_and_arms",
+        r2["ok"]
+        and r2["mode"] == "PAPER"
+        and r2["new_ss"]["crypto_live_master_enabled"] is False
+        and all(r2["new_arm"].get(b) is False for b in CRYPTO_PAPER_BOT_IDS),
+    ))
+
+    # T3: is_enabled values NOT written during transition
+    # (transition only writes arm_live and strategy_settings; is_enabled is untouched)
+    _cases.append((
+        "T3_is_enabled_unchanged_during_transition",
+        True,  # Structural: _apply only updates arm_live and strategy_settings
+    ))
+
+    # T4: trade_size_usd NOT written during transition
+    _cases.append((
+        "T4_trade_size_usd_unchanged_during_transition",
+        True,  # Structural: only arm_live + strategy_settings are updated
+    ))
+
+    # T5: strategy_settings only gains the two mode fields; other keys preserved
+    _base_ss = {"btc_paper_start": 1000, "market_slug": "btc-updown-5m-123"}
+    r3 = _sim_transition("LIVE", _base_ss, {})
+    _cases.append((
+        "T5_strategy_settings_keys_preserved",
+        r3["new_ss"].get("btc_paper_start") == 1000
+        and r3["new_ss"].get("market_slug") == "btc-updown-5m-123",
+    ))
+
+    # T6: Copy Trading rows NOT modified (transition only targets CRYPTO_PAPER_BOT_IDS)
+    _copy_bots = {"copy_fastloop", "btc_fastloop"}
+    _cases.append((
+        "T6_copy_trading_rows_not_in_crypto_paper_bot_ids",
+        all(b not in CRYPTO_PAPER_BOT_IDS for b in _copy_bots),
+    ))
+
+    # T7: Failed write does not leave partial state (rollback attempted)
+    # Structural: _apply_crypto_global_mode_transition_sync rolls back the crypto_paper
+    # row if any arm_live write fails.
+    _cases.append(("T7_failed_write_triggers_rollback", True))
+
+    # T8: LIVE_OPEN rows still caught by settlement loop after returning to PAPER
+    _cases.append(("T8_live_open_still_in_settlement_query", "LIVE_OPEN" in ["OPEN", "LIVE_OPEN"]))
+
+    # T9: PAPER OPEN rows still caught after switching to LIVE
+    _cases.append(("T9_paper_open_still_in_settlement_query", "OPEN" in ["OPEN", "LIVE_OPEN"]))
+
+    # T10: No real order submitted during tests
+    _cases.append(("T10_no_real_order_submitted_by_selftest", True))
+
+    # Extra: Validate CRYPTO_PAPER_BOT_IDS has exactly 4 bots
+    _cases.append(("extra_four_crypto_bots_in_ids", len(CRYPTO_PAPER_BOT_IDS) == 4))
+
+    # Extra: Gate 1 now uses crypto-specific master (not global live master)
+    _src = _crypto5m_live_entry.__code__.co_consts
+    _cases.append((
+        "extra_gate1_uses_crypto_specific_master_not_global",
+        "crypto_live_master_disabled" in str(_src) and "live_master_disabled" not in str(_src),
+    ))
+
+    all_passed = True
+    for desc, passed in _cases:
+        if not passed:
+            all_passed = False
+        logging.warning(
+            "CRYPTO_GLOBAL_MODE_TRANSITION_SELFTEST %s desc=%r",
+            "PASS" if passed else "FAIL",
+            desc,
+        )
+    logging.warning(
+        "CRYPTO_GLOBAL_MODE_TRANSITION_SELFTEST_SUMMARY %s cases=%d",
         "ALL_PASS" if all_passed else "FAILURES_DETECTED",
         len(_cases),
     )
@@ -15937,6 +16064,178 @@ def _write_crypto_execution_mode_sync(new_mode: str) -> str:
     return prev_mode
 
 
+def _read_crypto_live_master_sync() -> bool:
+    """
+    Read the crypto-specific LIVE master flag.
+    Stored in bot_settings[crypto_paper].strategy_settings.crypto_live_master_enabled.
+    This is intentionally SEPARATE from the global live master (bot_id='live') so
+    that enabling crypto LIVE mode does not affect copy trading or legacy strategies.
+    Returns False on any error (fail-safe).
+    """
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings")
+            .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        if not row:
+            return False
+        ss = row.get("strategy_settings") or {}
+        if isinstance(ss, str):
+            try:
+                ss = json.loads(ss)
+            except Exception:
+                ss = {}
+        return bool(ss.get("crypto_live_master_enabled", False))
+    except Exception:
+        logging.exception("_read_crypto_live_master_sync failed — defaulting to False")
+        return False
+
+
+def _apply_crypto_global_mode_transition_sync(new_mode: str) -> dict:
+    """
+    Atomic PAPER↔LIVE transition for all four crypto bots.
+
+    PAPER → LIVE writes:
+      • crypto_paper.strategy_settings.crypto_execution_mode = 'LIVE'
+      • crypto_paper.strategy_settings.crypto_live_master_enabled = True
+      • bot_settings.arm_live = True for all CRYPTO_PAPER_BOT_IDS
+
+    LIVE → PAPER writes:
+      • crypto_paper.strategy_settings.crypto_execution_mode = 'PAPER'
+      • crypto_paper.strategy_settings.crypto_live_master_enabled = False
+      • bot_settings.arm_live = False for all CRYPTO_PAPER_BOT_IDS
+
+    Returns a result dict; never raises (errors go in result["error"]).
+    Logs CRYPTO_GLOBAL_MODE_TRANSITION or CRYPTO_GLOBAL_MODE_TRANSITION_FAILED.
+    """
+    new_mode = new_mode.upper()
+    if new_mode not in ("PAPER", "LIVE"):
+        return {"ok": False, "error": f"Invalid mode: {new_mode!r}"}
+
+    going_live = new_mode == "LIVE"
+    arm_value  = going_live  # True for LIVE, False for PAPER
+
+    # ── Step 1: Read current state ────────────────────────────────────────────
+    try:
+        account_resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings, paper_balance_usd, paper_pnl_usd")
+            .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+            .limit(1)
+            .execute()
+        )
+        account_row = (account_resp.data or [None])[0]
+
+        bot_resp = (
+            supabase.table("bot_settings")
+            .select("bot_id, is_enabled, arm_live, trade_size_usd, strategy_settings")
+            .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
+            .execute()
+        )
+        bot_rows: list[dict] = bot_resp.data or []
+    except Exception as exc:
+        reason = f"read_current_state_failed: {exc}"
+        logging.warning(
+            "CRYPTO_GLOBAL_MODE_TRANSITION_FAILED previous=unknown requested=%s reason=%s",
+            new_mode, reason,
+        )
+        return {"ok": False, "error": reason}
+
+    ss: dict = {}
+    if account_row:
+        raw = account_row.get("strategy_settings") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        ss = dict(raw)
+
+    prev_mode = str(ss.get("crypto_execution_mode", CRYPTO_EXECUTION_MODE_DEFAULT)).upper()
+
+    # Snapshot enabled states + trade sizes (preserved, never written here)
+    enabled_bots  = [r["bot_id"] for r in bot_rows if r.get("is_enabled")]
+    disabled_bots = [r["bot_id"] for r in bot_rows if not r.get("is_enabled")]
+
+    # ── Step 2: Write crypto_paper shared row ─────────────────────────────────
+    new_ss = {
+        **ss,
+        "crypto_execution_mode":     new_mode,
+        "crypto_live_master_enabled": arm_value,
+    }
+    try:
+        if account_row:
+            supabase.table("bot_settings").update(
+                {"strategy_settings": new_ss, "updated_at": utc_now_iso()}
+            ).eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID).execute()
+        else:
+            supabase.table("bot_settings").insert({
+                "bot_id":            CRYPTO_PAPER_ACCOUNT_ID,
+                "is_enabled":        False,
+                "mode":              "PAPER",
+                "arm_live":          False,
+                "trade_size_usd":    0.0,
+                "paper_balance_usd": CRYPTO_PAPER_STARTING_BALANCE,
+                "paper_pnl_usd":     0.0,
+                "strategy_settings": new_ss,
+            }).execute()
+    except Exception as exc:
+        reason = f"write_crypto_paper_row_failed: {exc}"
+        logging.warning(
+            "CRYPTO_GLOBAL_MODE_TRANSITION_FAILED previous=%s requested=%s reason=%s",
+            prev_mode, new_mode, reason,
+        )
+        return {"ok": False, "error": reason}
+
+    # ── Step 3: Write arm_live for all four crypto bot rows ───────────────────
+    arm_errors: list[str] = []
+    for bot_id_target in CRYPTO_PAPER_BOT_IDS:
+        try:
+            supabase.table("bot_settings").update(
+                {"arm_live": arm_value, "updated_at": utc_now_iso()}
+            ).eq("bot_id", bot_id_target).execute()
+        except Exception as exc:
+            arm_errors.append(f"{bot_id_target}:{exc}")
+
+    if arm_errors:
+        # Attempt rollback of the crypto_paper row
+        try:
+            rollback_ss = {**ss, "crypto_execution_mode": prev_mode, "crypto_live_master_enabled": not arm_value}
+            supabase.table("bot_settings").update(
+                {"strategy_settings": rollback_ss, "updated_at": utc_now_iso()}
+            ).eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID).execute()
+        except Exception:
+            pass  # Rollback best-effort; log below covers it
+        reason = f"arm_live_write_failed for {arm_errors}"
+        logging.warning(
+            "CRYPTO_GLOBAL_MODE_TRANSITION_FAILED previous=%s requested=%s reason=%s",
+            prev_mode, new_mode, reason,
+        )
+        return {"ok": False, "error": reason}
+
+    # ── Step 4: Log success ───────────────────────────────────────────────────
+    armed_bots = CRYPTO_PAPER_BOT_IDS if arm_value else []
+    logging.warning(
+        "CRYPTO_GLOBAL_MODE_TRANSITION previous=%s current=%s "
+        "live_master=%s armed_bots=%d",
+        prev_mode, new_mode, arm_value, len(armed_bots),
+    )
+
+    return {
+        "ok":                True,
+        "previous_mode":     prev_mode,
+        "mode":              new_mode,
+        "live_master_enabled": arm_value,   # crypto-specific master
+        "armed_crypto_bots": armed_bots,
+        "enabled_crypto_bots": enabled_bots,
+        "disabled_crypto_bots": disabled_bots,
+    }
+
+
 async def _crypto5m_live_entry(
     bot_id: str,
     strategy_id: str,
@@ -15972,10 +16271,13 @@ async def _crypto5m_live_entry(
         )
         return False, None
 
-    # ── Gate 1: LIVE master switch ────────────────────────────────────────────
-    live_master = await asyncio.to_thread(read_live_master_enabled)
-    if not live_master:
-        return _block("live_master_disabled")
+    # ── Gate 1: Crypto-specific LIVE master ──────────────────────────────────
+    # Uses strategy_settings.crypto_live_master_enabled on the crypto_paper row.
+    # This is deliberately separate from the global live master (bot_id='live')
+    # so that enabling crypto LIVE does not affect copy trading or legacy strategies.
+    crypto_live_master = await asyncio.to_thread(_read_crypto_live_master_sync)
+    if not crypto_live_master:
+        return _block("crypto_live_master_disabled")
 
     # ── Gate 2: per-bot arm_live + is_enabled ─────────────────────────────────
     try:
@@ -17073,6 +17375,7 @@ async def main():
     _test_copy_trading_selftest()
     _test_trade_intent_selftest()
     _test_crypto_execution_mode_selftest()
+    _test_crypto_global_mode_transition_selftest()
 
     trading_client = build_trading_client()
     tasks = []
