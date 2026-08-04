@@ -59,6 +59,7 @@ def log_paper_decision(
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -19116,18 +19117,30 @@ async def main():
     )
 
     # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
-    _test_compute_copy_size()
-    _test_btc5m_test_mode()
-    _test_copy_trading_selftest()
-    _test_trade_intent_selftest()
-    _test_crypto_execution_mode_selftest()
-    _test_crypto_global_mode_transition_selftest()
-    _test_crypto_rotation_settlement_selftest()
-    _test_live_wallet_selftest()
-    _test_evm_key_validation_selftest()
-    _test_live_clob_reconnect_selftest()
-    _test_crypto_only_worker_selftest()
-    _test_crypto_settlement_handler_selftest()
+    # Each test is wrapped independently so a single failure logs a warning
+    # but never prevents the worker from starting PAPER/LIVE loops.
+    _SELFTESTS = [
+        ("_test_compute_copy_size",                _test_compute_copy_size),
+        ("_test_btc5m_test_mode",                  _test_btc5m_test_mode),
+        ("_test_copy_trading_selftest",            _test_copy_trading_selftest),
+        ("_test_trade_intent_selftest",            _test_trade_intent_selftest),
+        ("_test_crypto_execution_mode_selftest",   _test_crypto_execution_mode_selftest),
+        ("_test_crypto_global_mode_transition_selftest", _test_crypto_global_mode_transition_selftest),
+        ("_test_crypto_rotation_settlement_selftest",    _test_crypto_rotation_settlement_selftest),
+        ("_test_live_wallet_selftest",             _test_live_wallet_selftest),
+        ("_test_evm_key_validation_selftest",      _test_evm_key_validation_selftest),
+        ("_test_live_clob_reconnect_selftest",     _test_live_clob_reconnect_selftest),
+        ("_test_crypto_only_worker_selftest",      _test_crypto_only_worker_selftest),
+        ("_test_crypto_settlement_handler_selftest", _test_crypto_settlement_handler_selftest),
+    ]
+    for _st_name, _st_fn in _SELFTESTS:
+        try:
+            _st_fn()
+        except Exception as _st_exc:
+            logging.warning(
+                "SELFTEST_STARTUP_ERROR name=%s error=%s — worker continues",
+                _st_name, type(_st_exc).__name__,
+            )
 
     # ── Settlement handler availability assertion ─────────────────────────────
     # If _settle_one_position_sync is missing (e.g. due to a future refactor
