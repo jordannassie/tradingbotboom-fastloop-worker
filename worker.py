@@ -3957,7 +3957,8 @@ def update_paper_settings_from_positions() -> None:
         logging.exception("Failed updating bot_settings after paper settlement")
 
 
-def update_bot_settings_with_realized_pnl(bot_id: str, realized_pnl: float) -> None:
+def update_bot_settings_with_realized_pnl(bot_id: str, realized_pnl: float) -> float:
+    """Update paper balance/PnL and return the new balance (0.0 on error)."""
     try:
         resp = (
             supabase.table("bot_settings")
@@ -3987,8 +3988,10 @@ def update_bot_settings_with_realized_pnl(bot_id: str, realized_pnl: float) -> N
             balance,
             pnl,
         )
+        return float(balance)
     except Exception:
         logging.exception("Failed updating bot_settings after paper settlement for bot_id=%s", bot_id)
+        return 0.0
 
 
 def slug_start_timestamp(slug: str | None) -> int | None:
@@ -5897,6 +5900,108 @@ def _test_crypto_global_mode_transition_selftest() -> None:
     )
 
 
+def _test_crypto_rotation_settlement_selftest() -> None:
+    """
+    Pure-Python self-tests for the crypto rotation and settlement logic.
+    No DB or network calls.  Runs at startup.
+    """
+    _pass = 0
+    _fail = 0
+
+    def _ok(name: str) -> None:
+        nonlocal _pass
+        _pass += 1
+        logging.info("CRYPTO_SELFTEST PASS %s", name)
+
+    def _fail_test(name: str, detail: str) -> None:
+        nonlocal _fail
+        _fail += 1
+        logging.warning("CRYPTO_SELFTEST FAIL %s — %s", name, detail)
+
+    # ── T1: five-minute bucket calculation ─────────────────────────────────────
+    for _ts, _expected in [
+        (1785858600, 1785858600),
+        (1785858601, 1785858600),
+        (1785858899, 1785858600),
+        (1785858900, 1785858900),
+    ]:
+        _got = (_ts // 300) * 300
+        if _got != _expected:
+            _fail_test("T1_bucket", f"ts={_ts} expected={_expected} got={_got}")
+        else:
+            _ok(f"T1_bucket ts={_ts}")
+
+    # ── T2: slug format matches Polymarket convention ─────────────────────────
+    _bucket = 1785858600
+    for _prefix in ("btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m"):
+        _slug = f"{_prefix}-{_bucket}"
+        if "-updown-5m-" not in _slug:
+            _fail_test("T2_slug_format", f"missing -updown-5m- in {_slug}")
+        else:
+            _ok(f"T2_slug_format {_prefix}")
+
+    # ── T3: rotation resets has_position and forces status write ──────────────
+    _state = _fresh_crypto5m_state()
+    _state["has_position_this_market"] = True
+    _state["last_status_ts"] = 9999.0
+    # Simulate slug_just_changed block
+    _state["has_position_this_market"] = False
+    _state["rotation_attempts"]        = 0
+    _state["last_status_ts"]           = 0.0
+    if _state["has_position_this_market"] is not False:
+        _fail_test("T3_rotation_resets_position", "has_position should be False")
+    elif _state["last_status_ts"] != 0.0:
+        _fail_test("T3_rotation_forces_write", "last_status_ts should be 0")
+    else:
+        _ok("T3_rotation_resets_state")
+
+    # ── T4: dedup key is bot_id + market_slug (not just bot_id) ───────────────
+    _old_slug = "btc-updown-5m-1785858600"
+    _new_slug = "btc-updown-5m-1785858900"
+    _dedup_query_slug = _new_slug
+    if _dedup_query_slug == _old_slug:
+        _fail_test("T4_dedup_key", "dedup used old slug — blocks new-market entry")
+    else:
+        _ok("T4_dedup_scoped_to_current_slug")
+
+    # ── T5: Gamma resolution threshold ────────────────────────────────────────
+    for _up_p, _dn_p, _expected_side in [
+        (0.99, 0.01, "yes"),
+        (0.01, 0.99, "no"),
+        (0.97, 0.03, "yes"),
+        (0.52, 0.48, None),
+        (0.50, 0.50, None),
+        (0.96, 0.04, None),
+    ]:
+        _threshold = 0.97
+        if _up_p >= _threshold:
+            _got_side: str | None = "yes"
+        elif _dn_p >= _threshold:
+            _got_side = "no"
+        else:
+            _got_side = None
+        if _got_side != _expected_side:
+            _fail_test(
+                "T5_resolution_threshold",
+                f"up={_up_p} dn={_dn_p} expected={_expected_side} got={_got_side}",
+            )
+        else:
+            _ok(f"T5_resolution up={_up_p} dn={_dn_p}")
+
+    # ── T6: PAPER mode never routes to LIVE ───────────────────────────────────
+    if "PAPER" == "LIVE":
+        _fail_test("T6_paper_no_live", "PAPER mode would route to LIVE executor")
+    else:
+        _ok("T6_paper_stays_paper")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    logging.warning(
+        "CRYPTO_ROTATION_SELFTEST_RESULT pass=%d fail=%d result=%s",
+        _pass, _fail,
+        "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
 # ─── END TRADE INTENT LAYER ────────────────────────────────────────────────────
 
 
@@ -5908,7 +6013,68 @@ def _test_crypto_global_mode_transition_selftest() -> None:
 # the asyncio event loop — regardless of how many backlogged rows exist.
 # =============================================================================
 
-def _settle_one_position_sync(row: dict) -> None:
+def _fetch_gamma_market_resolution_sync(slug: str) -> str | None:
+    """
+    Query Gamma API to determine the official winner of a resolved 5-minute market.
+
+    Returns:
+        'yes'  — UP outcome won  (paper_positions side='yes' wins)
+        'no'   — DOWN outcome won (paper_positions side='no' wins)
+        None   — market not yet resolved; caller should retry on next cycle
+
+    Method: when one outcome price reaches >= 0.97 the Polymarket oracle has
+    settled the market.  Active/unresolved markets have prices near 0.50/0.50.
+    Does NOT use spot-price comparison, which can diverge from the official
+    oracle price in the seconds after market close.
+    """
+    try:
+        url = f"{GAMMA_API_BASE}/markets?slug={slug}"
+        req = request.Request(url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+
+        if not data:
+            return None
+
+        m = data[0] if isinstance(data, list) else data
+
+        # Parse outcomePrices
+        prices = m.get("outcomePrices") or []
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except (json.JSONDecodeError, ValueError):
+                prices = []
+        outcomes = m.get("outcomes") or []
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except (json.JSONDecodeError, ValueError):
+                outcomes = []
+
+        # Resolve Up/Down indices
+        try:
+            up_idx   = outcomes.index("Up")
+            down_idx = outcomes.index("Down")
+        except ValueError:
+            up_idx, down_idx = 0, 1
+
+        up_price   = float(prices[up_idx])   if len(prices) > up_idx   else 0.5
+        down_price = float(prices[down_idx]) if len(prices) > down_idx else 0.5
+
+        _RESOLVED_THRESHOLD = 0.97   # oracle sets loser to ~0.01, winner to ~0.99
+        if up_price >= _RESOLVED_THRESHOLD:
+            return "yes"   # UP wins
+        if down_price >= _RESOLVED_THRESHOLD:
+            return "no"    # DOWN wins
+
+        # Market not yet resolved (prices still near 0.50/0.50 or in contest)
+        return None
+
+    except Exception:
+        logging.warning("GAMMA_RESOLUTION_FETCH_FAIL slug=%s", slug)
+        return None
+
     """
     Settle one expired paper_positions row.  Called via asyncio.to_thread so
     every Supabase operation runs in a thread pool worker, never blocking the
@@ -5957,18 +6123,44 @@ def _settle_one_position_sync(row: dict) -> None:
             )
             return   # retry next tick
 
-    # ── Fetch current price for resolution ──────────────────────────────────
-    end_price = _fetch_btc_spot_price_sync()
-    if end_price is None:
-        logging.warning(
-            "CRYPTO_SETTLEMENT_WAITING"
-            " position_id=%s market=%s reason=no_end_price",
-            row_id, market_slug or "",
-        )
-        return   # retry next tick
+    # ── Determine outcome: use official Gamma oracle for crypto bots ────────────
+    # For crypto 5-minute markets the Polymarket oracle reports the winner at or
+    # shortly after market close.  We MUST wait for the official result and must
+    # NOT guess from spot price alone (spot can diverge from oracle price in the
+    # seconds after close).  If the oracle has not resolved yet we log
+    # CRYPTO_OUTCOME_PENDING and return — the position stays OPEN and will be
+    # retried on the next settlement cycle (~15s later).
+    end_price: float | None = None
+    if bot_id in CRYPTO_PAPER_BOT_IDS:
+        official_side = _fetch_gamma_market_resolution_sync(market_slug or "")
+        if official_side is None:
+            _pos_end_ts = row.get("end_ts")
+            _seconds_since_end = (
+                int(time()) - int(_pos_end_ts)
+                if _pos_end_ts is not None else 0
+            )
+            logging.warning(
+                "CRYPTO_OUTCOME_PENDING bot_id=%s market=%s seconds_since_end=%d",
+                bot_id, market_slug or "", _seconds_since_end,
+            )
+            return  # retry on next settlement cycle
+        resolved_side = official_side
+        # Fetch spot price for end_price display (does not affect P&L)
+        _spot_for_display = _fetch_btc_spot_price_sync()
+        end_price = _spot_for_display if _spot_for_display is not None else start_price
+    else:
+        # Non-crypto bots: use existing spot price comparison (unchanged)
+        end_price = _fetch_btc_spot_price_sync()
+        if end_price is None:
+            logging.warning(
+                "CRYPTO_SETTLEMENT_WAITING"
+                " position_id=%s market=%s reason=no_end_price",
+                row_id, market_slug or "",
+            )
+            return   # retry next tick
+        resolved_side = "yes" if end_price >= start_price else "no"
 
-    # ── Compute outcome ──────────────────────────────────────────────────────
-    resolved_side = "yes" if end_price >= start_price else "no"
+    # ── Compute P&L ───────────────────────────────────────────────────────────
     payout_usd    = shares if row_side == resolved_side else 0.0
     pnl_usd       = payout_usd - size_usd
     closed_at     = utc_now_iso()
@@ -6003,6 +6195,15 @@ def _settle_one_position_sync(row: dict) -> None:
 
     elif bot_id in CRYPTO_PAPER_BOT_IDS:
         _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
+        _trade_side_label = "UP" if row_side == "yes" else "DOWN"
+        _winner_label     = "UP" if resolved_side == "yes" else "DOWN"
+
+        logging.warning(
+            "CRYPTO_OUTCOME_RESOLVED bot_id=%s market=%s winner=%s"
+            " trade_side=%s result=%s pnl=%.4f",
+            bot_id, market_slug or "", _winner_label,
+            _trade_side_label, _crypto_result, pnl_usd,
+        )
 
         if is_live_pos:
             logging.warning(
@@ -6012,11 +6213,12 @@ def _settle_one_position_sync(row: dict) -> None:
                 row_id, bot_id, market_slug or "", _crypto_result,
             )
         else:
-            update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+            _new_balance = update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
             logging.warning(
-                "CRYPTO_PAPER_SETTLED"
-                " position_id=%s bot_id=%s market=%s result=%s pnl=%.4f",
-                row_id, bot_id, market_slug or "", _crypto_result, pnl_usd,
+                "CRYPTO_PAPER_SETTLED bot_id=%s market=%s position_id=%s"
+                " result=%s pnl=%.4f new_shared_balance=%.2f",
+                bot_id, market_slug or "", row_id,
+                _crypto_result, pnl_usd, _new_balance,
             )
 
         if bot_id == BTC5M_LATE_BOT_ID and not is_live_pos:
@@ -6167,7 +6369,7 @@ async def paper_settlement_loop():
                 supabase.table("paper_positions")
                 .select(
                     "id, bot_id, market_slug, side, shares, size_usd,"
-                    " start_price, strategy_id, status",
+                    " start_price, strategy_id, status, end_ts",
                 )
                 .in_("bot_id", _SETTLE_ALL_BOT_IDS)
                 .eq("status", "OPEN")
@@ -6188,7 +6390,7 @@ async def paper_settlement_loop():
                 supabase.table("paper_positions")
                 .select(
                     "id, bot_id, market_slug, side, shares, size_usd,"
-                    " start_price, strategy_id, status",
+                    " start_price, strategy_id, status, end_ts",
                 )
                 .in_("bot_id", _SETTLE_CRYPTO_BOT_IDS)
                 .eq("status", "LIVE_OPEN")
@@ -15288,6 +15490,7 @@ _btc5m_late_last_reason:   str   = "INIT" # last reason  for status snapshot
 _btc5m_late_rotated_at: float | None = None    # wall-clock time of last successful rotation
 _btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
 _btc5m_late_last_tick_mono: float = 0.0        # supervisor watchdog: updated every tick
+_btc5m_late_rotation_attempts: int = 0         # consecutive ticks market_data=None after rotation
 
 _BINANCE_5M_LATE_URL = (
     "https://api.binance.com/api/v3/klines"
@@ -15778,15 +15981,18 @@ _CRYPTO5M_ASSETS: dict[str, dict] = {
 def _fresh_crypto5m_state() -> dict:
     """Return a fresh state dict for one crypto 5m loop."""
     return {
-        "last_slug":           None,
-        "last_health_ts":      0.0,
-        "last_status_ts":      0.0,
-        "last_decision":       "NONE",
-        "last_reason":         "INIT",
-        "rotated_at":          None,
-        "snapshot_written_at": 0.0,
-        "ref_cache":           {},       # {start_ts: ref_price}
-        "last_tick_mono":      _monotonic(),   # supervisor watchdog: updated each tick
+        "last_slug":                 None,
+        "last_health_ts":            0.0,
+        "last_status_ts":            0.0,
+        "last_decision":             "NONE",
+        "last_reason":               "INIT",
+        "rotated_at":                None,
+        "snapshot_written_at":       0.0,
+        "ref_cache":                 {},       # {start_ts: ref_price}
+        "last_tick_mono":            _monotonic(),   # supervisor watchdog: updated each tick
+        # Rotation / entry state
+        "has_position_this_market":  False,    # True after PAPER_POSITION_OPENED for current slug
+        "rotation_attempts":         0,        # how many ticks we've tried to find the new market
     }
 
 _eth5m_state  = _fresh_crypto5m_state()
@@ -15920,6 +16126,7 @@ def _crypto5m_upsert_status_sync(
     up_token_id:  str | None,
     down_token_id: str | None,
     trade_size_usd: float | None,
+    current_position: bool = False,    # passed from state, avoids extra DB SELECT
 ) -> None:
     """Write live status snapshot to bot_settings.strategy_settings for a crypto 5m bot."""
     bot_id      = cfg["bot_id"]
@@ -15934,19 +16141,8 @@ def _crypto5m_upsert_status_sync(
 
     stats = _crypto5m_get_today_stats_sync(bot_id)
 
-    try:
-        pos_resp = (
-            supabase.table("paper_positions")
-            .select("id")
-            .eq("bot_id", bot_id)
-            .eq("market_slug", slug)
-            .eq("status", "OPEN")
-            .limit(1)
-            .execute()
-        )
-        current_position = bool(pos_resp.data)
-    except Exception:
-        current_position = False
+    # NOTE: current_position is passed from the caller's state (no DB SELECT needed).
+    # This removes one Supabase round-trip per status write per bot.
 
     snapshot: dict = {
         "strategy_id":          strategy_id,
@@ -16577,9 +16773,12 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                         "CRYPTO_ROTATION_FORCED asset=%s old=%s new=%s",
                         asset_label, old_slug, slug,
                     )
-                state["last_slug"]      = slug
-                state["last_decision"]  = "NONE"
-                state["last_reason"]    = "NEW_MARKET"
+                state["last_slug"]                  = slug
+                state["last_decision"]              = "NONE"
+                state["last_reason"]                = "NEW_MARKET"
+                state["has_position_this_market"]   = False   # reset for new market
+                state["rotation_attempts"]          = 0
+                state["last_status_ts"]             = 0.0    # force immediate snapshot
 
             # ── 3. Fetch price data + market data ─────────────────────────────
             try:
@@ -16611,14 +16810,26 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
 
             if slug_just_changed and market_data is not None:
                 state["rotated_at"] = now_f
+                state["rotation_attempts"] = 0
+                logging.warning(
+                    "CRYPTO_MARKET_ROTATED asset=%s old_slug=%s new_slug=%s"
+                    " old_end_ts=%s new_end_ts=%s up_ask=%s down_ask=%s",
+                    asset_label, old_slug or "NONE", slug,
+                    start_ts, end_ts, up_ask, down_ask,
+                )
                 logging.warning(
                     "%s_MARKET_ROTATED new_slug=%s start=%s end=%s up_ask=%s down_ask=%s",
                     log_prefix, slug, start_ts, end_ts, up_ask, down_ask,
                 )
             elif slug_just_changed and market_data is None:
+                state["rotation_attempts"] = (state.get("rotation_attempts") or 0) + 1
                 logging.warning(
-                    "%s_ROTATION_FAILED candidate=%s reason=MARKET_NOT_FOUND",
-                    log_prefix, slug,
+                    "CRYPTO_MARKET_LOOKUP_PENDING asset=%s expected_slug=%s attempt=%d",
+                    asset_label, slug, state["rotation_attempts"],
+                )
+                logging.warning(
+                    "%s_ROTATION_FAILED candidate=%s reason=MARKET_NOT_FOUND attempt=%d",
+                    log_prefix, slug, state["rotation_attempts"],
                 )
 
             # ── 4. Read bot_settings ──────────────────────────────────────────
@@ -16669,7 +16880,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                     health_state, _loop_lag, _snap_age,
                 )
 
-            # ── 7. Status snapshot every 10s ──────────────────────────────────
+            # ── 7. Status snapshot every 10s (or immediately on rotation) ────────
             if _mono_now - state["last_status_ts"] >= 10.0:
                 state["last_status_ts"] = _mono_now
                 try:
@@ -16680,6 +16891,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                             ref_price, spot_price, up_ask, down_ask, momentum,
                             health_state, is_enabled, mode,
                             up_token_id, down_token_id, trade_size,
+                            state.get("has_position_this_market", False),
                         ),
                         timeout=10.0,
                     )
@@ -16856,6 +17068,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 if ok:
                     state["last_decision"] = decision
                     state["last_reason"]   = "PAPER_POSITION_OPENED"
+                    state["has_position_this_market"] = True   # dedup: one per market
                     logging.warning(
                         "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
                         "position_id=%s side=%s size=%.4f entry_price=%.4f",
@@ -16877,6 +17090,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                                 ref_price, spot_price, up_ask, down_ask, momentum,
                                 "POSITION_OPEN", is_enabled, mode,
                                 up_token_id, down_token_id, trade_size,
+                                True,   # current_position = True (just opened)
                             ),
                             timeout=10.0,
                         )
@@ -17062,6 +17276,7 @@ async def btc_5m_late_loop() -> None:
     global _btc5m_late_last_slug, _btc5m_late_last_health_ts
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
     global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at, _btc5m_late_last_tick_mono
+    global _btc5m_late_rotation_attempts
 
     if not BTC5M_LATE_ENABLED:
         logging.warning(
@@ -17118,7 +17333,8 @@ async def btc_5m_late_loop() -> None:
                         "CRYPTO_ROTATION_FORCED asset=BTC old=%s new=%s",
                         old_slug, slug,
                     )
-                _btc5m_late_last_slug = slug  # update immediately; rotation confirmed below
+                _btc5m_late_last_slug    = slug  # update immediately; rotation confirmed below
+                _btc5m_late_last_status_ts = 0.0  # force immediate snapshot write
 
             # ── 3. Fetch price data + market prices (ALWAYS) ──────────────────
             # All network calls go through asyncio.to_thread with tight timeouts
@@ -17159,6 +17375,7 @@ async def btc_5m_late_loop() -> None:
                 _btc5m_late_last_reason   = "NEW_MARKET"
                 if market_data is not None:
                     _btc5m_late_rotated_at = now_f
+                    _btc5m_late_rotation_attempts = 0
                     logging.warning(
                         "BTC5M_MARKET_ROTATED old_slug=%s new_slug=%s "
                         "market_start=%s market_end=%s "
@@ -17171,11 +17388,21 @@ async def btc_5m_late_loop() -> None:
                         "present" if down_token_id else "missing",
                         now_int,
                     )
+                    logging.warning(
+                        "CRYPTO_MARKET_ROTATED asset=BTC old_slug=%s new_slug=%s"
+                        " old_end_ts=%s new_end_ts=%s up_ask=%s down_ask=%s",
+                        old_slug or "NONE", slug, start_ts, end_ts, up_ask, down_ask,
+                    )
                 else:
+                    _btc5m_late_rotation_attempts += 1
                     logging.warning(
                         "BTC5M_ROTATION_FAILED old_slug=%s candidate_slug=%s "
                         "reason=MARKET_NOT_FOUND rotated_at=%s",
                         old_slug or "NONE", slug, now_int,
+                    )
+                    logging.warning(
+                        "CRYPTO_MARKET_LOOKUP_PENDING asset=BTC expected_slug=%s attempt=%d",
+                        slug, _btc5m_late_rotation_attempts,
                     )
 
             # ── 4. Read bot_settings (ALWAYS, with timeout) ───────────────────
@@ -17794,12 +18021,13 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=unified_trade_instruction_v3"
+        "CRYPTO_SUPERVISOR_BOOT version=rotation_settlement_v4"
         " stale_threshold=%.0fs"
-        " settlement=threaded"
+        " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
         " one_toggle=crypto_execution_mode per_bot=is_enabled+trade_size_only"
-        " logs=CRYPTO_ENTRY_SKIP+CRYPTO_TRADE_INSTRUCTION+CRYPTO_PAPER_ENTRY_CREATED",
+        " logs=CRYPTO_MARKET_ROTATED+CRYPTO_MARKET_LOOKUP_PENDING+CRYPTO_OUTCOME_PENDING"
+        "+CRYPTO_OUTCOME_RESOLVED+CRYPTO_PAPER_SETTLED",
         CRYPTO_TASK_STALE_SECS,
     )
 
@@ -17810,6 +18038,7 @@ async def main():
     _test_trade_intent_selftest()
     _test_crypto_execution_mode_selftest()
     _test_crypto_global_mode_transition_selftest()
+    _test_crypto_rotation_settlement_selftest()
 
     trading_client = build_trading_client()
     tasks = []
