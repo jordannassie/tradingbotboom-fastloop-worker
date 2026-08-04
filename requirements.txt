@@ -1,4 +1,4 @@
-py-clob-client
+py-clob-client==0.34.6
 websockets
 python-dotenv
 supabase

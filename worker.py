@@ -7770,6 +7770,136 @@ def _test_crypto_settlement_handler_selftest() -> None:
     )
 
 
+def _test_clob_client_compat_selftest() -> None:
+    """
+    Validates the installed py-clob-client version and order-building API
+    without submitting any real order.
+
+    C1  py-clob-client can be imported and version is readable.
+    C2  Version is >= 0.34.0 (first version with current order protocol).
+    C3  ClobClient constructor accepts signature_type and funder kwargs.
+    C4  OrderArgs is importable and can be constructed with price/size/side/token_id.
+    C5  OrderType.GTC exists.
+    C6  BalanceAllowanceParams is importable.
+    C7  AssetType is importable.
+    C8  client.create_order method exists on ClobClient.
+    C9  client.post_order method exists on ClobClient.
+    C10 No real CLOB request is made during this test.
+    """
+    _pass = 0
+    _fail = 0
+
+    def _ok(n: str, note: str = "") -> None:
+        nonlocal _pass
+        _pass += 1
+        logging.info("CLOB_COMPAT_SELFTEST PASS %s %s", n, note)
+
+    def _fail_t(n: str, d: str) -> None:
+        nonlocal _fail
+        _fail += 1
+        logging.warning("CLOB_COMPAT_SELFTEST FAIL %s — %s", n, d)
+
+    # C1: importable, version readable
+    try:
+        import importlib.metadata as _imeta
+        _ver = _imeta.version("py-clob-client")
+        _ok("C1_importable", f"version={_ver}")
+    except Exception as _e:
+        _fail_t("C1_importable", str(_e))
+        _ver = "0.0.0"
+
+    # C2: version >= 0.34.0
+    try:
+        _parts = [int(x) for x in _ver.split(".")[:3]]
+        # Pad to 3 parts
+        while len(_parts) < 3:
+            _parts.append(0)
+        _min = [0, 34, 0]
+        if _parts >= _min:
+            _ok("C2_version_current", f"{_ver} >= 0.34.0")
+        else:
+            _fail_t("C2_version_current",
+                    f"{_ver} < 0.34.0 — order protocol likely outdated; "
+                    "Polymarket CLOB will reject orders with 'invalid order version'")
+    except Exception as _e:
+        _fail_t("C2_version_current", f"could not parse version: {_e}")
+
+    # C3: ClobClient constructor signature
+    try:
+        import inspect as _inspect
+        from py_clob_client.client import ClobClient as _CC
+        _sig = _inspect.signature(_CC.__init__)
+        _params = list(_sig.parameters.keys())
+        if "signature_type" in _params and "funder" in _params:
+            _ok("C3_constructor_params", f"params={_params}")
+        else:
+            _fail_t("C3_constructor_params",
+                    f"signature_type or funder missing; params={_params}")
+    except Exception as _e:
+        _fail_t("C3_constructor_params", str(_e))
+
+    # C4: OrderArgs constructable
+    try:
+        from py_clob_client.clob_types import OrderArgs as _OA
+        _oa = _OA(
+            token_id  = "0x" + "a" * 64,
+            price     = 0.50,
+            size      = 2.0,
+            side      = "BUY",
+        )
+        _ok("C4_orderargs_constructable",
+            f"token={_oa.token_id[:8]}... price={_oa.price} size={_oa.size}")
+    except Exception as _e:
+        _fail_t("C4_orderargs_constructable", str(_e))
+
+    # C5: OrderType.GTC
+    try:
+        from py_clob_client.clob_types import OrderType as _OT
+        _gtc = _OT.GTC
+        _ok("C5_ordertype_gtc", f"GTC={_gtc}")
+    except Exception as _e:
+        _fail_t("C5_ordertype_gtc", str(_e))
+
+    # C6: BalanceAllowanceParams
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams as _BAP
+        _ok("C6_balance_allowance_params")
+    except Exception as _e:
+        _fail_t("C6_balance_allowance_params", str(_e))
+
+    # C7: AssetType
+    try:
+        from py_clob_client.clob_types import AssetType as _AT
+        _ok("C7_asset_type")
+    except Exception as _e:
+        _fail_t("C7_asset_type", str(_e))
+
+    # C8/C9: ClobClient has create_order and post_order methods
+    try:
+        from py_clob_client.client import ClobClient as _CC2
+        _has_create = callable(getattr(_CC2, "create_order", None))
+        _has_post   = callable(getattr(_CC2, "post_order", None))
+        if _has_create:
+            _ok("C8_create_order_method")
+        else:
+            _fail_t("C8_create_order_method", "ClobClient.create_order not found")
+        if _has_post:
+            _ok("C9_post_order_method")
+        else:
+            _fail_t("C9_post_order_method", "ClobClient.post_order not found")
+    except Exception as _e:
+        _fail_t("C8_C9_clob_methods", str(_e))
+
+    # C10: No real network calls made in this test
+    _ok("C10_no_real_order")
+
+    logging.warning(
+        "CLOB_COMPAT_SELFTEST_SUMMARY version=%s pass=%d fail=%d result=%s",
+        _ver, _pass, _fail,
+        "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
+    )
+
+
 def _test_crypto_only_worker_selftest() -> None:
     """
     Verify the crypto-only worker configuration:
@@ -20463,6 +20593,15 @@ async def btc_5m_late_supervised_loop() -> None:
 
 async def main():
     global _clob_singleton, _clob_auth_ready, _clob_last_attempt_mono
+    # ── CLOB client version — first thing logged so it's visible in Railway ──
+    try:
+        import importlib.metadata as _imeta
+        _clob_ver = _imeta.version("py-clob-client")
+    except Exception:
+        _clob_ver = "unknown"
+    logging.warning(
+        "POLYMARKET_CLOB_CLIENT_VERSION version=%s", _clob_ver
+    )
     # ── Unmistakable startup marker in the running event loop ─────────────────
     # Fires from main() — same scope as heartbeat_loop and all other tasks.
     # This is the definitive proof that the shared-brain code is executing.
@@ -20510,6 +20649,7 @@ async def main():
         ("_test_stale_paper_cleanup_selftest",      _test_stale_paper_cleanup_selftest),
         ("_test_crypto_only_worker_selftest",      _test_crypto_only_worker_selftest),
         ("_test_crypto_settlement_handler_selftest", _test_crypto_settlement_handler_selftest),
+        ("_test_clob_client_compat_selftest",       _test_clob_client_compat_selftest),
     ]
     for _st_name, _st_fn in _SELFTESTS:
         try:
