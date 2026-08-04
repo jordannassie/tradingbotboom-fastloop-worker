@@ -7051,6 +7051,72 @@ def _test_crypto_execution_path_selftest() -> None:
         _f("T11_old_token_id_gate_removed_from_generic_loop",
            "TOKEN_IDS_MISSING still in generic loop — old gate not removed")
 
+    # T12: PAPER position exists → LIVE executor must still be called.
+    # This is the core regression for the bug where an existing OPEN paper
+    # position triggered CRYPTO_ENTRY_SKIP and prevented LIVE execution.
+    _src = inspect.getsource(_crypto5m_loop_impl)
+    _btc_src = inspect.getsource(btc_5m_late_loop)
+
+    # Confirm: step 10 now uses SEPARATE paper and live dedup checks
+    _has_dual_dedup_eth = (
+        "_has_paper" in _src and
+        "_has_live" in _src and
+        "_paper_needed" in _src and
+        "_live_needed" in _src
+    )
+    if _has_dual_dedup_eth:
+        _p("T12_eth_sol_xrp_dual_dedup_present")
+    else:
+        _f("T12_eth_sol_xrp_dual_dedup_present",
+           "dual dedup variables missing from _crypto5m_loop_impl")
+
+    _has_dual_dedup_btc = (
+        "_btc_has_paper" in _btc_src and
+        "_btc_has_live" in _btc_src and
+        "_btc_paper_needed" in _btc_src and
+        "_btc_live_needed" in _btc_src
+    )
+    if _has_dual_dedup_btc:
+        _p("T12_btc_dual_dedup_present")
+    else:
+        _f("T12_btc_dual_dedup_present",
+           "dual dedup variables missing from btc_5m_late_loop")
+
+    # Confirm: CRYPTO_PAPER_SKIPPED log is present in both loops
+    if "CRYPTO_PAPER_SKIPPED" in _src:
+        _p("T12_eth_paper_skipped_log_present")
+    else:
+        _f("T12_eth_paper_skipped_log_present",
+           "CRYPTO_PAPER_SKIPPED not found in _crypto5m_loop_impl")
+
+    if "CRYPTO_PAPER_SKIPPED" in _btc_src:
+        _p("T12_btc_paper_skipped_log_present")
+    else:
+        _f("T12_btc_paper_skipped_log_present",
+           "CRYPTO_PAPER_SKIPPED not found in btc_5m_late_loop")
+
+    # Confirm: LIVE path is reachable even when _has_paper is True
+    # (the LIVE path is guarded only by _live_enabled, not by _has_paper)
+    _live_path_independent_eth = (
+        "if _live_enabled:" in _src and
+        "not _paper_needed and not _live_needed" in _src
+    )
+    if _live_path_independent_eth:
+        _p("T12_eth_live_path_independent_of_paper")
+    else:
+        _f("T12_eth_live_path_independent_of_paper",
+           "LIVE path still coupled to paper dedup in generic loop")
+
+    _live_path_independent_btc = (
+        "if _live_enabled:" in _btc_src and
+        "not _btc_paper_needed and not _btc_live_needed" in _btc_src
+    )
+    if _live_path_independent_btc:
+        _p("T12_btc_live_path_independent_of_paper")
+    else:
+        _f("T12_btc_live_path_independent_of_paper",
+           "LIVE path still coupled to paper dedup in BTC loop")
+
     logging.warning(
         "EXEC_PATH_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
         _pass_ct, _fail_ct,
@@ -19041,23 +19107,50 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 )
                 continue
 
-            # ── 10. One-trade-per-market check ────────────────────────────────
+            # ── 10. Per-execution-path dedup (PAPER and LIVE checked separately) ──
+            # PAPER check: any position (OPEN or settled) prevents another PAPER entry.
+            # LIVE check:  LIVE_OPEN only — an existing PAPER row must NOT block LIVE.
+            # Skip entire tick only when nothing new can be created:
+            #   PAPER already done AND (LIVE disabled OR LIVE already done).
+            _exec_mode_quick    = state["exec_mode_cache"]   # cached from last health tick
+            _live_enabled_quick = (_exec_mode_quick == "LIVE")
+
             try:
-                already_traded = await asyncio.wait_for(
+                _has_paper = await asyncio.wait_for(
                     asyncio.to_thread(_crypto5m_has_position_sync, bot_id, slug),
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
                 logging.warning(
-                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=dup_check_timeout",
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=paper_dup_check_timeout",
                     bot_id, slug,
                 )
                 continue
-            if already_traded:
+
+            _has_live = False
+            if _live_enabled_quick:
+                try:
+                    _has_live = await asyncio.wait_for(
+                        asyncio.to_thread(_crypto5m_has_live_position_sync, bot_id, slug),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=live_dup_check_timeout",
+                        bot_id, slug,
+                    )
+                    continue
+
+            _paper_needed = not _has_paper
+            _live_needed  = _live_enabled_quick and not _has_live
+
+            if not _paper_needed and not _live_needed:
                 state["last_reason"] = "ALREADY_TRADED_MARKET"
+                state["has_position_this_market"] = True
                 logging.warning(
-                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists",
-                    bot_id, slug,
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists"
+                    " paper_done=%s live_done=%s",
+                    bot_id, slug, _has_paper, _has_live,
                 )
                 continue
 
@@ -19173,76 +19266,85 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
             )
 
             try:
-                # ── PAPER path (always) ───────────────────────────────────────
+                # ── PAPER path (always unless already done this market) ────────
                 shares = round(trade_size / entry_price, 4)
                 _paper_ok = False
                 _paper_row_id = None
-                try:
-                    _paper_ok, _paper_row_id, _ = await insert_paper_position_row(
-                        bot_id      = bot_id,
-                        strategy_id = strategy_id,
-                        market_slug = slug,
-                        side        = side,
-                        entry_price = entry_price,
-                        size_usd    = trade_size,
-                        shares      = shares,
-                        start_ts    = start_ts,
-                    )
-                except Exception as _paper_exc:
+                if _has_paper:
+                    # PAPER was already created for this market on a previous tick
+                    # (e.g. mode switched from PAPER to LIVE mid-market).
+                    # Log the skip and continue to the LIVE path below.
                     logging.warning(
-                        "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
-                        " reason=%s",
-                        bot_id, slug, _side_label, type(_paper_exc).__name__,
+                        "CRYPTO_PAPER_SKIPPED bot_id=%s market=%s"
+                        " reason=already_has_paper_position",
+                        bot_id, slug,
                     )
-
-                if _paper_ok:
-                    state["last_decision"] = decision
-                    state["last_reason"]   = "PAPER_POSITION_OPENED"
-                    state["has_position_this_market"] = True
-                    logging.warning(
-                        "CRYPTO_PAPER_OPENED bot_id=%s market=%s"
-                        " position_id=%s side=%s size=%.4f entry_price=%.4f",
-                        bot_id, slug, _paper_row_id or "?",
-                        _side_label, trade_size, entry_price,
-                    )
-                    logging.warning(
-                        "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
-                        "position_id=%s side=%s size=%.4f entry_price=%.4f",
-                        bot_id, slug, _paper_row_id or "?",
-                        _side_label, trade_size, entry_price,
-                    )
-                    logging.warning(
-                        "%s_ENTRY position_id=%s side=%s size_usd=%s "
-                        "entry_price=%.4f seconds_left=%s slug=%s",
-                        log_prefix, _paper_row_id or "?",
-                        _side_label, trade_size, entry_price, remaining, slug,
-                    )
-                    # Publish snapshot immediately after opening
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                _crypto5m_upsert_status_sync,
-                                cfg, state, slug, start_ts, end_ts, remaining,
-                                ref_price, spot_price, up_ask, down_ask, momentum,
-                                "POSITION_OPEN", is_enabled, mode,
-                                up_token_id, down_token_id, trade_size,
-                                True,
-                            ),
-                            timeout=10.0,
-                        )
-                        state["snapshot_written_at"] = _monotonic()
-                        state["last_status_ts"]      = _monotonic()
-                    except asyncio.TimeoutError:
-                        pass
                 else:
-                    logging.warning(
-                        "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
-                        " reason=insert_returned_false",
-                        bot_id, slug, _side_label,
-                    )
+                    try:
+                        _paper_ok, _paper_row_id, _ = await insert_paper_position_row(
+                            bot_id      = bot_id,
+                            strategy_id = strategy_id,
+                            market_slug = slug,
+                            side        = side,
+                            entry_price = entry_price,
+                            size_usd    = trade_size,
+                            shares      = shares,
+                            start_ts    = start_ts,
+                        )
+                    except Exception as _paper_exc:
+                        logging.warning(
+                            "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
+                            " reason=%s",
+                            bot_id, slug, _side_label, type(_paper_exc).__name__,
+                        )
+
+                    if _paper_ok:
+                        state["last_decision"] = decision
+                        state["last_reason"]   = "PAPER_POSITION_OPENED"
+                        state["has_position_this_market"] = True
+                        logging.warning(
+                            "CRYPTO_PAPER_OPENED bot_id=%s market=%s"
+                            " position_id=%s side=%s size=%.4f entry_price=%.4f",
+                            bot_id, slug, _paper_row_id or "?",
+                            _side_label, trade_size, entry_price,
+                        )
+                        logging.warning(
+                            "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
+                            "position_id=%s side=%s size=%.4f entry_price=%.4f",
+                            bot_id, slug, _paper_row_id or "?",
+                            _side_label, trade_size, entry_price,
+                        )
+                        logging.warning(
+                            "%s_ENTRY position_id=%s side=%s size_usd=%s "
+                            "entry_price=%.4f seconds_left=%s slug=%s",
+                            log_prefix, _paper_row_id or "?",
+                            _side_label, trade_size, entry_price, remaining, slug,
+                        )
+                        # Publish snapshot immediately after opening
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    _crypto5m_upsert_status_sync,
+                                    cfg, state, slug, start_ts, end_ts, remaining,
+                                    ref_price, spot_price, up_ask, down_ask, momentum,
+                                    "POSITION_OPEN", is_enabled, mode,
+                                    up_token_id, down_token_id, trade_size,
+                                    True,
+                                ),
+                                timeout=10.0,
+                            )
+                            state["snapshot_written_at"] = _monotonic()
+                            state["last_status_ts"]      = _monotonic()
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        logging.warning(
+                            "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
+                            " reason=insert_returned_false",
+                            bot_id, slug, _side_label,
+                        )
 
                 # ── LIVE path (optional, independent of PAPER result) ─────────
-                # A PAPER failure must NOT prevent a LIVE attempt and vice versa.
                 # Gate 7 inside _crypto5m_live_entry checks LIVE_OPEN only, so
                 # the just-created PAPER position does not block LIVE entry.
                 if _live_enabled:
@@ -19754,9 +19856,12 @@ async def btc_5m_late_loop() -> None:
                 )
                 continue
 
-            # ── 13. One-trade-per-market (OPEN or settled) ───────────────────
+            # ── 13. Per-execution-path dedup (PAPER and LIVE checked separately) ──
+            # PAPER check: any position (OPEN or settled) prevents another PAPER entry.
+            # LIVE check:  LIVE_OPEN only — a PAPER row must NOT block the LIVE path.
+            # Skip entire tick only when nothing new can be created.
             try:
-                already_traded = await asyncio.wait_for(
+                _btc_has_paper = await asyncio.wait_for(
                     asyncio.to_thread(
                         _btc5m_late_has_any_position_for_market_sync, slug
                     ),
@@ -19769,11 +19874,33 @@ async def btc_5m_late_loop() -> None:
                     slug, remaining,
                 )
                 logging.warning(
-                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=dup_check_timeout",
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=paper_dup_check_timeout",
                     BTC5M_LATE_BOT_ID, slug,
                 )
                 continue
-            if already_traded:
+
+            _btc_exec_mode_quick    = _btc5m_late_exec_mode_cache
+            _btc_live_enabled_quick = (_btc_exec_mode_quick == "LIVE")
+            _btc_has_live = False
+            if _btc_live_enabled_quick:
+                try:
+                    _btc_has_live = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _btc5m_late_has_live_position_for_market_sync, slug
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=live_dup_check_timeout",
+                        BTC5M_LATE_BOT_ID, slug,
+                    )
+                    continue
+
+            _btc_paper_needed = not _btc_has_paper
+            _btc_live_needed  = _btc_live_enabled_quick and not _btc_has_live
+
+            if not _btc_paper_needed and not _btc_live_needed:
                 _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
                 logging.warning(
                     "BTC5M_SIMPLE_SKIP slug=%s reason=ALREADY_TRADED_MARKET "
@@ -19781,8 +19908,9 @@ async def btc_5m_late_loop() -> None:
                     slug, remaining,
                 )
                 logging.warning(
-                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists",
-                    BTC5M_LATE_BOT_ID, slug,
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists"
+                    " paper_done=%s live_done=%s",
+                    BTC5M_LATE_BOT_ID, slug, _btc_has_paper, _btc_has_live,
                 )
                 continue
 
@@ -19908,179 +20036,188 @@ async def btc_5m_late_loop() -> None:
                 entry_price, remaining, _exec_mode,
             )
 
-            # ── PAPER path (always) ───────────────────────────────────────
+            # ── PAPER path (always unless already done this market) ────────
             # Trade Intent: create before position open
             _btc5m_ti_id = _make_trade_intent_id()
-            _btc5m_ti_row = _build_trade_intent_row(
-                intent_id          = _btc5m_ti_id,
-                bot_id             = BTC5M_LATE_BOT_ID,
-                bot_name           = "btc_5m_late",
-                strategy_id        = BTC5M_LATE_STRATEGY_ID,
-                source_type        = "btc5m",
-                market_slug        = slug,
-                token_id           = (up_token_id if side == "yes" else down_token_id) or "",
-                side               = "UP" if side == "yes" else "DOWN",
-                outcome            = "UP" if side == "yes" else "DOWN",
-                signal_price       = float(entry_price),
-                requested_size_usd = float(trade_size),
-                calculated_size_usd= float(trade_size),
-                final_size_usd     = float(trade_size),
-                mode_requested     = "PAPER",
-                paper_enabled      = True,
-                mirror_enabled     = bool(TRADE_INTENT_MIRROR_ENABLED),
-                live_enabled       = _live_enabled,
-                arm_live           = bool(is_enabled),
-                emergency_stop     = False,
-                decision           = decision,
-                decision_reason    = "SIMPLE_DIRECTION",
-                metadata           = {
-                    "price_to_beat":  ref_price,
-                    "reference_price": btc_price,
-                    "seconds_left":   remaining,
-                },
-            )
-            asyncio.ensure_future(asyncio.to_thread(
-                _insert_trade_intent_sync, _btc5m_ti_row
-            ))
-            logging.warning(
-                "TRADE_INTENT_CREATED intent_id=%s "
-                "bot_id=%s market=%s side=%s size=%s",
-                _btc5m_ti_id, BTC5M_LATE_BOT_ID,
-                slug, "UP" if side == "yes" else "DOWN", trade_size,
-            )
-
-            shares = round(trade_size / entry_price, 4)
-            _paper_ok = False
-            _paper_row_id = None
-            try:
-                _paper_ok, _paper_row_id, _ = await insert_paper_position_row(
-                    bot_id      = BTC5M_LATE_BOT_ID,
-                    strategy_id = BTC5M_LATE_STRATEGY_ID,
-                    market_slug = slug,
-                    side        = side,
-                    entry_price = entry_price,
-                    size_usd    = trade_size,
-                    shares      = shares,
-                    start_ts    = start_ts,
-                )
-            except Exception as _paper_exc:
+            if _btc_has_paper:
+                # PAPER already exists for this market (e.g. mode switched mid-market).
+                # Skip paper insert; proceed to LIVE path below.
                 logging.warning(
-                    "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
-                    " reason=%s",
-                    BTC5M_LATE_BOT_ID, slug, _btc_side_label,
-                    type(_paper_exc).__name__,
+                    "CRYPTO_PAPER_SKIPPED bot_id=%s market=%s"
+                    " reason=already_has_paper_position",
+                    BTC5M_LATE_BOT_ID, slug,
                 )
-
-            if _paper_ok:
-                _btc5m_late_last_decision = decision
-                _btc5m_late_last_reason   = "PAPER_POSITION_OPENED"
-                logging.warning(
-                    "CRYPTO_PAPER_OPENED bot_id=%s market=%s"
-                    " position_id=%s side=%s size_usd=%s entry_price=%.4f"
-                    " seconds_left=%s slug=%s",
-                    BTC5M_LATE_BOT_ID, slug, _paper_row_id or "?",
-                    side, trade_size, entry_price, remaining, slug,
-                )
-                logging.warning(
-                    "BTC5M_SIMPLE_ENTRY slug=%s side=%s size_usd=%s "
-                    "entry_price=%.4f seconds_left=%s position_id=%s",
-                    slug,
-                    ("UP" if side == "yes" else "DOWN"),
-                    trade_size,
-                    entry_price,
-                    remaining,
-                    _paper_row_id or "?",
-                )
-                logging.warning(
-                    "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
-                    "position_id=%s side=%s size=%.4f entry_price=%.4f",
-                    BTC5M_LATE_BOT_ID, slug, _paper_row_id or "?",
-                    _btc_side_label, trade_size, entry_price,
-                )
-                # Trade Intent: update with PAPER result
-                asyncio.ensure_future(asyncio.to_thread(
-                    _update_trade_intent_sync,
-                    _btc5m_ti_id,
-                    {
-                        "paper_status":       "OPENED",
-                        "paper_position_id":  str(_paper_row_id or ""),
-                        "paper_entry_price":  float(entry_price),
-                        "paper_size_usd":     float(trade_size),
+            if not _btc_has_paper:
+                _btc5m_ti_row = _build_trade_intent_row(
+                    intent_id          = _btc5m_ti_id,
+                    bot_id             = BTC5M_LATE_BOT_ID,
+                    bot_name           = "btc_5m_late",
+                    strategy_id        = BTC5M_LATE_STRATEGY_ID,
+                    source_type        = "btc5m",
+                    market_slug        = slug,
+                    token_id           = (up_token_id if side == "yes" else down_token_id) or "",
+                    side               = "UP" if side == "yes" else "DOWN",
+                    outcome            = "UP" if side == "yes" else "DOWN",
+                    signal_price       = float(entry_price),
+                    requested_size_usd = float(trade_size),
+                    calculated_size_usd= float(trade_size),
+                    final_size_usd     = float(trade_size),
+                    mode_requested     = "PAPER",
+                    paper_enabled      = True,
+                    mirror_enabled     = bool(TRADE_INTENT_MIRROR_ENABLED),
+                    live_enabled       = _live_enabled,
+                    arm_live           = bool(is_enabled),
+                    emergency_stop     = False,
+                    decision           = decision,
+                    decision_reason    = "SIMPLE_DIRECTION",
+                    metadata           = {
+                        "price_to_beat":  ref_price,
+                        "reference_price": btc_price,
+                        "seconds_left":   remaining,
                     },
+                )
+                asyncio.ensure_future(asyncio.to_thread(
+                    _insert_trade_intent_sync, _btc5m_ti_row
                 ))
                 logging.warning(
-                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
-                    "status=OPENED position_id=%s reason=ok",
-                    _btc5m_ti_id, _paper_row_id or "?",
+                    "TRADE_INTENT_CREATED intent_id=%s "
+                    "bot_id=%s market=%s side=%s size=%s",
+                    _btc5m_ti_id, BTC5M_LATE_BOT_ID,
+                    slug, "UP" if side == "yes" else "DOWN", trade_size,
                 )
-                # Mirror evaluation if enabled
-                if TRADE_INTENT_MIRROR_ENABLED:
-                    _btc5m_mirror = _evaluate_mirror_sync(
-                        intent_id       = _btc5m_ti_id,
-                        copy_bot        = None,
-                        global_settings = {},
-                        submitted_size  = float(trade_size),
-                        submitted_price = float(entry_price),
-                        source_type     = "btc5m",
+
+                shares = round(trade_size / entry_price, 4)
+                _paper_ok = False
+                _paper_row_id = None
+                try:
+                    _paper_ok, _paper_row_id, _ = await insert_paper_position_row(
+                        bot_id      = BTC5M_LATE_BOT_ID,
+                        strategy_id = BTC5M_LATE_STRATEGY_ID,
+                        market_slug = slug,
+                        side        = side,
+                        entry_price = entry_price,
+                        size_usd    = trade_size,
+                        shares      = shares,
+                        start_ts    = start_ts,
                     )
+                except Exception as _paper_exc:
+                    logging.warning(
+                        "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
+                        " reason=%s",
+                        BTC5M_LATE_BOT_ID, slug, _btc_side_label,
+                        type(_paper_exc).__name__,
+                    )
+
+                if _paper_ok:
+                    _btc5m_late_last_decision = decision
+                    _btc5m_late_last_reason   = "PAPER_POSITION_OPENED"
+                    logging.warning(
+                        "CRYPTO_PAPER_OPENED bot_id=%s market=%s"
+                        " position_id=%s side=%s size_usd=%s entry_price=%.4f"
+                        " seconds_left=%s slug=%s",
+                        BTC5M_LATE_BOT_ID, slug, _paper_row_id or "?",
+                        side, trade_size, entry_price, remaining, slug,
+                    )
+                    logging.warning(
+                        "BTC5M_SIMPLE_ENTRY slug=%s side=%s size_usd=%s "
+                        "entry_price=%.4f seconds_left=%s position_id=%s",
+                        slug,
+                        ("UP" if side == "yes" else "DOWN"),
+                        trade_size,
+                        entry_price,
+                        remaining,
+                        _paper_row_id or "?",
+                    )
+                    logging.warning(
+                        "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
+                        "position_id=%s side=%s size=%.4f entry_price=%.4f",
+                        BTC5M_LATE_BOT_ID, slug, _paper_row_id or "?",
+                        _btc_side_label, trade_size, entry_price,
+                    )
+                    # Trade Intent: update with PAPER result
                     asyncio.ensure_future(asyncio.to_thread(
                         _update_trade_intent_sync,
-                        _btc5m_ti_id, _btc5m_mirror,
+                        _btc5m_ti_id,
+                        {
+                            "paper_status":       "OPENED",
+                            "paper_position_id":  str(_paper_row_id or ""),
+                            "paper_entry_price":  float(entry_price),
+                            "paper_size_usd":     float(trade_size),
+                        },
                     ))
                     logging.warning(
-                        "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
-                        "status=%s reason=%s "
-                        "expected_size=%s expected_price=%s "
-                        "minimum_order_size=%s",
+                        "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                        "status=OPENED position_id=%s reason=ok",
+                        _btc5m_ti_id, _paper_row_id or "?",
+                    )
+                    # Mirror evaluation if enabled
+                    if TRADE_INTENT_MIRROR_ENABLED:
+                        _btc5m_mirror = _evaluate_mirror_sync(
+                            intent_id       = _btc5m_ti_id,
+                            copy_bot        = None,
+                            global_settings = {},
+                            submitted_size  = float(trade_size),
+                            submitted_price = float(entry_price),
+                            source_type     = "btc5m",
+                        )
+                        asyncio.ensure_future(asyncio.to_thread(
+                            _update_trade_intent_sync,
+                            _btc5m_ti_id, _btc5m_mirror,
+                        ))
+                        logging.warning(
+                            "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
+                            "status=%s reason=%s "
+                            "expected_size=%s expected_price=%s "
+                            "minimum_order_size=%s",
+                            _btc5m_ti_id,
+                            _btc5m_mirror["mirror_status"],
+                            _btc5m_mirror["mirror_reason"],
+                            _btc5m_mirror["mirror_expected_size_usd"],
+                            _btc5m_mirror["mirror_expected_price"],
+                            _btc5m_mirror["mirror_minimum_order_size"],
+                        )
+                    # Immediately publish updated snapshot after opening
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _btc5m_late_upsert_status_sync,
+                                slug, start_ts, end_ts, remaining,
+                                ref_price, btc_price,
+                                up_ask, down_ask, momentum,
+                                "POSITION_OPEN",
+                                _btc5m_late_last_decision,
+                                _btc5m_late_last_reason,
+                                is_enabled, mode,
+                                up_token_id, down_token_id,
+                                _btc5m_late_rotated_at,
+                                trade_size,
+                            ),
+                            timeout=10.0,
+                        )
+                        _btc5m_late_snapshot_written_at = _monotonic()
+                        _btc5m_late_last_status_ts = _monotonic()
+                    except asyncio.TimeoutError:
+                        pass  # non-critical; next tick will write snapshot
+                else:
+                    # Trade Intent: record error
+                    asyncio.ensure_future(asyncio.to_thread(
+                        _update_trade_intent_sync,
                         _btc5m_ti_id,
-                        _btc5m_mirror["mirror_status"],
-                        _btc5m_mirror["mirror_reason"],
-                        _btc5m_mirror["mirror_expected_size_usd"],
-                        _btc5m_mirror["mirror_expected_price"],
-                        _btc5m_mirror["mirror_minimum_order_size"],
+                        {
+                            "paper_status": "ERROR",
+                            "paper_error":  "insert_paper_position_row_returned_false",
+                        },
+                    ))
+                    logging.warning(
+                        "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                        "status=ERROR position_id=none reason=insert_failed",
+                        _btc5m_ti_id,
                     )
-                # Immediately publish updated snapshot after opening
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _btc5m_late_upsert_status_sync,
-                            slug, start_ts, end_ts, remaining,
-                            ref_price, btc_price,
-                            up_ask, down_ask, momentum,
-                            "POSITION_OPEN",
-                            _btc5m_late_last_decision,
-                            _btc5m_late_last_reason,
-                            is_enabled, mode,
-                            up_token_id, down_token_id,
-                            _btc5m_late_rotated_at,
-                            trade_size,
-                        ),
-                        timeout=10.0,
+                    logging.warning(
+                        "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
+                        " reason=insert_paper_position_row_returned_false",
+                        BTC5M_LATE_BOT_ID, slug, _btc_side_label,
                     )
-                    _btc5m_late_snapshot_written_at = _monotonic()
-                    _btc5m_late_last_status_ts = _monotonic()
-                except asyncio.TimeoutError:
-                    pass  # non-critical; next tick will write snapshot
-            else:
-                # Trade Intent: record error
-                asyncio.ensure_future(asyncio.to_thread(
-                    _update_trade_intent_sync,
-                    _btc5m_ti_id,
-                    {
-                        "paper_status": "ERROR",
-                        "paper_error":  "insert_paper_position_row_returned_false",
-                    },
-                ))
-                logging.warning(
-                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
-                    "status=ERROR position_id=none reason=insert_failed",
-                    _btc5m_ti_id,
-                )
-                logging.warning(
-                    "CRYPTO_PAPER_FAILED bot_id=%s market=%s side=%s"
-                    " reason=insert_paper_position_row_returned_false",
-                    BTC5M_LATE_BOT_ID, slug, _btc_side_label,
-                )
 
             # ── LIVE path (optional, independent of PAPER result) ─────────────
             # Gate 7 inside _crypto5m_live_entry checks LIVE_OPEN only, so
@@ -20249,7 +20386,7 @@ async def main():
     # This log appears ONCE at startup.  Search for it in Railway to confirm
     # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v10_paper_always_executes"
+        "CRYPTO_SUPERVISOR_BOOT version=crypto_only_v11_split_paper_live_dedup"
         " stale_threshold=%.0fs"
         " settlement=threaded+official_gamma_outcome"
         " btc=supervised eth=supervised sol=supervised xrp=supervised"
