@@ -468,6 +468,31 @@ BTC5M_LATE_ASK_MAX        = float(os.getenv("BTC5M_LATE_ASK_MAX",       "0.80"))
 BTC5M_LATE_EVAL_START_S   = int(os.getenv("BTC5M_LATE_EVAL_START_S",    "60"))   # health/status window start (kept for back-compat)
 BTC5M_LATE_ENTRY_CUTOFF_S = int(os.getenv("BTC5M_LATE_ENTRY_CUTOFF_S",  "20"))   # entry hard stop (seconds remaining)
 
+# ── ETH / SOL / XRP 5-Minute Paper Bots ──────────────────────────────────────
+# Mirror of BTC5M_LATE config for three additional crypto up/down 5-minute bots.
+# Each bot has an isolated bot_id, starting balance, and paper account.
+# Default trade size: $0.10.  Default enabled: true.
+# All three use the same entry rules as btc_5m_late (SIMPLE mode: price vs ref).
+# Settlement via the shared paper_settlement_loop.
+
+ETH5M_PAPER_ENABLED     = os.getenv("ETH5M_PAPER_ENABLED",  "true").strip().lower() in ("1","true","yes")
+ETH5M_PAPER_BOT_ID      = "eth_5m_paper"
+ETH5M_PAPER_STRATEGY_ID = "ETH_5M_PAPER"
+ETH5M_PAPER_SLUG_PREFIX = "eth-updown-5m"
+ETH5M_PAPER_TRADE_SIZE  = float(os.getenv("ETH5M_PAPER_TRADE_SIZE_USD", "0.10"))
+
+SOL5M_PAPER_ENABLED     = os.getenv("SOL5M_PAPER_ENABLED",  "true").strip().lower() in ("1","true","yes")
+SOL5M_PAPER_BOT_ID      = "sol_5m_paper"
+SOL5M_PAPER_STRATEGY_ID = "SOL_5M_PAPER"
+SOL5M_PAPER_SLUG_PREFIX = "sol-updown-5m"
+SOL5M_PAPER_TRADE_SIZE  = float(os.getenv("SOL5M_PAPER_TRADE_SIZE_USD", "0.10"))
+
+XRP5M_PAPER_ENABLED     = os.getenv("XRP5M_PAPER_ENABLED",  "true").strip().lower() in ("1","true","yes")
+XRP5M_PAPER_BOT_ID      = "xrp_5m_paper"
+XRP5M_PAPER_STRATEGY_ID = "XRP_5M_PAPER"
+XRP5M_PAPER_SLUG_PREFIX = "xrp-updown-5m"
+XRP5M_PAPER_TRADE_SIZE  = float(os.getenv("XRP5M_PAPER_TRADE_SIZE_USD", "0.10"))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — FAST-TURNOVER COPY ENGINE CONFIGURATION

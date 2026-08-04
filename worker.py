@@ -5726,6 +5726,9 @@ async def paper_settlement_loop():
                         BOT_ID,
                         EMA_5M_BOT_ID,         # btc_5m_ema settled via BTC price move
                         BTC5M_LATE_BOT_ID,     # btc_5m_late settled via BTC price move
+                        ETH5M_PAPER_BOT_ID,    # eth_5m_paper settled via ETH price move
+                        SOL5M_PAPER_BOT_ID,    # sol_5m_paper settled via SOL price move
+                        XRP5M_PAPER_BOT_ID,    # xrp_5m_paper settled via XRP price move
                     ],
                 )
                 .eq("status", "OPEN")
@@ -15357,6 +15360,646 @@ def _btc5m_late_upsert_status_sync(
         )
 
 
+        logging.exception(
+            "BTC5M_STATUS_WRITE_FAIL bot_id=%s slug=%s", BTC5M_LATE_BOT_ID, slug
+        )
+
+
+# =============================================================================
+# GENERIC CRYPTO 5-MINUTE PAPER BOTS — ETH, SOL, XRP
+# =============================================================================
+# These three bots use the same SIMPLE paper logic as btc_5m_late:
+#   - Every 5-minute period is a Polymarket UP/DOWN market
+#   - Entry window: 35–20 seconds remaining
+#   - Direction: current asset price vs reference price (previous candle close)
+#   - One trade per market, PAPER only
+#   - Settlement via the shared paper_settlement_loop
+#
+# All three are driven by a single generic loop implementation: _crypto5m_loop_impl().
+# The BTC loop (btc_5m_late_loop) is NOT modified — it remains the proven template.
+# =============================================================================
+
+# ── Asset configs ─────────────────────────────────────────────────────────────
+
+_CRYPTO5M_ASSETS: dict[str, dict] = {
+    "eth": {
+        "bot_id":          ETH5M_PAPER_BOT_ID,
+        "strategy_id":     ETH5M_PAPER_STRATEGY_ID,
+        "slug_prefix":     ETH5M_PAPER_SLUG_PREFIX,
+        "binance_url":     "https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=5m&limit=5",
+        "coinbase_url":    "https://api.coinbase.com/v2/prices/ETH-USD/spot",
+        "enabled":         ETH5M_PAPER_ENABLED,
+        "default_size":    ETH5M_PAPER_TRADE_SIZE,
+        "log_prefix":      "ETH5M",
+        "asset_label":     "ETH",
+    },
+    "sol": {
+        "bot_id":          SOL5M_PAPER_BOT_ID,
+        "strategy_id":     SOL5M_PAPER_STRATEGY_ID,
+        "slug_prefix":     SOL5M_PAPER_SLUG_PREFIX,
+        "binance_url":     "https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=5m&limit=5",
+        "coinbase_url":    "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+        "enabled":         SOL5M_PAPER_ENABLED,
+        "default_size":    SOL5M_PAPER_TRADE_SIZE,
+        "log_prefix":      "SOL5M",
+        "asset_label":     "SOL",
+    },
+    "xrp": {
+        "bot_id":          XRP5M_PAPER_BOT_ID,
+        "strategy_id":     XRP5M_PAPER_STRATEGY_ID,
+        "slug_prefix":     XRP5M_PAPER_SLUG_PREFIX,
+        "binance_url":     "https://api.binance.com/api/v3/klines?symbol=XRPUSDT&interval=5m&limit=5",
+        "coinbase_url":    "https://api.coinbase.com/v2/prices/XRP-USD/spot",
+        "enabled":         XRP5M_PAPER_ENABLED,
+        "default_size":    XRP5M_PAPER_TRADE_SIZE,
+        "log_prefix":      "XRP5M",
+        "asset_label":     "XRP",
+    },
+}
+
+# ── Per-asset in-memory state dicts ──────────────────────────────────────────
+
+def _fresh_crypto5m_state() -> dict:
+    """Return a fresh state dict for one crypto 5m loop."""
+    return {
+        "last_slug":           None,
+        "last_health_ts":      0.0,
+        "last_status_ts":      0.0,
+        "last_decision":       "NONE",
+        "last_reason":         "INIT",
+        "rotated_at":          None,
+        "snapshot_written_at": 0.0,
+        "ref_cache":           {},  # {start_ts: ref_price}
+    }
+
+_eth5m_state  = _fresh_crypto5m_state()
+_sol5m_state  = _fresh_crypto5m_state()
+_xrp5m_state  = _fresh_crypto5m_state()
+
+
+# ── Generic helpers ───────────────────────────────────────────────────────────
+
+def _crypto5m_fetch_price_sync(
+    binance_url: str,
+    coinbase_url: str,
+    start_ts: int,
+    ref_cache: dict,
+) -> tuple[float | None, float | None, str]:
+    """
+    Fetch reference price (Binance 5m previous candle close) and current
+    spot price (Coinbase) for any supported crypto asset.
+
+    Returns (ref_price, spot_price, momentum).
+    On failure returns (None, None, "FLAT") for the failing component.
+    """
+    # ── Spot price (Coinbase) ─────────────────────────────────────────────────
+    spot_price: float | None = None
+    try:
+        req = request.Request(coinbase_url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        amount = data.get("data", {}).get("amount")
+        spot_price = float(amount) if amount is not None else None
+    except Exception:
+        logging.warning("CRYPTO5M_SPOT_FAIL url=%s", coinbase_url)
+
+    # ── Binance 5m klines for reference + momentum ────────────────────────────
+    try:
+        req2 = request.Request(binance_url, headers={"User-Agent": "FastLoopWorker/1.0"})
+        with request.urlopen(req2, timeout=8) as resp2:
+            rows = json.loads(resp2.read())
+
+        completed = rows[:-1]  # exclude still-forming candle
+        if not completed:
+            return spot_price, None, "FLAT"
+
+        last = completed[-1]
+        last_open_s = int(last[0]) // 1000
+        expected_prev_open_s = start_ts - 300
+
+        cached = ref_cache.get(start_ts)
+        if cached is not None:
+            ref_price: float | None = cached
+        elif last_open_s == expected_prev_open_s:
+            ref_price = float(last[4])
+            ref_cache[start_ts] = ref_price
+            for old in [k for k in list(ref_cache) if k < start_ts - 600]:
+                ref_cache.pop(old, None)
+        else:
+            ref_price = float(last[4])
+            ref_cache[start_ts] = ref_price
+
+        momentum = "FLAT"
+        if len(completed) >= 2:
+            c_last = float(completed[-1][4])
+            c_prev = float(completed[-2][4])
+            momentum = "UP" if c_last > c_prev else ("DOWN" if c_last < c_prev else "FLAT")
+
+        return ref_price, spot_price, momentum
+
+    except Exception:
+        logging.exception("CRYPTO5M_KLINES_FAIL url=%s", binance_url)
+        return spot_price, None, "FLAT"
+
+
+def _crypto5m_has_position_sync(bot_id: str, slug: str) -> bool:
+    """
+    Return True if any paper_position exists for this bot+slug (OPEN or settled).
+    Fail-safe: returns True on DB error.
+    """
+    try:
+        resp = (
+            supabase.table("paper_positions")
+            .select("id")
+            .eq("bot_id", bot_id)
+            .eq("market_slug", slug)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        logging.warning("CRYPTO5M_DUP_CHECK_FAIL bot_id=%s slug=%s — assuming traded", bot_id, slug)
+        return True
+
+
+def _crypto5m_get_today_stats_sync(bot_id: str) -> dict:
+    """Return today's closed trade stats for the given bot_id."""
+    try:
+        import datetime as _dt
+        today_midnight_dt = _dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_midnight_ts = int(today_midnight_dt.timestamp())
+        resp = (
+            supabase.table("paper_positions")
+            .select("pnl_usd, status")
+            .eq("bot_id", bot_id)
+            .gte("start_ts", today_midnight_ts)
+            .execute()
+        )
+        rows   = resp.data or []
+        closed = [r for r in rows if (r.get("status") or "").upper() == "CLOSED"]
+        wins   = sum(1 for r in closed if (float_or_none(r.get("pnl_usd")) or 0.0) >= 0)
+        losses = len(closed) - wins
+        pnl    = round(sum(float_or_none(r.get("pnl_usd")) or 0.0 for r in closed), 4)
+        return {"today_trade_count": len(rows), "today_wins": wins, "today_losses": losses, "today_pnl": pnl}
+    except Exception:
+        return {"today_trade_count": 0, "today_wins": 0, "today_losses": 0, "today_pnl": 0.0}
+
+
+def _crypto5m_upsert_status_sync(
+    cfg:          dict,
+    state:        dict,
+    slug:         str,
+    start_ts:     int,
+    end_ts:       int,
+    remaining:    int,
+    ref_price:    float | None,
+    spot_price:   float | None,
+    up_ask:       float | None,
+    down_ask:     float | None,
+    momentum:     str,
+    status_str:   str,
+    is_enabled:   bool,
+    mode:         str,
+    up_token_id:  str | None,
+    down_token_id: str | None,
+    trade_size_usd: float | None,
+) -> None:
+    """Write live status snapshot to bot_settings.strategy_settings for a crypto 5m bot."""
+    bot_id      = cfg["bot_id"]
+    strategy_id = cfg["strategy_id"]
+    log_prefix  = cfg["log_prefix"]
+
+    distance = round(spot_price - ref_price, 4) if (spot_price and ref_price) else None
+    if distance is not None:
+        leading_side = "UP" if distance > 0 else ("DOWN" if distance < 0 else "FLAT")
+    else:
+        leading_side = "FLAT"
+
+    stats = _crypto5m_get_today_stats_sync(bot_id)
+
+    try:
+        pos_resp = (
+            supabase.table("paper_positions")
+            .select("id")
+            .eq("bot_id", bot_id)
+            .eq("market_slug", slug)
+            .eq("status", "OPEN")
+            .limit(1)
+            .execute()
+        )
+        current_position = bool(pos_resp.data)
+    except Exception:
+        current_position = False
+
+    snapshot: dict = {
+        "strategy_id":          strategy_id,
+        "status":               status_str,
+        "market_slug":          slug,
+        "market_url":           f"https://polymarket.com/event/{slug}",
+        "market_start":         start_ts,
+        "market_end":           end_ts,
+        "seconds_remaining":    remaining,
+        "price_to_beat":        ref_price,
+        "reference_price":      spot_price,
+        "distance":             distance,
+        "leading_side":         leading_side,
+        "up_token_id":          up_token_id,
+        "down_token_id":        down_token_id,
+        "up_ask":               up_ask,
+        "down_ask":             down_ask,
+        "momentum":             momentum,
+        "signal":               state["last_decision"],
+        "last_decision":        state["last_decision"],
+        "last_decision_reason": state["last_reason"],
+        "current_position":     current_position,
+        "today_trade_count":    stats["today_trade_count"],
+        "today_wins":           stats["today_wins"],
+        "today_losses":         stats["today_losses"],
+        "today_pnl":            stats["today_pnl"],
+        "rotated_at":           state["rotated_at"],
+        "strategy_mode":        "SIMPLE_PAPER",
+        "trade_size_usd":       trade_size_usd,
+        "updated_at":           utc_now_iso(),
+    }
+
+    try:
+        existing_resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings, paper_pnl_usd, paper_balance_usd")
+            .eq("bot_id", bot_id)
+            .limit(1)
+            .execute()
+        )
+        existing_row = (existing_resp.data or [None])[0]
+
+        if existing_row is None:
+            supabase.table("bot_settings").insert({
+                "bot_id":            bot_id,
+                "is_enabled":        False,
+                "mode":              "PAPER",
+                "arm_live":          False,
+                "trade_size_usd":    cfg["default_size"],
+                "paper_balance_usd": 100.0,
+                "strategy_settings": snapshot,
+            }).execute()
+            logging.warning(
+                "%s_STATUS_WRITE action=row_created bot_id=%s slug=%s",
+                log_prefix, bot_id, slug,
+            )
+            return
+
+        raw_ss = existing_row.get("strategy_settings") or {}
+        if isinstance(raw_ss, str):
+            try:
+                raw_ss = json.loads(raw_ss)
+            except json.JSONDecodeError:
+                raw_ss = {}
+        merged = {**raw_ss, **snapshot}
+
+        realized_pnl = float_or_none(existing_row.get("paper_pnl_usd"))
+        balance_snap = float_or_none(existing_row.get("paper_balance_usd"))
+        if realized_pnl is not None:
+            merged["realized_pnl_usd"] = realized_pnl
+        if balance_snap is not None:
+            merged["paper_balance_usd_snapshot"] = balance_snap
+
+        supabase.table("bot_settings").update(
+            {"strategy_settings": merged, "updated_at": utc_now_iso()}
+        ).eq("bot_id", bot_id).execute()
+
+        logging.info(
+            "%s_STATUS_WRITE bot_id=%s slug=%s status=%s ref=%s spot=%s leading=%s",
+            log_prefix, bot_id, slug, status_str, ref_price, spot_price, leading_side,
+        )
+
+    except Exception:
+        logging.exception("%s_STATUS_WRITE_FAIL bot_id=%s slug=%s", log_prefix, bot_id, slug)
+
+
+# ── Generic loop implementation ───────────────────────────────────────────────
+
+async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
+    """
+    Generic SIMPLE paper loop for ETH, SOL, XRP 5-minute Polymarket markets.
+
+    Mirrors btc_5m_late_loop logic exactly:
+      - 300-second period, slug = {prefix}-{start_ts}
+      - Entry window: 35–20 seconds remaining
+      - Direction: spot price vs reference price (prev candle close)
+      - One trade per market (paper_positions dedup check)
+      - Status snapshot every 10s to bot_settings.strategy_settings
+      - Health log every 10s
+      - 2s cadence in final 45s, 5s otherwise
+
+    The BTC loop is untouched — this is an additive implementation only.
+    """
+    bot_id      = cfg["bot_id"]
+    slug_prefix = cfg["slug_prefix"]
+    strategy_id = cfg["strategy_id"]
+    log_prefix  = cfg["log_prefix"]
+    asset_label = cfg["asset_label"]
+    default_size= cfg["default_size"]
+    enabled     = cfg["enabled"]
+
+    if not enabled:
+        logging.warning(
+            "%s_DISABLED env — set %s5M_PAPER_ENABLED=true to activate; sleeping indefinitely",
+            log_prefix, asset_label,
+        )
+        while True:
+            await asyncio.sleep(3600)
+        return
+
+    logging.warning(
+        "%s_BOOT registered=true bot_id=%s strategy_id=%s slug_prefix=%s "
+        "entry_window=35-20s cadence=5s fast_poll=2s mode=PAPER",
+        log_prefix, bot_id, strategy_id, slug_prefix,
+    )
+
+    while True:
+        _tick_start = _monotonic()
+        try:
+            # ── 1. Timing ─────────────────────────────────────────────────────
+            period    = 300
+            now_int   = int(time())
+            now_f     = time()
+            start_ts  = (now_int // period) * period
+            end_ts    = start_ts + period
+            remaining = end_ts - now_int
+            slug      = f"{slug_prefix}-{start_ts}"
+
+            # ── 2. Rotation detection ─────────────────────────────────────────
+            slug_just_changed = (slug != state["last_slug"])
+            if slug_just_changed:
+                old_slug = state["last_slug"]
+                if old_slug is not None:
+                    logging.warning(
+                        "%s_MARKET_EXPIRED old_slug=%s market_end=%s",
+                        log_prefix, old_slug, start_ts,
+                    )
+                state["last_slug"]      = slug
+                state["last_decision"]  = "NONE"
+                state["last_reason"]    = "NEW_MARKET"
+
+            # ── 3. Fetch price data + market data ─────────────────────────────
+            try:
+                ref_price, spot_price, momentum = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _crypto5m_fetch_price_sync,
+                        cfg["binance_url"], cfg["coinbase_url"],
+                        start_ts, state["ref_cache"],
+                    ),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning("%s_DATA_FETCH_TIMEOUT slug=%s", log_prefix, slug)
+                ref_price, spot_price, momentum = None, None, "FLAT"
+
+            try:
+                market_data = await asyncio.wait_for(
+                    asyncio.to_thread(_btc5m_late_fetch_market_data_sync, slug),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning("%s_MARKET_FETCH_TIMEOUT slug=%s", log_prefix, slug)
+                market_data = None
+
+            up_ask        = market_data.get("up_price")     if market_data else None
+            down_ask      = market_data.get("down_price")   if market_data else None
+            up_token_id   = market_data.get("up_token_id")  if market_data else None
+            down_token_id = market_data.get("down_token_id") if market_data else None
+
+            if slug_just_changed and market_data is not None:
+                state["rotated_at"] = now_f
+                logging.warning(
+                    "%s_MARKET_ROTATED new_slug=%s start=%s end=%s up_ask=%s down_ask=%s",
+                    log_prefix, slug, start_ts, end_ts, up_ask, down_ask,
+                )
+            elif slug_just_changed and market_data is None:
+                logging.warning(
+                    "%s_ROTATION_FAILED candidate=%s reason=MARKET_NOT_FOUND",
+                    log_prefix, slug,
+                )
+
+            # ── 4. Read bot_settings ──────────────────────────────────────────
+            try:
+                settings = await asyncio.wait_for(
+                    asyncio.to_thread(read_strategy_settings, bot_id),
+                    timeout=8.0,
+                )
+            except asyncio.TimeoutError:
+                settings = {"is_enabled": False, "mode": "PAPER", "trade_size_usd": default_size, "arm_live": False}
+
+            is_enabled = bool(settings.get("is_enabled", False))
+            mode       = str(settings.get("mode") or "PAPER").upper()
+            trade_size = float(settings.get("trade_size_usd") or default_size)
+
+            # ── 5. Health state ───────────────────────────────────────────────
+            in_window = (20 < remaining <= 35)
+            if not is_enabled:
+                health_state = "STRATEGY_DISABLED"
+            elif mode != "PAPER":
+                health_state = "WRONG_MODE"
+            elif ref_price is None:
+                health_state = "PRICE_TO_BEAT_MISSING"
+            elif spot_price is None:
+                health_state = "REFERENCE_PRICE_MISSING"
+            elif market_data is None:
+                health_state = "MARKET_NOT_FOUND"
+            elif up_ask is None or down_ask is None:
+                health_state = "ORDER_BOOK_MISSING"
+            elif not in_window:
+                health_state = "OUTSIDE_EVALUATION_WINDOW"
+            else:
+                health_state = "READY"
+
+            # ── 6. Health log every 10s ───────────────────────────────────────
+            _mono_now   = _monotonic()
+            _loop_lag   = round((_mono_now - _tick_start) * 1000, 1)
+            _snap_age   = round(_mono_now - state["snapshot_written_at"], 1)
+            if _mono_now - state["last_health_ts"] >= 10.0:
+                state["last_health_ts"] = _mono_now
+                logging.warning(
+                    "%s_HEALTH enabled=%s mode=%s slug=%s seconds_left=%s "
+                    "ref=%s spot=%s up_ask=%s down_ask=%s state=%s "
+                    "loop_lag_ms=%s snap_age=%s",
+                    log_prefix, is_enabled, mode, slug, remaining,
+                    ref_price, spot_price, up_ask, down_ask,
+                    health_state, _loop_lag, _snap_age,
+                )
+
+            # ── 7. Status snapshot every 10s ──────────────────────────────────
+            if _mono_now - state["last_status_ts"] >= 10.0:
+                state["last_status_ts"] = _mono_now
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _crypto5m_upsert_status_sync,
+                            cfg, state, slug, start_ts, end_ts, remaining,
+                            ref_price, spot_price, up_ask, down_ask, momentum,
+                            health_state, is_enabled, mode,
+                            up_token_id, down_token_id, trade_size,
+                        ),
+                        timeout=10.0,
+                    )
+                    state["snapshot_written_at"] = _monotonic()
+                except asyncio.TimeoutError:
+                    logging.warning("%s_STATUS_WRITE_TIMEOUT slug=%s", log_prefix, slug)
+
+            # ── 8. Outside entry window ───────────────────────────────────────
+            if not in_window:
+                continue
+
+            # ── 9. Entry gates ────────────────────────────────────────────────
+            if not is_enabled:
+                state["last_reason"] = "STRATEGY_DISABLED"
+                continue
+            if mode != "PAPER":
+                state["last_reason"] = "WRONG_MODE"
+                continue
+            if ref_price is None:
+                state["last_reason"] = "PRICE_TO_BEAT_MISSING"
+                continue
+            if spot_price is None:
+                state["last_reason"] = "REFERENCE_PRICE_MISSING"
+                continue
+            if market_data is None:
+                state["last_reason"] = "MARKET_NOT_FOUND"
+                continue
+
+            # ── 10. One-trade-per-market check ────────────────────────────────
+            try:
+                already_traded = await asyncio.wait_for(
+                    asyncio.to_thread(_crypto5m_has_position_sync, bot_id, slug),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logging.warning("%s_DUP_CHECK_TIMEOUT slug=%s", log_prefix, slug)
+                continue
+            if already_traded:
+                state["last_reason"] = "ALREADY_TRADED_MARKET"
+                continue
+
+            # ── 11. Direction decision ────────────────────────────────────────
+            side: str | None          = None
+            entry_price: float | None = None
+            decision:    str          = "SKIP"
+            skip_reason: str          = "NO_SIGNAL"
+
+            if spot_price > ref_price:
+                side        = "yes"
+                entry_price = up_ask
+                decision    = "BUY_UP"
+            elif spot_price < ref_price:
+                side        = "no"
+                entry_price = down_ask
+                decision    = "BUY_DOWN"
+            else:
+                skip_reason = "PRICES_EXACTLY_EQUAL"
+
+            if decision != "SKIP" and entry_price is None:
+                skip_reason = f"ASK_PRICE_MISSING side={'UP' if side=='yes' else 'DOWN'}"
+                decision    = "SKIP"
+
+            state["last_decision"] = decision
+            state["last_reason"]   = skip_reason if decision == "SKIP" else "SIGNAL_MET"
+
+            logging.warning(
+                "%s_EVALUATE slug=%s seconds_left=%s ref=%.4f spot=%.4f "
+                "up_ask=%s down_ask=%s decision=%s",
+                log_prefix, slug, remaining, ref_price, spot_price,
+                f"{up_ask:.4f}"   if up_ask   is not None else "None",
+                f"{down_ask:.4f}" if down_ask is not None else "None",
+                decision,
+            )
+
+            if decision == "SKIP":
+                logging.warning(
+                    "%s_SKIP slug=%s reason=%s seconds_left=%s",
+                    log_prefix, slug, state["last_reason"], remaining,
+                )
+                continue
+
+            # ── 12. Open PAPER position ───────────────────────────────────────
+            assert side is not None and entry_price is not None
+            logging.warning(
+                "%s_ENTRY_ATTEMPT slug=%s side=%s entry_price=%.4f size=%s seconds_left=%s",
+                log_prefix, slug, "UP" if side == "yes" else "DOWN",
+                entry_price, trade_size, remaining,
+            )
+
+            shares = round(trade_size / entry_price, 4)
+            ok, row_id, _ = await insert_paper_position_row(
+                bot_id      = bot_id,
+                strategy_id = strategy_id,
+                market_slug = slug,
+                side        = side,
+                entry_price = entry_price,
+                size_usd    = trade_size,
+                shares      = shares,
+                start_ts    = start_ts,
+            )
+
+            if ok:
+                state["last_decision"] = decision
+                state["last_reason"]   = "PAPER_POSITION_OPENED"
+                logging.warning(
+                    "%s_ENTRY position_id=%s side=%s size_usd=%s "
+                    "entry_price=%.4f seconds_left=%s slug=%s",
+                    log_prefix, row_id or "?",
+                    ("UP" if side == "yes" else "DOWN"),
+                    trade_size, entry_price, remaining, slug,
+                )
+                # Publish snapshot immediately after opening
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _crypto5m_upsert_status_sync,
+                            cfg, state, slug, start_ts, end_ts, remaining,
+                            ref_price, spot_price, up_ask, down_ask, momentum,
+                            "POSITION_OPEN", is_enabled, mode,
+                            up_token_id, down_token_id, trade_size,
+                        ),
+                        timeout=10.0,
+                    )
+                    state["snapshot_written_at"] = _monotonic()
+                    state["last_status_ts"]      = _monotonic()
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                logging.warning(
+                    "%s_ENTRY_FAIL slug=%s side=%s — insert_paper_position_row failed",
+                    log_prefix, slug, side,
+                )
+
+        except Exception:
+            logging.exception("%s_LOOP_ERROR", log_prefix)
+
+        # ── Cadence: 2s in final 45s, 5s otherwise ────────────────────────────
+        _now_b    = int(time())
+        _rem_b    = ((_now_b // 300) * 300 + 300) - _now_b
+        _target   = 2.0 if _rem_b <= 45 else 5.0
+        _elapsed  = _monotonic() - _tick_start
+        await asyncio.sleep(max(0.0, _target - _elapsed))
+
+
+# ── Thin loop wrappers (registered in main()) ─────────────────────────────────
+
+async def eth_5m_loop() -> None:
+    """ETH 5-minute paper strategy loop."""
+    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["eth"], _eth5m_state)
+
+
+async def sol_5m_loop() -> None:
+    """SOL 5-minute paper strategy loop."""
+    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["sol"], _sol5m_state)
+
+
+async def xrp_5m_loop() -> None:
+    """XRP 5-minute paper strategy loop."""
+    await _crypto5m_loop_impl(_CRYPTO5M_ASSETS["xrp"], _xrp5m_state)
+
+
 async def btc_5m_late_loop() -> None:
     """
     BTC_5M_LATE paper strategy main loop — V2 (health + status + rotation).
@@ -15970,6 +16613,10 @@ async def main():
     tasks.append(asyncio.create_task(_run_forever("ema_5m_btc_loop", ema_5m_btc_loop)))
     # ── BTC_5M_LATE strategy (isolated — paper only, btc-updown-5m-* markets) ─
     tasks.append(asyncio.create_task(_run_forever("btc_5m_late_loop", btc_5m_late_loop)))
+    # ── ETH / SOL / XRP 5-minute paper bots (additive — isolated from BTC) ───
+    tasks.append(asyncio.create_task(_run_forever("eth_5m_loop", eth_5m_loop)))
+    tasks.append(asyncio.create_task(_run_forever("sol_5m_loop", sol_5m_loop)))
+    tasks.append(asyncio.create_task(_run_forever("xrp_5m_loop", xrp_5m_loop)))
     restart_ws_task()
     try:
         await asyncio.gather(*tasks)
