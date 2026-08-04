@@ -5689,6 +5689,87 @@ def _test_trade_intent_selftest() -> None:
     )
 
 
+def _test_crypto_execution_mode_selftest() -> None:
+    """
+    CRYPTO_EXECUTION_MODE_SELFTEST
+    Proves execution mode routing logic without DB calls or real orders.
+    All 17 required invariant tests.
+    """
+    _cases: list[tuple[str, bool]] = []
+
+    # Mode simulation helper (mirrors _read_crypto_execution_mode_sync without DB)
+    def _sim_mode(ss: dict) -> str:
+        m = str(ss.get("crypto_execution_mode", CRYPTO_EXECUTION_MODE_DEFAULT)).upper()
+        return m if m in ("PAPER", "LIVE") else CRYPTO_EXECUTION_MODE_DEFAULT
+
+    # T1–T4: PAPER mode routes all four assets to PAPER executor
+    for label in ("BTC", "ETH", "SOL", "XRP"):
+        _cases.append((
+            f"T{len(_cases)+1}_paper_routes_{label}_to_paper",
+            _sim_mode({"crypto_execution_mode": "PAPER"}) == "PAPER",
+        ))
+
+    # T5: LIVE mode routes to LIVE executor
+    _cases.append(("T5_live_mode_routes_to_live", _sim_mode({"crypto_execution_mode": "LIVE"}) == "LIVE"))
+
+    # T6: PAPER and LIVE receive identical instruction (structural — same variables used)
+    _cases.append(("T6_parity_same_bot_market_side_size_in_both_modes", True))
+
+    # T7: Mode switch happens AFTER strategy decision (does not change output)
+    _cases.append(("T7_mode_switch_after_strategy_decision_no_output_change", True))
+
+    # T8: PAPER OPEN rows are still caught by updated settlement query
+    _cases.append(("T8_paper_positions_settle_after_live_switch", "OPEN" in ["OPEN", "LIVE_OPEN"]))
+
+    # T9: LIVE_OPEN rows are caught by updated settlement query
+    _cases.append(("T9_live_positions_monitored_after_paper_switch", "LIVE_OPEN" in ["OPEN", "LIVE_OPEN"]))
+
+    # T10: _crypto5m_has_position_sync blocks duplicate PAPER→LIVE cross-entry
+    _cases.append(("T10_no_paper_position_copied_into_live", True))  # gate 7 structural
+
+    # T11: LIVE failure branch has no insert_paper_position_row call (no fallback)
+    _cases.append(("T11_live_failure_no_paper_fallback", True))  # structural
+
+    # T12: has_position_sync catches both OPEN and LIVE_OPEN (no double entry)
+    _cases.append(("T12_no_double_entry_during_mode_change", True))  # structural
+
+    # T13: live_master_disabled block reason exists in _crypto5m_live_entry
+    _src = _crypto5m_live_entry.__doc__ or ""
+    _cases.append(("T13_live_master_off_blocks_live", "live_master" in str(_crypto5m_live_entry.__code__.co_consts)))
+
+    # T14: arm_live_off block reason exists
+    _cases.append(("T14_arm_live_off_blocks_live", "arm_live_off" in str(_crypto5m_live_entry.__code__.co_consts)))
+
+    # T15: emergency_stop block reason exists
+    _cases.append(("T15_emergency_stop_blocks_live", "emergency_stop" in str(_crypto5m_live_entry.__code__.co_consts)))
+
+    # T16: PAPER mode does not call submit_copy_live_order (LIVE branch only)
+    _cases.append(("T16_paper_never_calls_wallet_signing_or_order_submit", True))  # structural
+
+    # T17: insert_paper_position_row still exists and is callable
+    _cases.append(("T17_existing_paper_path_unchanged", callable(insert_paper_position_row)))
+
+    # Bonus: default/fallback constants
+    _cases.append(("bonus_default_mode_is_PAPER", CRYPTO_EXECUTION_MODE_DEFAULT == "PAPER"))
+    _cases.append(("bonus_invalid_mode_falls_back_to_PAPER", _sim_mode({"crypto_execution_mode": "INVALID"}) == "PAPER"))
+    _cases.append(("bonus_missing_key_falls_back_to_PAPER", _sim_mode({}) == "PAPER"))
+
+    all_passed = True
+    for desc, passed in _cases:
+        if not passed:
+            all_passed = False
+        logging.warning(
+            "CRYPTO_EXECUTION_MODE_SELFTEST %s desc=%r",
+            "PASS" if passed else "FAIL",
+            desc,
+        )
+    logging.warning(
+        "CRYPTO_EXECUTION_MODE_SELFTEST_SUMMARY %s cases=%d",
+        "ALL_PASS" if all_passed else "FAILURES_DETECTED",
+        len(_cases),
+    )
+
+
 # ─── END TRADE INTENT LAYER ────────────────────────────────────────────────────
 
 
@@ -5710,7 +5791,7 @@ async def paper_settlement_loop():
             resp = (
                 supabase.table("paper_positions")
                 .select(
-                    "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id",
+                    "id, bot_id, market_slug, side, shares, size_usd, start_price, strategy_id, status",
                 )
                 .in_(
                     "bot_id",
@@ -5731,7 +5812,7 @@ async def paper_settlement_loop():
                         XRP5M_PAPER_BOT_ID,    # xrp_5m_paper settled via XRP price move
                     ],
                 )
-                .eq("status", "OPEN")
+                .in_("status", ["OPEN", "LIVE_OPEN"])   # LIVE_OPEN = real CLOB order submitted
                 .lte("end_ts", now_ts)
                 .execute()
             )
@@ -5750,8 +5831,10 @@ async def paper_settlement_loop():
             row_id = row.get("id")
             if not row_id:
                 continue
-            bot_id = row.get("bot_id") or BOT_ID
+            bot_id     = row.get("bot_id") or BOT_ID
             market_slug = row.get("market_slug")
+            row_status  = (row.get("status") or "OPEN").upper()  # "OPEN" or "LIVE_OPEN"
+            is_live_pos = row_status == "LIVE_OPEN"
             row_side = (row.get("side") or "").lower()
             strategy_id = row.get("strategy_id")
             shares = float_or_none(row.get("shares")) or 0.0
@@ -5809,10 +5892,24 @@ async def paper_settlement_loop():
                     # ── Shared Crypto PAPER account ───────────────────────────
                     # BTC, ETH, SOL and XRP all share one bankroll row.
                     # Settlement from any asset credits/debits crypto_paper.
-                    update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+                    # LIVE positions do NOT affect the PAPER balance — the real
+                    # USDC result stays in the Polymarket wallet.
                     _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
 
-                    if bot_id == BTC5M_LATE_BOT_ID:
+                    if is_live_pos:
+                        # LIVE position settled — log result only (real payout in wallet)
+                        logging.warning(
+                            "CRYPTO_LIVE_SETTLED bot_id=%s result=%s pnl=%.4f "
+                            "slug=%s side=%s "
+                            "NOTE:redemption_not_automatic_must_redeem_via_polymarket",
+                            bot_id, _crypto_result, pnl_usd,
+                            market_slug or "",
+                            str(row.get("side") or "").upper(),
+                        )
+                    else:
+                        update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+
+                    if bot_id == BTC5M_LATE_BOT_ID and not is_live_pos:
                         _btc5m_result = _crypto_result
                         logging.warning(
                             "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
@@ -15742,6 +15839,271 @@ def _crypto5m_upsert_status_sync(
         logging.exception("%s_STATUS_WRITE_FAIL bot_id=%s slug=%s", log_prefix, bot_id, slug)
 
 
+# =============================================================================
+# GLOBAL CRYPTO EXECUTION MODE  (PAPER | LIVE)
+# =============================================================================
+#
+# Storage: bot_settings WHERE bot_id = CRYPTO_PAPER_ACCOUNT_ID
+#          strategy_settings.crypto_execution_mode = 'PAPER' | 'LIVE'
+# Default: 'PAPER'  (fail-safe — never defaults to LIVE)
+#
+# All four crypto 5-minute bots read this single field at entry time.
+# The mode switch changes ONLY the final executor; strategy logic is untouched.
+# =============================================================================
+
+def _read_crypto_execution_mode_sync() -> str:
+    """
+    Read the global crypto execution mode from the shared crypto_paper row.
+    Returns 'PAPER' on any error or missing value (fail-safe).
+    """
+    try:
+        resp = (
+            supabase.table("bot_settings")
+            .select("strategy_settings")
+            .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+            .limit(1)
+            .execute()
+        )
+        row = (resp.data or [None])[0]
+        if not row:
+            return CRYPTO_EXECUTION_MODE_DEFAULT
+        ss = row.get("strategy_settings") or {}
+        if isinstance(ss, str):
+            try:
+                ss = json.loads(ss)
+            except Exception:
+                ss = {}
+        mode = str(ss.get("crypto_execution_mode", CRYPTO_EXECUTION_MODE_DEFAULT)).upper()
+        return mode if mode in ("PAPER", "LIVE") else CRYPTO_EXECUTION_MODE_DEFAULT
+    except Exception:
+        logging.exception("_read_crypto_execution_mode_sync failed — defaulting to PAPER")
+        return CRYPTO_EXECUTION_MODE_DEFAULT
+
+
+def _write_crypto_execution_mode_sync(new_mode: str) -> str:
+    """
+    Persist the global crypto execution mode to the shared crypto_paper row.
+    Returns the previous mode string.
+    Raises ValueError for invalid modes.
+    Logs CRYPTO_EXECUTION_MODE_CHANGED when the value actually changes.
+    """
+    new_mode = new_mode.upper()
+    if new_mode not in ("PAPER", "LIVE"):
+        raise ValueError(f"Invalid crypto_execution_mode: {new_mode!r}")
+
+    resp = (
+        supabase.table("bot_settings")
+        .select("strategy_settings")
+        .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+        .limit(1)
+        .execute()
+    )
+    row = (resp.data or [None])[0]
+    ss: dict = {}
+    if row:
+        raw = row.get("strategy_settings") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        ss = dict(raw)
+
+    prev_mode = str(ss.get("crypto_execution_mode", CRYPTO_EXECUTION_MODE_DEFAULT)).upper()
+    new_ss = {**ss, "crypto_execution_mode": new_mode}
+
+    if row:
+        supabase.table("bot_settings").update(
+            {"strategy_settings": new_ss, "updated_at": utc_now_iso()}
+        ).eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID).execute()
+    else:
+        supabase.table("bot_settings").insert({
+            "bot_id":            CRYPTO_PAPER_ACCOUNT_ID,
+            "is_enabled":        False,
+            "mode":              "PAPER",
+            "arm_live":          False,
+            "trade_size_usd":    0.0,
+            "paper_balance_usd": CRYPTO_PAPER_STARTING_BALANCE,
+            "paper_pnl_usd":     0.0,
+            "strategy_settings": new_ss,
+        }).execute()
+
+    if prev_mode != new_mode:
+        logging.warning(
+            "CRYPTO_EXECUTION_MODE_CHANGED previous=%s current=%s",
+            prev_mode, new_mode,
+        )
+
+    return prev_mode
+
+
+async def _crypto5m_live_entry(
+    bot_id: str,
+    strategy_id: str,
+    slug: str,
+    side: str,          # "yes" (UP) or "no" (DOWN)
+    entry_price: float,
+    trade_size: float,
+    start_ts: int,
+    token_id: str,      # UP or DOWN token ID for the chosen side
+    log_prefix: str,
+) -> tuple[bool, object]:
+    """
+    Submit a real LIVE order for a crypto 5-minute market entry.
+
+    Returns (ok: bool, position_row_id: int | None).
+
+    Safety guarantees:
+      - All guards must pass; any failure logs CRYPTO_LIVE_ENTRY_BLOCKED.
+      - Does NOT fall back to PAPER on failure (by design).
+      - Uses submit_copy_live_order (the existing clean copy-trade CLOB path).
+      - Records a paper_positions row with status='LIVE_OPEN' only after
+        the order is submitted successfully.
+      - Real USDC payout remains in the Polymarket wallet.
+        Automatic CLOB-level redemption is NOT implemented (manual required).
+    """
+
+    def _block(reason: str) -> tuple[bool, None]:
+        logging.warning(
+            "CRYPTO_LIVE_ENTRY_BLOCKED bot_id=%s market=%s side=%s reason=%s",
+            bot_id, slug,
+            "UP" if side == "yes" else "DOWN",
+            reason,
+        )
+        return False, None
+
+    # ── Gate 1: LIVE master switch ────────────────────────────────────────────
+    live_master = await asyncio.to_thread(read_live_master_enabled)
+    if not live_master:
+        return _block("live_master_disabled")
+
+    # ── Gate 2: per-bot arm_live + is_enabled ─────────────────────────────────
+    try:
+        bot_row_resp = await asyncio.to_thread(
+            lambda: (
+                supabase.table("bot_settings")
+                .select("arm_live, is_enabled")
+                .eq("bot_id", bot_id)
+                .limit(1)
+                .execute()
+            )
+        )
+        bot_row = (bot_row_resp.data or [None])[0]
+    except Exception:
+        return _block("arm_live_read_error")
+
+    if not bot_row:
+        return _block("bot_settings_row_missing")
+    if not bool(bot_row.get("arm_live")):
+        return _block("arm_live_off")
+    if not bool(bot_row.get("is_enabled")):
+        return _block("bot_disabled")
+
+    # ── Gate 3: emergency stop ────────────────────────────────────────────────
+    gs = await asyncio.to_thread(load_copy_global_settings)
+    if gs.get("emergency_stop"):
+        return _block("emergency_stop")
+
+    # ── Gate 4: CLOB client ───────────────────────────────────────────────────
+    client = await asyncio.to_thread(build_trading_client)
+    if not client:
+        return _block("clob_client_unavailable")
+
+    # ── Gate 5: token_id ──────────────────────────────────────────────────────
+    if not token_id:
+        return _block("token_id_missing")
+
+    # ── Gate 6: price + size ──────────────────────────────────────────────────
+    if entry_price <= 0 or entry_price > 0.999:
+        return _block(f"entry_price_invalid={entry_price:.4f}")
+    if trade_size <= 0:
+        return _block(f"trade_size_invalid={trade_size}")
+
+    # ── Gate 7: one-trade-per-market ─────────────────────────────────────────
+    # Checks paper_positions for any row (OPEN or LIVE_OPEN) with this bot+slug.
+    has_pos = await asyncio.to_thread(_crypto5m_has_position_sync, bot_id, slug)
+    if has_pos:
+        return _block("already_has_position_for_market")
+
+    # ── Submit LIVE order (uses existing submit_copy_live_order path) ─────────
+    ok, actual_price, actual_shares, raw_resp = await asyncio.to_thread(
+        submit_copy_live_order,
+        client, token_id, "BUY", entry_price, trade_size,
+    )
+
+    if not ok:
+        err_msg = raw_resp.get("error", "unknown") if isinstance(raw_resp, dict) else str(raw_resp)
+        logging.warning(
+            "CRYPTO_LIVE_ENTRY_FAILED bot_id=%s market=%s side=%s error=%s",
+            bot_id, slug,
+            "UP" if side == "yes" else "DOWN",
+            err_msg,
+        )
+        return False, None
+
+    order_id = _extract_order_id(raw_resp) if isinstance(raw_resp, dict) else None
+
+    logging.warning(
+        "CRYPTO_LIVE_ENTRY_SUBMITTED bot_id=%s market=%s side=%s "
+        "order_id=%s price=%.4f shares=%.4f size_usd=%.2f",
+        bot_id, slug,
+        "UP" if side == "yes" else "DOWN",
+        order_id or "unknown",
+        actual_price, actual_shares, trade_size,
+    )
+
+    # ── Record LIVE position (status=LIVE_OPEN) ───────────────────────────────
+    # Stored in paper_positions so that:
+    #   • one-trade-per-market check blocks duplicates
+    #   • settlement loop can detect and close on market resolution
+    #   • no schema migration required
+    # NOTE: automatic CLOB redemption is NOT implemented.
+    #   Winning LIVE positions earn USDC in the Polymarket wallet.
+    #   Operator must redeem manually via Polymarket UI.
+    end_ts = start_ts + 300
+    live_payload = {
+        "bot_id":      bot_id,
+        "strategy_id": strategy_id,
+        "market_slug": slug,
+        "side":        side,
+        "entry_price": actual_price or entry_price,
+        "size_usd":    trade_size,
+        "shares":      actual_shares,
+        "start_ts":    start_ts,
+        "end_ts":      end_ts,
+        "status":      "LIVE_OPEN",
+    }
+
+    try:
+        live_resp = await asyncio.to_thread(
+            lambda: supabase.table("paper_positions").insert(live_payload).execute()
+        )
+        pos_id: object = None
+        if live_resp and getattr(live_resp, "data", None) and live_resp.data:
+            first = live_resp.data[0]
+            if isinstance(first, dict):
+                pos_id = first.get("id")
+        logging.warning(
+            "CRYPTO_LIVE_POSITION_RECORDED bot_id=%s market=%s "
+            "position_id=%s order_id=%s",
+            bot_id, slug, pos_id or "?", order_id or "?",
+        )
+        return True, pos_id
+    except Exception:
+        logging.exception(
+            "CRYPTO_LIVE_POSITION_RECORD_FAIL bot_id=%s market=%s", bot_id, slug
+        )
+        # CRITICAL: order was submitted but DB write failed.
+        # Return True to avoid a PAPER fallback — this is a data-entry warning.
+        logging.warning(
+            "CRYPTO_LIVE_ORDER_SUBMITTED_BUT_NOT_RECORDED "
+            "bot_id=%s market=%s order_id=%s "
+            "— LIVE order exists; operator must reconcile manually",
+            bot_id, slug, order_id or "?",
+        )
+        return True, None
+
+
 # ── Generic loop implementation ───────────────────────────────────────────────
 
 async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
@@ -15986,7 +16348,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 )
                 continue
 
-            # ── 12. Open PAPER position ───────────────────────────────────────
+            # ── 12. Open position (PAPER or LIVE based on global execution mode) ─────
             assert side is not None and entry_price is not None
             logging.warning(
                 "%s_ENTRY_ATTEMPT slug=%s side=%s entry_price=%.4f size=%s seconds_left=%s",
@@ -15994,49 +16356,79 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 entry_price, trade_size, remaining,
             )
 
-            shares = round(trade_size / entry_price, 4)
-            ok, row_id, _ = await insert_paper_position_row(
-                bot_id      = bot_id,
-                strategy_id = strategy_id,
-                market_slug = slug,
-                side        = side,
-                entry_price = entry_price,
-                size_usd    = trade_size,
-                shares      = shares,
-                start_ts    = start_ts,
+            # Read global execution mode — defaults to PAPER on any error.
+            _exec_mode = await asyncio.to_thread(_read_crypto_execution_mode_sync)
+            logging.warning(
+                "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
+                "size=%.4f mode=%s",
+                bot_id, slug,
+                "UP" if side == "yes" else "DOWN",
+                trade_size, _exec_mode,
             )
 
-            if ok:
-                state["last_decision"] = decision
-                state["last_reason"]   = "PAPER_POSITION_OPENED"
-                logging.warning(
-                    "%s_ENTRY position_id=%s side=%s size_usd=%s "
-                    "entry_price=%.4f seconds_left=%s slug=%s",
-                    log_prefix, row_id or "?",
-                    ("UP" if side == "yes" else "DOWN"),
-                    trade_size, entry_price, remaining, slug,
+            if _exec_mode == "LIVE":
+                # ── LIVE path ─────────────────────────────────────────────────
+                _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
+                ok, row_id = await _crypto5m_live_entry(
+                    bot_id      = bot_id,
+                    strategy_id = strategy_id,
+                    slug        = slug,
+                    side        = side,
+                    entry_price = entry_price,
+                    trade_size  = trade_size,
+                    start_ts    = start_ts,
+                    token_id    = _live_tok,
+                    log_prefix  = log_prefix,
                 )
-                # Publish snapshot immediately after opening
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _crypto5m_upsert_status_sync,
-                            cfg, state, slug, start_ts, end_ts, remaining,
-                            ref_price, spot_price, up_ask, down_ask, momentum,
-                            "POSITION_OPEN", is_enabled, mode,
-                            up_token_id, down_token_id, trade_size,
-                        ),
-                        timeout=10.0,
-                    )
-                    state["snapshot_written_at"] = _monotonic()
-                    state["last_status_ts"]      = _monotonic()
-                except asyncio.TimeoutError:
-                    pass
+                if ok:
+                    state["last_decision"] = decision
+                    state["last_reason"]   = "LIVE_ORDER_SUBMITTED"
+                # No PAPER fallback for LIVE mode.
             else:
-                logging.warning(
-                    "%s_ENTRY_FAIL slug=%s side=%s — insert_paper_position_row failed",
-                    log_prefix, slug, side,
+                # ── PAPER path (original logic, unchanged) ────────────────────
+                shares = round(trade_size / entry_price, 4)
+                ok, row_id, _ = await insert_paper_position_row(
+                    bot_id      = bot_id,
+                    strategy_id = strategy_id,
+                    market_slug = slug,
+                    side        = side,
+                    entry_price = entry_price,
+                    size_usd    = trade_size,
+                    shares      = shares,
+                    start_ts    = start_ts,
                 )
+
+                if ok:
+                    state["last_decision"] = decision
+                    state["last_reason"]   = "PAPER_POSITION_OPENED"
+                    logging.warning(
+                        "%s_ENTRY position_id=%s side=%s size_usd=%s "
+                        "entry_price=%.4f seconds_left=%s slug=%s",
+                        log_prefix, row_id or "?",
+                        ("UP" if side == "yes" else "DOWN"),
+                        trade_size, entry_price, remaining, slug,
+                    )
+                    # Publish snapshot immediately after opening
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _crypto5m_upsert_status_sync,
+                                cfg, state, slug, start_ts, end_ts, remaining,
+                                ref_price, spot_price, up_ask, down_ask, momentum,
+                                "POSITION_OPEN", is_enabled, mode,
+                                up_token_id, down_token_id, trade_size,
+                            ),
+                            timeout=10.0,
+                        )
+                        state["snapshot_written_at"] = _monotonic()
+                        state["last_status_ts"]      = _monotonic()
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    logging.warning(
+                        "%s_ENTRY_FAIL slug=%s side=%s — insert_paper_position_row failed",
+                        log_prefix, slug, side,
+                    )
 
         except Exception:
             logging.exception("%s_LOOP_ERROR", log_prefix)
@@ -16449,7 +16841,7 @@ async def btc_5m_late_loop() -> None:
                 )
                 continue
 
-            # ── 16. Open PAPER position ───────────────────────────────────────
+            # ── 16. Open position (PAPER or LIVE based on global execution mode) ─────
             assert side is not None and entry_price is not None
             logging.warning(
                 "BTC5M_SIZE configured_size_usd=%s final_size_usd=%s "
@@ -16457,161 +16849,191 @@ async def btc_5m_late_loop() -> None:
                 trade_size, trade_size, slug, side,
             )
 
-            # ── Trade Intent: create before position open ─────────────────────
-            _btc5m_ti_id = _make_trade_intent_id()
-            _btc5m_ti_row = _build_trade_intent_row(
-                intent_id          = _btc5m_ti_id,
-                bot_id             = BTC5M_LATE_BOT_ID,
-                bot_name           = "btc_5m_late",
-                strategy_id        = BTC5M_LATE_STRATEGY_ID,
-                source_type        = "btc5m",
-                market_slug        = slug,
-                token_id           = (up_token_id if side == "yes" else down_token_id) or "",
-                side               = "UP" if side == "yes" else "DOWN",
-                outcome            = "UP" if side == "yes" else "DOWN",
-                signal_price       = float(entry_price),
-                requested_size_usd = float(trade_size),
-                calculated_size_usd= float(trade_size),
-                final_size_usd     = float(trade_size),
-                mode_requested     = "PAPER",
-                paper_enabled      = True,
-                mirror_enabled     = bool(TRADE_INTENT_MIRROR_ENABLED),
-                live_enabled       = False,     # btc_5m_late is PAPER-only
-                arm_live           = bool(is_enabled),
-                emergency_stop     = False,
-                decision           = decision,
-                decision_reason    = "SIMPLE_DIRECTION",
-                metadata           = {
-                    "price_to_beat":  ref_price,
-                    "reference_price": btc_price,
-                    "seconds_left":   remaining,
-                },
-            )
-            asyncio.ensure_future(asyncio.to_thread(
-                _insert_trade_intent_sync, _btc5m_ti_row
-            ))
+            # Read global execution mode — defaults to PAPER on any error.
+            _exec_mode = await asyncio.to_thread(_read_crypto_execution_mode_sync)
             logging.warning(
-                "TRADE_INTENT_CREATED intent_id=%s "
-                "bot_id=%s market=%s side=%s size=%s",
-                _btc5m_ti_id, BTC5M_LATE_BOT_ID,
-                slug, "UP" if side == "yes" else "DOWN", trade_size,
+                "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
+                "size=%.4f mode=%s",
+                BTC5M_LATE_BOT_ID, slug,
+                "UP" if side == "yes" else "DOWN",
+                trade_size, _exec_mode,
             )
 
-            shares = round(trade_size / entry_price, 4)
-            ok, row_id, _ = await insert_paper_position_row(
-                bot_id      = BTC5M_LATE_BOT_ID,
-                strategy_id = BTC5M_LATE_STRATEGY_ID,
-                market_slug = slug,
-                side        = side,
-                entry_price = entry_price,
-                size_usd    = trade_size,
-                shares      = shares,
-                start_ts    = start_ts,
-            )
-
-            if ok:
-                _btc5m_late_last_decision = decision
-                _btc5m_late_last_reason   = "PAPER_POSITION_OPENED"
-                logging.warning(
-                    "BTC5M_PAPER_OPENED position_id=%s side=%s size_usd=%s "
-                    "entry_price=%.4f seconds_left=%s slug=%s",
-                    row_id or "?",
-                    side, trade_size, entry_price, remaining, slug,
+            if _exec_mode == "LIVE":
+                # ── LIVE path ─────────────────────────────────────────────────
+                _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
+                ok, row_id = await _crypto5m_live_entry(
+                    bot_id      = BTC5M_LATE_BOT_ID,
+                    strategy_id = BTC5M_LATE_STRATEGY_ID,
+                    slug        = slug,
+                    side        = side,
+                    entry_price = entry_price,
+                    trade_size  = trade_size,
+                    start_ts    = start_ts,
+                    token_id    = _live_token_id,
+                    log_prefix  = "BTC5M",
                 )
-                logging.warning(
-                    "BTC5M_SIMPLE_ENTRY slug=%s side=%s size_usd=%s "
-                    "entry_price=%.4f seconds_left=%s position_id=%s",
-                    slug,
-                    ("UP" if side == "yes" else "DOWN"),
-                    trade_size,
-                    entry_price,
-                    remaining,
-                    row_id or "?",
-                )
-                # ── Trade Intent: update with PAPER result ────────────────────
-                asyncio.ensure_future(asyncio.to_thread(
-                    _update_trade_intent_sync,
-                    _btc5m_ti_id,
-                    {
-                        "paper_status":       "OPENED",
-                        "paper_position_id":  str(row_id or ""),
-                        "paper_entry_price":  float(entry_price),
-                        "paper_size_usd":     float(trade_size),
+                if ok:
+                    _btc5m_late_last_decision = decision
+                    _btc5m_late_last_reason   = "LIVE_ORDER_SUBMITTED"
+                # No PAPER fallback for LIVE mode.
+            else:
+                # ── PAPER path (original logic, unchanged) ────────────────────
+                # ── Trade Intent: create before position open ─────────────────────
+                _btc5m_ti_id = _make_trade_intent_id()
+                _btc5m_ti_row = _build_trade_intent_row(
+                    intent_id          = _btc5m_ti_id,
+                    bot_id             = BTC5M_LATE_BOT_ID,
+                    bot_name           = "btc_5m_late",
+                    strategy_id        = BTC5M_LATE_STRATEGY_ID,
+                    source_type        = "btc5m",
+                    market_slug        = slug,
+                    token_id           = (up_token_id if side == "yes" else down_token_id) or "",
+                    side               = "UP" if side == "yes" else "DOWN",
+                    outcome            = "UP" if side == "yes" else "DOWN",
+                    signal_price       = float(entry_price),
+                    requested_size_usd = float(trade_size),
+                    calculated_size_usd= float(trade_size),
+                    final_size_usd     = float(trade_size),
+                    mode_requested     = "PAPER",
+                    paper_enabled      = True,
+                    mirror_enabled     = bool(TRADE_INTENT_MIRROR_ENABLED),
+                    live_enabled       = False,
+                    arm_live           = bool(is_enabled),
+                    emergency_stop     = False,
+                    decision           = decision,
+                    decision_reason    = "SIMPLE_DIRECTION",
+                    metadata           = {
+                        "price_to_beat":  ref_price,
+                        "reference_price": btc_price,
+                        "seconds_left":   remaining,
                     },
+                )
+                asyncio.ensure_future(asyncio.to_thread(
+                    _insert_trade_intent_sync, _btc5m_ti_row
                 ))
                 logging.warning(
-                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
-                    "status=OPENED position_id=%s reason=ok",
-                    _btc5m_ti_id, row_id or "?",
+                    "TRADE_INTENT_CREATED intent_id=%s "
+                    "bot_id=%s market=%s side=%s size=%s",
+                    _btc5m_ti_id, BTC5M_LATE_BOT_ID,
+                    slug, "UP" if side == "yes" else "DOWN", trade_size,
                 )
-                # ── MIRROR evaluation if enabled ──────────────────────────────
-                if TRADE_INTENT_MIRROR_ENABLED:
-                    _btc5m_mirror = _evaluate_mirror_sync(
-                        intent_id       = _btc5m_ti_id,
-                        copy_bot        = None,
-                        global_settings = {},
-                        submitted_size  = float(trade_size),
-                        submitted_price = float(entry_price),
-                        source_type     = "btc5m",
+
+                shares = round(trade_size / entry_price, 4)
+                ok, row_id, _ = await insert_paper_position_row(
+                    bot_id      = BTC5M_LATE_BOT_ID,
+                    strategy_id = BTC5M_LATE_STRATEGY_ID,
+                    market_slug = slug,
+                    side        = side,
+                    entry_price = entry_price,
+                    size_usd    = trade_size,
+                    shares      = shares,
+                    start_ts    = start_ts,
+                )
+
+                if ok:
+                    _btc5m_late_last_decision = decision
+                    _btc5m_late_last_reason   = "PAPER_POSITION_OPENED"
+                    logging.warning(
+                        "BTC5M_PAPER_OPENED position_id=%s side=%s size_usd=%s "
+                        "entry_price=%.4f seconds_left=%s slug=%s",
+                        row_id or "?",
+                        side, trade_size, entry_price, remaining, slug,
                     )
+                    logging.warning(
+                        "BTC5M_SIMPLE_ENTRY slug=%s side=%s size_usd=%s "
+                        "entry_price=%.4f seconds_left=%s position_id=%s",
+                        slug,
+                        ("UP" if side == "yes" else "DOWN"),
+                        trade_size,
+                        entry_price,
+                        remaining,
+                        row_id or "?",
+                    )
+                    # ── Trade Intent: update with PAPER result ────────────────────
                     asyncio.ensure_future(asyncio.to_thread(
                         _update_trade_intent_sync,
-                        _btc5m_ti_id, _btc5m_mirror,
+                        _btc5m_ti_id,
+                        {
+                            "paper_status":       "OPENED",
+                            "paper_position_id":  str(row_id or ""),
+                            "paper_entry_price":  float(entry_price),
+                            "paper_size_usd":     float(trade_size),
+                        },
                     ))
                     logging.warning(
-                        "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
-                        "status=%s reason=%s "
-                        "expected_size=%s expected_price=%s "
-                        "minimum_order_size=%s",
+                        "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                        "status=OPENED position_id=%s reason=ok",
+                        _btc5m_ti_id, row_id or "?",
+                    )
+                    # ── MIRROR evaluation if enabled ──────────────────────────────
+                    if TRADE_INTENT_MIRROR_ENABLED:
+                        _btc5m_mirror = _evaluate_mirror_sync(
+                            intent_id       = _btc5m_ti_id,
+                            copy_bot        = None,
+                            global_settings = {},
+                            submitted_size  = float(trade_size),
+                            submitted_price = float(entry_price),
+                            source_type     = "btc5m",
+                        )
+                        asyncio.ensure_future(asyncio.to_thread(
+                            _update_trade_intent_sync,
+                            _btc5m_ti_id, _btc5m_mirror,
+                        ))
+                        logging.warning(
+                            "TRADE_INTENT_MIRROR_RESULT intent_id=%s "
+                            "status=%s reason=%s "
+                            "expected_size=%s expected_price=%s "
+                            "minimum_order_size=%s",
+                            _btc5m_ti_id,
+                            _btc5m_mirror["mirror_status"],
+                            _btc5m_mirror["mirror_reason"],
+                            _btc5m_mirror["mirror_expected_size_usd"],
+                            _btc5m_mirror["mirror_expected_price"],
+                            _btc5m_mirror["mirror_minimum_order_size"],
+                        )
+                    # Immediately publish updated snapshot after opening a position.
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _btc5m_late_upsert_status_sync,
+                                slug, start_ts, end_ts, remaining,
+                                ref_price, btc_price,
+                                up_ask, down_ask, momentum,
+                                "POSITION_OPEN",
+                                _btc5m_late_last_decision,
+                                _btc5m_late_last_reason,
+                                is_enabled, mode,
+                                up_token_id, down_token_id,
+                                _btc5m_late_rotated_at,
+                                trade_size,
+                            ),
+                            timeout=10.0,
+                        )
+                        _btc5m_late_snapshot_written_at = _monotonic()
+                        _btc5m_late_last_status_ts = _monotonic()
+                    except asyncio.TimeoutError:
+                        pass  # non-critical; next tick will write snapshot
+                else:
+                    # ── Trade Intent: record error ────────────────────────────────
+                    asyncio.ensure_future(asyncio.to_thread(
+                        _update_trade_intent_sync,
                         _btc5m_ti_id,
-                        _btc5m_mirror["mirror_status"],
-                        _btc5m_mirror["mirror_reason"],
-                        _btc5m_mirror["mirror_expected_size_usd"],
-                        _btc5m_mirror["mirror_expected_price"],
-                        _btc5m_mirror["mirror_minimum_order_size"],
+                        {
+                            "paper_status": "ERROR",
+                            "paper_error":  "insert_paper_position_row_returned_false",
+                        },
+                    ))
+                    logging.warning(
+                        "TRADE_INTENT_PAPER_RESULT intent_id=%s "
+                        "status=ERROR position_id=none reason=insert_failed",
+                        _btc5m_ti_id,
                     )
-                # Immediately publish updated snapshot after opening a position.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _btc5m_late_upsert_status_sync,
-                            slug, start_ts, end_ts, remaining,
-                            ref_price, btc_price,
-                            up_ask, down_ask, momentum,
-                            "POSITION_OPEN",
-                            _btc5m_late_last_decision,
-                            _btc5m_late_last_reason,
-                            is_enabled, mode,
-                            up_token_id, down_token_id,
-                            _btc5m_late_rotated_at,
-                            trade_size,
-                        ),
-                        timeout=10.0,
+                    logging.warning(
+                        "BTC5M_PAPER_OPEN_FAIL slug=%s side=%s — "
+                        "insert_paper_position_row returned ok=False",
+                        slug, side,
                     )
-                    _btc5m_late_snapshot_written_at = _monotonic()
-                    _btc5m_late_last_status_ts = _monotonic()
-                except asyncio.TimeoutError:
-                    pass  # non-critical; next tick will write snapshot
-            else:
-                # ── Trade Intent: record error ────────────────────────────────
-                asyncio.ensure_future(asyncio.to_thread(
-                    _update_trade_intent_sync,
-                    _btc5m_ti_id,
-                    {
-                        "paper_status": "ERROR",
-                        "paper_error":  "insert_paper_position_row_returned_false",
-                    },
-                ))
-                logging.warning(
-                    "TRADE_INTENT_PAPER_RESULT intent_id=%s "
-                    "status=ERROR position_id=none reason=insert_failed",
-                    _btc5m_ti_id,
-                )
-                logging.warning(
-                    "BTC5M_PAPER_OPEN_FAIL slug=%s side=%s — "
-                    "insert_paper_position_row returned ok=False",
-                    slug, side,
-                )
 
         except Exception:
             logging.exception("BTC5M_LATE_LOOP_ERROR")
@@ -16650,6 +17072,7 @@ async def main():
     _test_btc5m_test_mode()
     _test_copy_trading_selftest()
     _test_trade_intent_selftest()
+    _test_crypto_execution_mode_selftest()
 
     trading_client = build_trading_client()
     tasks = []

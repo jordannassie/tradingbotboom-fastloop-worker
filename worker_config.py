@@ -508,6 +508,11 @@ CRYPTO_PAPER_BOT_IDS: list[str] = [             # all bots that debit this accou
     "xrp_5m_paper",
 ]
 
+# Global execution mode for all crypto 5-minute bots.
+# Stored in bot_settings[crypto_paper].strategy_settings.crypto_execution_mode
+# Valid values: "PAPER" | "LIVE".   Default is always "PAPER" (fail-safe).
+CRYPTO_EXECUTION_MODE_DEFAULT = "PAPER"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — FAST-TURNOVER COPY ENGINE CONFIGURATION
