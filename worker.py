@@ -7310,6 +7310,20 @@ def _test_stale_paper_cleanup_selftest() -> None:
         _f("T8_exposure_excludes_stale_rows",
            f"exposure={_exposure} active_count={len(_active_open)}")
 
+    # T9: close_reason is NOT written to paper_positions (column doesn't exist)
+    if "close_reason" not in _cleanup_src:
+        _p("T9_close_reason_not_written_to_paper_positions")
+    else:
+        _f("T9_close_reason_not_written_to_paper_positions",
+           "close_reason found in cleanup source — will cause APIError")
+
+    # T10: DELETE fallback exists in cleanup source (strategy C)
+    if ".delete()" in _cleanup_src and "Strategy C" in _cleanup_src:
+        _p("T10_delete_fallback_exists_in_cleanup")
+    else:
+        _f("T10_delete_fallback_exists_in_cleanup",
+           "DELETE fallback not found in cleanup source")
+
     logging.warning(
         "STALE_CLEANUP_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
         _pass_ct, _fail_ct,
@@ -7863,41 +7877,59 @@ _CLEANUP_BATCH_SIZE = 50  # rows per UPDATE batch to stay under URL limits
 
 def _cleanup_stale_crypto_paper_positions_sync() -> dict:
     """
-    Mark expired OPEN paper_positions rows for the four crypto bots as CANCELLED.
+    Remove expired OPEN paper_positions rows for the four crypto bots.
 
     Criteria for a "stale" row:
       bot_id  ∈ CRYPTO_PAPER_BOT_IDS
       status  = 'OPEN'
       end_ts  < current unix timestamp   (market has already ended)
 
-    Returns a summary dict:
-      {
-        "preview_count":        int,
-        "preview_size_usd":     float,
-        "preview_bot_counts":   dict,
-        "cancelled_count":      int,
-        "remaining_expired_open":  int,
-        "remaining_live_open":     int,
-        "remaining_active_paper":  int,
-        "paper_exposure_usd":      float,
-        "error":                   str|None,
-      }
+    Removal strategy (tried in order, first success wins per batch):
+      A. UPDATE status='CANCELLED', closed_at=now        (no extra columns)
+      B. UPDATE status='CLOSED', closed_at=now, pnl_usd=0  (proven-working fields)
+      C. DELETE the row by primary key                    (authorized fallback)
+
+    The close_reason column is intentionally NOT written — it does not exist on
+    paper_positions (only on copied_positions).
+
+    Returns a summary dict with counts and the method used.
+    Idempotent: re-running finds zero stale rows and exits immediately.
     """
     now_ts  = int(time())
     now_iso = utc_now_iso()
     result: dict = {
-        "preview_count":         0,
-        "preview_size_usd":      0.0,
-        "preview_bot_counts":    {},
-        "cancelled_count":       0,
+        "preview_count":          0,
+        "preview_size_usd":       0.0,
+        "preview_bot_counts":     {},
+        "cancelled_count":        0,
+        "method":                 "none",
         "remaining_expired_open": 0,
         "remaining_live_open":    0,
         "remaining_active_paper": 0,
-        "paper_exposure_usd":    0.0,
-        "error":                 None,
+        "paper_exposure_usd":     0.0,
+        "error":                  None,
     }
 
-    # ── Step 1: Preview — fetch all stale rows ────────────────────────────────
+    def _log_api_error(step: str, exc: Exception) -> None:
+        """Log safe Supabase APIError details without exposing credentials."""
+        code    = getattr(exc, "code",    None)
+        message = getattr(exc, "message", None) or str(exc)
+        details = getattr(exc, "details", None)
+        hint    = getattr(exc, "hint",    None)
+        status_code = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+        # Truncate long values; never log full exception repr which may contain headers
+        logging.warning(
+            "CRYPTO_STALE_PAPER_CLEANUP_API_ERROR"
+            " step=%s status_code=%s code=%s message=%.200s details=%.200s hint=%.200s",
+            step,
+            status_code,
+            code,
+            str(message)[:200] if message else None,
+            str(details)[:200] if details else None,
+            str(hint)[:200]    if hint    else None,
+        )
+
+    # ── Step 1: Preview ───────────────────────────────────────────────────────
     try:
         preview_resp = (
             supabase.table("paper_positions")
@@ -7911,16 +7943,12 @@ def _cleanup_stale_crypto_paper_positions_sync() -> dict:
         stale_rows = preview_resp.data or []
     except Exception as exc:
         result["error"] = f"preview_query_failed:{type(exc).__name__}"
-        logging.warning(
-            "CRYPTO_STALE_PAPER_CLEANUP_FAIL step=preview error=%s",
-            type(exc).__name__,
-        )
+        _log_api_error("preview", exc)
         return result
 
-    # Aggregate preview stats
-    bot_counts: dict[str, int] = {}
+    bot_counts: dict = {}
     total_size = 0.0
-    stale_ids: list[str] = []
+    stale_ids: list = []
     for row in stale_rows:
         bid = row.get("bot_id", "unknown")
         bot_counts[bid] = bot_counts.get(bid, 0) + 1
@@ -7941,36 +7969,92 @@ def _cleanup_stale_crypto_paper_positions_sync() -> dict:
         logging.warning(
             "CRYPTO_STALE_PAPER_CLEANUP_PREVIEW no_stale_rows_found — nothing to do"
         )
+        # Still run verification so final log reflects true state
+        stale_ids = []
 
-    # ── Step 2: Cancel in batches ─────────────────────────────────────────────
-    cancelled = 0
+    # ── Step 2: Remove in batches with tiered fallback ────────────────────────
+    # Determine which removal strategy works by probing with the first batch.
+    # Once a strategy succeeds it is locked in for remaining batches.
+    removed    = 0
+    _method    = "none"
     total_batches = -(-len(stale_ids) // _CLEANUP_BATCH_SIZE) if stale_ids else 0
+
     for batch_num, i in enumerate(range(0, len(stale_ids), _CLEANUP_BATCH_SIZE), start=1):
         batch = stale_ids[i : i + _CLEANUP_BATCH_SIZE]
-        try:
-            supabase.table("paper_positions").update({
-                "status":       "CANCELLED",
-                "closed_at":    now_iso,
-                "close_reason": CLOSE_REASON_STALE_PAPER_CLEANUP,
-            }).in_("id", batch).execute()
-            cancelled += len(batch)
+        _done = False
+
+        # Strategy A: UPDATE status=CANCELLED (minimal payload — no close_reason)
+        if not _done and _method in ("none", "UPDATE_CANCELLED"):
+            try:
+                supabase.table("paper_positions").update({
+                    "status":    "CANCELLED",
+                    "closed_at": now_iso,
+                }).in_("id", batch).execute()
+                removed  += len(batch)
+                _method   = "UPDATE_CANCELLED"
+                _done     = True
+                logging.warning(
+                    "CRYPTO_STALE_PAPER_CLEANUP_BATCH method=UPDATE_CANCELLED"
+                    " batch=%d/%d removed=%d",
+                    batch_num, total_batches, len(batch),
+                )
+            except Exception as exc_a:
+                _log_api_error(f"update_cancelled_batch{batch_num}", exc_a)
+                _method = "try_update_closed"   # escalate for remaining batches
+
+        # Strategy B: UPDATE status=CLOSED, pnl_usd=0 (proven-working schema fields)
+        if not _done and _method in ("try_update_closed", "UPDATE_CLOSED"):
+            try:
+                supabase.table("paper_positions").update({
+                    "status":    "CLOSED",
+                    "closed_at": now_iso,
+                    "pnl_usd":   0.0,
+                }).in_("id", batch).execute()
+                removed  += len(batch)
+                _method   = "UPDATE_CLOSED"
+                _done     = True
+                logging.warning(
+                    "CRYPTO_STALE_PAPER_CLEANUP_BATCH method=UPDATE_CLOSED"
+                    " batch=%d/%d removed=%d",
+                    batch_num, total_batches, len(batch),
+                )
+            except Exception as exc_b:
+                _log_api_error(f"update_closed_batch{batch_num}", exc_b)
+                _method = "try_delete"   # escalate to DELETE
+
+        # Strategy C: DELETE (last resort, explicitly authorized)
+        if not _done and _method in ("try_delete", "DELETE"):
+            try:
+                supabase.table("paper_positions").delete().in_("id", batch).execute()
+                removed  += len(batch)
+                _method   = "DELETE"
+                _done     = True
+                logging.warning(
+                    "CRYPTO_STALE_PAPER_CLEANUP_BATCH method=DELETE"
+                    " batch=%d/%d removed=%d",
+                    batch_num, total_batches, len(batch),
+                )
+            except Exception as exc_c:
+                _log_api_error(f"delete_batch{batch_num}", exc_c)
+                result["error"] = f"all_strategies_failed_batch{batch_num}:{type(exc_c).__name__}"
+
+        if not _done:
             logging.warning(
-                "CRYPTO_STALE_PAPER_CLEANUP_BATCH batch=%d/%d cancelled=%d",
-                batch_num, total_batches, len(batch),
-            )
-        except Exception as exc:
-            result["error"] = f"cancel_batch_failed:{type(exc).__name__}"
-            logging.warning(
-                "CRYPTO_STALE_PAPER_CLEANUP_FAIL step=cancel_batch"
-                " batch=%d/%d error=%s",
-                batch_num, total_batches, type(exc).__name__,
+                "CRYPTO_STALE_PAPER_CLEANUP_FAIL_ALL_STRATEGIES"
+                " batch=%d/%d — skipping batch",
+                batch_num, total_batches,
             )
 
-    result["cancelled_count"] = cancelled
+    result["cancelled_count"] = removed
+    result["method"]          = _method
 
-    # ── Step 3: Verify — count remaining expired OPEN, LIVE_OPEN, and active ─
+    logging.warning(
+        "CRYPTO_STALE_PAPER_CLEANUP_METHOD method=%s total_removed=%d",
+        _method, removed,
+    )
+
+    # ── Step 3: Verify ────────────────────────────────────────────────────────
     try:
-        # Remaining expired OPEN (should be 0 after cleanup)
         rem_resp = (
             supabase.table("paper_positions")
             .select("id", count="exact")
@@ -7985,7 +8069,6 @@ def _cleanup_stale_crypto_paper_positions_sync() -> dict:
         pass
 
     try:
-        # Remaining LIVE_OPEN (must be UNCHANGED)
         live_resp = (
             supabase.table("paper_positions")
             .select("id", count="exact")
@@ -7999,7 +8082,6 @@ def _cleanup_stale_crypto_paper_positions_sync() -> dict:
         pass
 
     try:
-        # Remaining active OPEN (end_ts >= now — current-market positions)
         active_resp = (
             supabase.table("paper_positions")
             .select("id, size_usd")
@@ -8020,11 +8102,13 @@ def _cleanup_stale_crypto_paper_positions_sync() -> dict:
     logging.warning(
         "CRYPTO_STALE_PAPER_CLEANUP_COMPLETE"
         " removed_or_cancelled=%d"
+        " method=%s"
         " remaining_expired_open=%d"
         " remaining_live_open=%d"
         " remaining_active_paper=%d"
         " paper_exposure_usd=%.2f",
         result["cancelled_count"],
+        result["method"],
         result["remaining_expired_open"],
         result["remaining_live_open"],
         result["remaining_active_paper"],
