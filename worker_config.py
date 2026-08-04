@@ -493,6 +493,21 @@ XRP5M_PAPER_STRATEGY_ID = "XRP_5M_PAPER"
 XRP5M_PAPER_SLUG_PREFIX = "xrp-updown-5m"
 XRP5M_PAPER_TRADE_SIZE  = float(os.getenv("XRP5M_PAPER_TRADE_SIZE_USD", "0.10"))
 
+# ── Shared Crypto PAPER Account ───────────────────────────────────────────────
+# All four crypto bots (BTC, ETH, SOL, XRP) share ONE paper bankroll row
+# in bot_settings.  Settlement from any bot credits/debits this single row.
+# Per-bot rows keep: is_enabled, mode, arm_live, trade_size_usd, strategy_settings.
+# This row keeps: paper_balance_usd, paper_pnl_usd.
+
+CRYPTO_PAPER_ACCOUNT_ID       = "crypto_paper"   # shared bot_settings row
+CRYPTO_PAPER_STARTING_BALANCE = float(os.getenv("CRYPTO_PAPER_STARTING_BALANCE", "1000.0"))
+CRYPTO_PAPER_BOT_IDS: list[str] = [             # all bots that debit this account
+    "btc_5m_late",
+    "eth_5m_paper",
+    "sol_5m_paper",
+    "xrp_5m_paper",
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — FAST-TURNOVER COPY ENGINE CONFIGURATION

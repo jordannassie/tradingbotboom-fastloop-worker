@@ -5805,56 +5805,73 @@ async def paper_settlement_loop():
                     # EMA strategy uses its own isolated accounting path with
                     # EMA_BALANCE_BEFORE / EMA_POSITION_CLOSE_PNL / EMA_BALANCE_AFTER logs.
                     _ema5m_apply_realized_pnl_sync(pnl_usd, str(row_id), market_slug or "")
-                elif bot_id == BTC5M_LATE_BOT_ID:
-                    # BTC_5M_LATE uses the standard realized-PnL path (bot_settings.paper_balance_usd).
-                    update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
-                    _btc5m_result = "WIN" if pnl_usd >= 0 else "LOSS"
-                    logging.warning(
-                        "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
-                        "slug=%s side=%s start_price=%.2f end_price=%.2f",
-                        row_id,
-                        _btc5m_result,
-                        pnl_usd,
-                        market_slug or "",
-                        row.get("side") or "",
-                        start_price or 0.0,
-                        end_price or 0.0,
-                    )
-                    logging.warning(
-                        "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
-                        market_slug or "",
-                        str(row.get("side") or "").upper(),
-                        _btc5m_result,
-                        pnl_usd,
-                    )
-                    # ── Trade Intent settlement link ──────────────────────────
-                    # Match by paper_position_id stored in trade_intents.
-                    def _btc5m_settle_intent(pos_id: str, result: str, pnl: float) -> None:
-                        try:
-                            _upd = {
-                                "paper_status":    "CLOSED",
-                                "paper_pnl_usd":   pnl,
-                                "paper_closed_at": utc_now_iso(),
-                                "paper_result":    result,
-                                "updated_at":      utc_now_iso(),
-                            }
-                            supabase.table("trade_intents").update(_upd).eq(
-                                "paper_position_id", str(pos_id)
-                            ).execute()
-                            logging.warning(
-                                "TRADE_INTENT_SETTLED intent_id=lookup "
-                                "result=%s pnl=%.4f",
-                                result, pnl,
-                            )
-                        except Exception:
-                            logging.warning(
-                                "TRADE_INTENT_SETTLE_FAIL pos_id=%s — "
-                                "settlement link failed (position settled ok)",
-                                pos_id,
-                            )
-                    asyncio.ensure_future(asyncio.to_thread(
-                        _btc5m_settle_intent, str(row_id), _btc5m_result, pnl_usd,
-                    ))
+                elif bot_id in CRYPTO_PAPER_BOT_IDS:
+                    # ── Shared Crypto PAPER account ───────────────────────────
+                    # BTC, ETH, SOL and XRP all share one bankroll row.
+                    # Settlement from any asset credits/debits crypto_paper.
+                    update_bot_settings_with_realized_pnl(CRYPTO_PAPER_ACCOUNT_ID, pnl_usd)
+                    _crypto_result = "WIN" if pnl_usd >= 0 else "LOSS"
+
+                    if bot_id == BTC5M_LATE_BOT_ID:
+                        _btc5m_result = _crypto_result
+                        logging.warning(
+                            "BTC5M_SETTLED position_id=%s result=%s pnl=%.4f "
+                            "slug=%s side=%s start_price=%.2f end_price=%.2f",
+                            row_id,
+                            _btc5m_result,
+                            pnl_usd,
+                            market_slug or "",
+                            row.get("side") or "",
+                            start_price or 0.0,
+                            end_price or 0.0,
+                        )
+                        logging.warning(
+                            "BTC5M_SIMPLE_SETTLED slug=%s side=%s result=%s pnl=%.4f",
+                            market_slug or "",
+                            str(row.get("side") or "").upper(),
+                            _btc5m_result,
+                            pnl_usd,
+                        )
+                        # ── Trade Intent settlement link ──────────────────────────
+                        # Match by paper_position_id stored in trade_intents.
+                        def _btc5m_settle_intent(pos_id: str, result: str, pnl: float) -> None:
+                            try:
+                                _upd = {
+                                    "paper_status":    "CLOSED",
+                                    "paper_pnl_usd":   pnl,
+                                    "paper_closed_at": utc_now_iso(),
+                                    "paper_result":    result,
+                                    "updated_at":      utc_now_iso(),
+                                }
+                                supabase.table("trade_intents").update(_upd).eq(
+                                    "paper_position_id", str(pos_id)
+                                ).execute()
+                                logging.warning(
+                                    "TRADE_INTENT_SETTLED intent_id=lookup "
+                                    "result=%s pnl=%.4f",
+                                    result, pnl,
+                                )
+                            except Exception:
+                                logging.warning(
+                                    "TRADE_INTENT_SETTLE_FAIL pos_id=%s — "
+                                    "settlement link failed (position settled ok)",
+                                    pos_id,
+                                )
+                        asyncio.ensure_future(asyncio.to_thread(
+                            _btc5m_settle_intent, str(row_id), _btc5m_result, pnl_usd,
+                        ))
+                    else:
+                        # ETH / SOL / XRP settlement
+                        logging.warning(
+                            "CRYPTO5M_SETTLED bot_id=%s result=%s pnl=%.4f "
+                            "slug=%s side=%s start_price=%.2f end_price=%.2f "
+                            "shared_account=%s",
+                            bot_id, _crypto_result, pnl_usd,
+                            market_slug or "",
+                            str(row.get("side") or "").upper(),
+                            start_price or 0.0, end_price or 0.0,
+                            CRYPTO_PAPER_ACCOUNT_ID,
+                        )
                 else:
                     update_bot_settings_with_realized_pnl(bot_id, pnl_usd)
 
@@ -15333,9 +15350,20 @@ def _btc5m_late_upsert_status_sync(
                 raw_ss = {}
         merged = {**raw_ss, **snapshot}
 
-        # Enrich with live accounting snapshot (paper_pnl_usd, paper_balance_usd).
-        realized_pnl = float_or_none(existing_row.get("paper_pnl_usd"))
-        balance_snap = float_or_none(existing_row.get("paper_balance_usd"))
+        # Enrich with live accounting snapshot — read from SHARED crypto_paper row.
+        try:
+            shared_resp = (
+                supabase.table("bot_settings")
+                .select("paper_pnl_usd, paper_balance_usd")
+                .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+                .limit(1)
+                .execute()
+            )
+            shared_row = (shared_resp.data or [None])[0]
+        except Exception:
+            shared_row = None
+        realized_pnl = float_or_none(shared_row.get("paper_pnl_usd"))     if shared_row else None
+        balance_snap = float_or_none(shared_row.get("paper_balance_usd"))  if shared_row else None
         if realized_pnl is not None:
             merged["realized_pnl_usd"] = realized_pnl
         if balance_snap is not None:
@@ -15639,9 +15667,35 @@ def _crypto5m_upsert_status_sync(
                 "mode":              "PAPER",
                 "arm_live":          False,
                 "trade_size_usd":    cfg["default_size"],
-                "paper_balance_usd": 100.0,
+                "paper_balance_usd": 0.0,   # balance lives in shared crypto_paper row
+                "paper_pnl_usd":     0.0,   # P/L lives in shared crypto_paper row
                 "strategy_settings": snapshot,
             }).execute()
+            # Also ensure the shared crypto_paper row exists with starting balance.
+            try:
+                _cp_resp = (
+                    supabase.table("bot_settings")
+                    .select("bot_id")
+                    .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+                    .limit(1)
+                    .execute()
+                )
+                if not (_cp_resp.data or []):
+                    supabase.table("bot_settings").insert({
+                        "bot_id":            CRYPTO_PAPER_ACCOUNT_ID,
+                        "is_enabled":        False,
+                        "mode":              "PAPER",
+                        "arm_live":          False,
+                        "trade_size_usd":    0.0,
+                        "paper_balance_usd": CRYPTO_PAPER_STARTING_BALANCE,
+                        "paper_pnl_usd":     0.0,
+                    }).execute()
+                    logging.warning(
+                        "%s_STATUS_WRITE created shared_account=%s balance=%.2f",
+                        log_prefix, CRYPTO_PAPER_ACCOUNT_ID, CRYPTO_PAPER_STARTING_BALANCE,
+                    )
+            except Exception:
+                logging.warning("%s_STATUS_WRITE shared_account_init_failed bot_id=%s", log_prefix, bot_id)
             logging.warning(
                 "%s_STATUS_WRITE action=row_created bot_id=%s slug=%s",
                 log_prefix, bot_id, slug,
@@ -15656,8 +15710,20 @@ def _crypto5m_upsert_status_sync(
                 raw_ss = {}
         merged = {**raw_ss, **snapshot}
 
-        realized_pnl = float_or_none(existing_row.get("paper_pnl_usd"))
-        balance_snap = float_or_none(existing_row.get("paper_balance_usd"))
+        # Enrich with shared crypto paper account balance (not per-bot).
+        try:
+            shared_resp2 = (
+                supabase.table("bot_settings")
+                .select("paper_pnl_usd, paper_balance_usd")
+                .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+                .limit(1)
+                .execute()
+            )
+            shared_row2 = (shared_resp2.data or [None])[0]
+        except Exception:
+            shared_row2 = None
+        realized_pnl = float_or_none(shared_row2.get("paper_pnl_usd"))    if shared_row2 else None
+        balance_snap = float_or_none(shared_row2.get("paper_balance_usd")) if shared_row2 else None
         if realized_pnl is not None:
             merged["realized_pnl_usd"] = realized_pnl
         if balance_snap is not None:
