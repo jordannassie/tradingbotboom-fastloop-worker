@@ -79,8 +79,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import websockets
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     BalanceAllowanceParams,
     OrderArgs,
     OrderType,
@@ -7802,24 +7802,23 @@ def _test_clob_client_compat_selftest() -> None:
     # C1: importable, version readable
     try:
         import importlib.metadata as _imeta
-        _ver = _imeta.version("py-clob-client")
+        _ver = _imeta.version("py-clob-client-v2")
         _ok("C1_importable", f"version={_ver}")
     except Exception as _e:
         _fail_t("C1_importable", str(_e))
         _ver = "0.0.0"
 
-    # C2: version >= 0.34.0
+    # C2: version >= 1.0.0 (V2 starts at 1.0.0)
     try:
         _parts = [int(x) for x in _ver.split(".")[:3]]
-        # Pad to 3 parts
         while len(_parts) < 3:
             _parts.append(0)
-        _min = [0, 34, 0]
+        _min = [1, 0, 0]
         if _parts >= _min:
-            _ok("C2_version_current", f"{_ver} >= 0.34.0")
+            _ok("C2_version_current", f"{_ver} >= 1.0.0 (CLOB V2)")
         else:
             _fail_t("C2_version_current",
-                    f"{_ver} < 0.34.0 — order protocol likely outdated; "
+                    f"{_ver} < 1.0.0 — not a V2 client; "
                     "Polymarket CLOB will reject orders with 'invalid order version'")
     except Exception as _e:
         _fail_t("C2_version_current", f"could not parse version: {_e}")
@@ -7827,7 +7826,7 @@ def _test_clob_client_compat_selftest() -> None:
     # C3: ClobClient constructor signature
     try:
         import inspect as _inspect
-        from py_clob_client.client import ClobClient as _CC
+        from py_clob_client_v2.client import ClobClient as _CC
         _sig = _inspect.signature(_CC.__init__)
         _params = list(_sig.parameters.keys())
         if "signature_type" in _params and "funder" in _params:
@@ -7838,9 +7837,9 @@ def _test_clob_client_compat_selftest() -> None:
     except Exception as _e:
         _fail_t("C3_constructor_params", str(_e))
 
-    # C4: OrderArgs constructable
+    # C4: OrderArgs constructable (V2 alias for OrderArgsV2 — same fields + optional builder_code/metadata)
     try:
-        from py_clob_client.clob_types import OrderArgs as _OA
+        from py_clob_client_v2.clob_types import OrderArgs as _OA
         _oa = _OA(
             token_id  = "0x" + "a" * 64,
             price     = 0.50,
@@ -7854,7 +7853,7 @@ def _test_clob_client_compat_selftest() -> None:
 
     # C5: OrderType.GTC
     try:
-        from py_clob_client.clob_types import OrderType as _OT
+        from py_clob_client_v2.clob_types import OrderType as _OT
         _gtc = _OT.GTC
         _ok("C5_ordertype_gtc", f"GTC={_gtc}")
     except Exception as _e:
@@ -7862,21 +7861,21 @@ def _test_clob_client_compat_selftest() -> None:
 
     # C6: BalanceAllowanceParams
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams as _BAP
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams as _BAP
         _ok("C6_balance_allowance_params")
     except Exception as _e:
         _fail_t("C6_balance_allowance_params", str(_e))
 
     # C7: AssetType
     try:
-        from py_clob_client.clob_types import AssetType as _AT
+        from py_clob_client_v2.clob_types import AssetType as _AT
         _ok("C7_asset_type")
     except Exception as _e:
         _fail_t("C7_asset_type", str(_e))
 
     # C8/C9: ClobClient has create_order and post_order methods
     try:
-        from py_clob_client.client import ClobClient as _CC2
+        from py_clob_client_v2.client import ClobClient as _CC2
         _has_create = callable(getattr(_CC2, "create_order", None))
         _has_post   = callable(getattr(_CC2, "post_order", None))
         if _has_create:
@@ -7894,7 +7893,8 @@ def _test_clob_client_compat_selftest() -> None:
     _ok("C10_no_real_order")
 
     logging.warning(
-        "CLOB_COMPAT_SELFTEST_SUMMARY version=%s pass=%d fail=%d result=%s",
+        "CLOB_COMPAT_SELFTEST_SUMMARY api_version=2 package=py-clob-client-v2"
+        " version=%s pass=%d fail=%d result=%s",
         _ver, _pass, _fail,
         "ALL_PASS" if _fail == 0 else "FAILURES_DETECTED",
     )
@@ -17792,6 +17792,7 @@ _btc5m_late_rotated_at: float | None = None    # wall-clock time of last success
 _btc5m_late_snapshot_written_at: float = 0.0   # monotonic time of last status snapshot write
 _btc5m_late_last_tick_mono: float = 0.0        # supervisor watchdog: updated every tick
 _btc5m_late_rotation_attempts: int = 0         # consecutive ticks market_data=None after rotation
+_btc5m_late_live_attempted_this_market: bool = False  # one LIVE attempt per slug; reset on rotation
 # Global execution mode cache — refreshed every 30s so BTC5M_HEALTH always
 # shows the real PAPER/LIVE toggle state, not the per-bot mode column.
 _btc5m_late_exec_mode_cache: str   = CRYPTO_EXECUTION_MODE_DEFAULT
@@ -18324,6 +18325,7 @@ def _fresh_crypto5m_state() -> dict:
         # Rotation / entry state
         "has_position_this_market":  False,    # True after PAPER_POSITION_OPENED for current slug
         "rotation_attempts":         0,        # how many ticks we've tried to find the new market
+        "live_attempted_this_market": False,   # True once a LIVE submission was attempted this slug
         # Global execution mode cache (refreshed every 30s; avoids reading DB every 5s tick)
         "exec_mode_cache":           CRYPTO_EXECUTION_MODE_DEFAULT,
         "exec_mode_cache_ts":        0.0,
@@ -19149,6 +19151,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 state["last_reason"]                = "NEW_MARKET"
                 state["has_position_this_market"]   = False   # reset for new market
                 state["rotation_attempts"]          = 0
+                state["live_attempted_this_market"] = False   # allow live on new market
                 state["last_status_ts"]             = 0.0    # force immediate snapshot
 
             # ── 3. Fetch price data + market data ─────────────────────────────
@@ -19557,20 +19560,28 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                 # Gate 7 inside _crypto5m_live_entry checks LIVE_OPEN only, so
                 # the just-created PAPER position does not block LIVE entry.
                 if _live_enabled:
-                    _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
-                    _live_ok, _live_row_id = await _crypto5m_live_entry(
-                        bot_id      = bot_id,
-                        strategy_id = strategy_id,
-                        slug        = slug,
-                        side        = side,
-                        entry_price = entry_price,
-                        trade_size  = trade_size,
-                        start_ts    = start_ts,
-                        token_id    = _live_tok,
-                        log_prefix  = log_prefix,
-                    )
-                    if _live_ok:
-                        state["last_reason"] = "LIVE_ORDER_SUBMITTED"
+                    if state.get("live_attempted_this_market"):
+                        logging.warning(
+                            "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
+                            " reason=live_already_attempted_this_market",
+                            bot_id, slug, _side_label,
+                        )
+                    else:
+                        state["live_attempted_this_market"] = True
+                        _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
+                        _live_ok, _live_row_id = await _crypto5m_live_entry(
+                            bot_id      = bot_id,
+                            strategy_id = strategy_id,
+                            slug        = slug,
+                            side        = side,
+                            entry_price = entry_price,
+                            trade_size  = trade_size,
+                            start_ts    = start_ts,
+                            token_id    = _live_tok,
+                            log_prefix  = log_prefix,
+                        )
+                        if _live_ok:
+                            state["last_reason"] = "LIVE_ORDER_SUBMITTED"
                 else:
                     logging.warning(
                         "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
@@ -19759,7 +19770,7 @@ async def btc_5m_late_loop() -> None:
     global _btc5m_late_last_slug, _btc5m_late_last_health_ts
     global _btc5m_late_last_status_ts, _btc5m_late_last_decision, _btc5m_late_last_reason
     global _btc5m_late_rotated_at, _btc5m_late_snapshot_written_at, _btc5m_late_last_tick_mono
-    global _btc5m_late_rotation_attempts
+    global _btc5m_late_rotation_attempts, _btc5m_late_live_attempted_this_market
     global _btc5m_late_exec_mode_cache, _btc5m_late_exec_mode_cache_ts
 
     if not BTC5M_LATE_ENABLED:
@@ -19860,6 +19871,7 @@ async def btc_5m_late_loop() -> None:
                 if market_data is not None:
                     _btc5m_late_rotated_at = now_f
                     _btc5m_late_rotation_attempts = 0
+                    _btc5m_late_live_attempted_this_market = False  # allow live on new market
                     logging.warning(
                         "BTC5M_MARKET_ROTATED old_slug=%s new_slug=%s "
                         "market_start=%s market_end=%s "
@@ -20438,20 +20450,28 @@ async def btc_5m_late_loop() -> None:
             # Gate 7 inside _crypto5m_live_entry checks LIVE_OPEN only, so
             # the just-created PAPER position does NOT block LIVE entry.
             if _live_enabled:
-                _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
-                _live_ok, _live_row_id = await _crypto5m_live_entry(
-                    bot_id      = BTC5M_LATE_BOT_ID,
-                    strategy_id = BTC5M_LATE_STRATEGY_ID,
-                    slug        = slug,
-                    side        = side,
-                    entry_price = entry_price,
-                    trade_size  = trade_size,
-                    start_ts    = start_ts,
-                    token_id    = _live_token_id,
-                    log_prefix  = "BTC5M",
-                )
-                if _live_ok:
-                    _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
+                if _btc5m_late_live_attempted_this_market:
+                    logging.warning(
+                        "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
+                        " reason=live_already_attempted_this_market",
+                        BTC5M_LATE_BOT_ID, slug, _btc_side_label,
+                    )
+                else:
+                    _btc5m_late_live_attempted_this_market = True
+                    _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
+                    _live_ok, _live_row_id = await _crypto5m_live_entry(
+                        bot_id      = BTC5M_LATE_BOT_ID,
+                        strategy_id = BTC5M_LATE_STRATEGY_ID,
+                        slug        = slug,
+                        side        = side,
+                        entry_price = entry_price,
+                        trade_size  = trade_size,
+                        start_ts    = start_ts,
+                        token_id    = _live_token_id,
+                        log_prefix  = "BTC5M",
+                    )
+                    if _live_ok:
+                        _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
             else:
                 logging.warning(
                     "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
@@ -20596,9 +20616,15 @@ async def main():
     # ── CLOB client version — first thing logged so it's visible in Railway ──
     try:
         import importlib.metadata as _imeta
-        _clob_ver = _imeta.version("py-clob-client")
+        _clob_ver = _imeta.version("py-clob-client-v2")
     except Exception:
         _clob_ver = "unknown"
+    logging.warning(
+        "POLYMARKET_CLOB_API_VERSION version=2"
+    )
+    logging.warning(
+        "POLYMARKET_CLOB_CLIENT_PACKAGE name=py-clob-client-v2 version=%s", _clob_ver
+    )
     logging.warning(
         "POLYMARKET_CLOB_CLIENT_VERSION version=%s", _clob_ver
     )
