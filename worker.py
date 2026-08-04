@@ -6893,6 +6893,9 @@ def _test_crypto_execution_path_selftest() -> None:
     T8  An exception after decision logs CRYPTO_EXECUTION_ABORTED.
     T9  BTC, ETH, SOL, XRP loops all have CRYPTO_DECISION_CREATED in source.
     T10 No real order is submitted in these tests.
+    T11 Old TOKEN_IDS_MISSING gate removed from generic loop.
+    T12 Dual dedup variables present; LIVE path independent of paper dedup.
+    T13 Simulation: paper exists + LIVE ON + no live pos → live runs (regression).
     """
     _pass_ct = 0
     _fail_ct = 0
@@ -7116,6 +7119,82 @@ def _test_crypto_execution_path_selftest() -> None:
     else:
         _f("T12_btc_live_path_independent_of_paper",
            "LIVE path still coupled to paper dedup in BTC loop")
+
+    # T13: Concrete simulation — paper exists, LIVE ON, no live position → live runs.
+    # This is the exact regression for the bug that was fixed:
+    #   Step 10 old code: already_traded=True → continue (LIVE never reached)
+    #   Step 10 new code: _has_paper=True, _has_live=False, _live_needed=True → do NOT continue
+    #
+    # Simulates the dedup logic in the fixed generic loop:
+    def _sim_dedup(has_paper: bool, has_live: bool, live_enabled: bool) -> dict:
+        _paper_needed = not has_paper
+        _live_needed  = live_enabled and not has_live
+        skip_all      = not _paper_needed and not _live_needed
+        return {
+            "skip_all":     skip_all,
+            "paper_needed": _paper_needed,
+            "live_needed":  _live_needed,
+        }
+
+    # Case A: paper exists, live ON, no live pos → must NOT skip, must attempt live
+    _ca = _sim_dedup(has_paper=True, has_live=False, live_enabled=True)
+    if not _ca["skip_all"] and _ca["live_needed"]:
+        _p("T13_paper_exists_live_on_no_live_pos__live_runs")
+    else:
+        _f("T13_paper_exists_live_on_no_live_pos__live_runs",
+           f"skip_all={_ca['skip_all']} live_needed={_ca['live_needed']}")
+
+    # Case B: paper exists, live ON, live pos exists → skip all
+    _cb = _sim_dedup(has_paper=True, has_live=True, live_enabled=True)
+    if _cb["skip_all"]:
+        _p("T13_paper_and_live_exist__skip_all")
+    else:
+        _f("T13_paper_and_live_exist__skip_all",
+           f"skip_all={_cb['skip_all']}")
+
+    # Case C: paper exists, live OFF → skip all
+    _cc = _sim_dedup(has_paper=True, has_live=False, live_enabled=False)
+    if _cc["skip_all"]:
+        _p("T13_paper_exists_live_off__skip_all")
+    else:
+        _f("T13_paper_exists_live_off__skip_all",
+           f"skip_all={_cc['skip_all']}")
+
+    # Case D: neither exists, live ON → create both
+    _cd = _sim_dedup(has_paper=False, has_live=False, live_enabled=True)
+    if not _cd["skip_all"] and _cd["paper_needed"] and _cd["live_needed"]:
+        _p("T13_neither_exists_live_on__create_both")
+    else:
+        _f("T13_neither_exists_live_on__create_both",
+           f"skip_all={_cd['skip_all']} paper={_cd['paper_needed']} live={_cd['live_needed']}")
+
+    # Confirm: CRYPTO_LIVE_SKIPPED appears in both loops (live_off log)
+    if "CRYPTO_LIVE_SKIPPED" in _src and "live_off" in _src:
+        _p("T13_eth_live_skipped_log_present")
+    else:
+        _f("T13_eth_live_skipped_log_present",
+           "CRYPTO_LIVE_SKIPPED reason=live_off missing from generic loop")
+
+    if "CRYPTO_LIVE_SKIPPED" in _btc_src and "live_off" in _btc_src:
+        _p("T13_btc_live_skipped_log_present")
+    else:
+        _f("T13_btc_live_skipped_log_present",
+           "CRYPTO_LIVE_SKIPPED reason=live_off missing from BTC loop")
+
+    # Confirm: CRYPTO_LIVE_ORDER_SUBMITTED / CRYPTO_LIVE_ORDER_FAILED
+    # (renamed from CRYPTO_LIVE_ENTRY_SUBMITTED / CRYPTO_LIVE_ENTRY_FAILED)
+    _live_entry_src = inspect.getsource(_crypto5m_live_entry)
+    if "CRYPTO_LIVE_ORDER_SUBMITTED" in _live_entry_src:
+        _p("T13_live_order_submitted_log_correct_name")
+    else:
+        _f("T13_live_order_submitted_log_correct_name",
+           "CRYPTO_LIVE_ORDER_SUBMITTED not found in _crypto5m_live_entry")
+
+    if "CRYPTO_LIVE_ORDER_FAILED" in _live_entry_src:
+        _p("T13_live_order_failed_log_correct_name")
+    else:
+        _f("T13_live_order_failed_log_correct_name",
+           "CRYPTO_LIVE_ORDER_FAILED not found in _crypto5m_live_entry")
 
     logging.warning(
         "EXEC_PATH_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
@@ -18799,7 +18878,7 @@ async def _crypto5m_live_entry(
     if not ok:
         err_msg = raw_resp.get("error", "unknown") if isinstance(raw_resp, dict) else str(raw_resp)
         logging.warning(
-            "CRYPTO_LIVE_ENTRY_FAILED bot_id=%s market=%s side=%s error=%s",
+            "CRYPTO_LIVE_ORDER_FAILED bot_id=%s market=%s side=%s error=%s",
             bot_id, slug,
             "UP" if side == "yes" else "DOWN",
             err_msg,
@@ -18809,7 +18888,7 @@ async def _crypto5m_live_entry(
     order_id = _extract_order_id(raw_resp) if isinstance(raw_resp, dict) else None
 
     logging.warning(
-        "CRYPTO_LIVE_ENTRY_SUBMITTED bot_id=%s market=%s side=%s "
+        "CRYPTO_LIVE_ORDER_SUBMITTED bot_id=%s market=%s side=%s "
         "order_id=%s price=%.4f shares=%.4f size_usd=%.2f",
         bot_id, slug,
         "UP" if side == "yes" else "DOWN",
@@ -19362,6 +19441,12 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                     )
                     if _live_ok:
                         state["last_reason"] = "LIVE_ORDER_SUBMITTED"
+                else:
+                    logging.warning(
+                        "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
+                        " reason=live_off",
+                        bot_id, slug, _side_label,
+                    )
 
             except Exception as _exec_exc:
                 logging.warning(
@@ -20237,6 +20322,12 @@ async def btc_5m_late_loop() -> None:
                 )
                 if _live_ok:
                     _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
+            else:
+                logging.warning(
+                    "CRYPTO_LIVE_SKIPPED bot_id=%s market=%s side=%s"
+                    " reason=live_off",
+                    BTC5M_LATE_BOT_ID, slug, _btc_side_label,
+                )
 
         except Exception as _loop_exc:
             logging.warning(
