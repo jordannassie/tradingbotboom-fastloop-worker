@@ -16883,7 +16883,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
 # One crashed or frozen asset never blocks the other three.
 # =============================================================================
 
-CRYPTO_TASK_STALE_SECS: float = 30.0   # cancel inner task if no tick for this long
+CRYPTO_TASK_STALE_SECS: float = 70.0   # must exceed max possible tick time (15+10+10+10 = 45s worst case)
 
 
 async def _supervised_crypto_loop(asset_key: str) -> None:
@@ -16987,6 +16987,10 @@ async def _supervised_crypto_loop(asset_key: str) -> None:
 
         if restart_count > 1:
             logging.warning("CRYPTO_ASSET_TASK_RECOVERED asset=%s", asset)
+            logging.warning(
+                "CRYPTO_TRACKING_RECOVERY_OK asset=%s slug=%s",
+                asset, state.get("last_slug") or "none",
+            )
 
 
 async def eth_5m_loop() -> None:
@@ -17615,8 +17619,10 @@ async def btc_5m_late_supervised_loop() -> None:
     Supervised wrapper for btc_5m_late_loop.
 
     Mirrors _supervised_crypto_loop: monitors _btc5m_late_last_tick_mono and
-    cancels + restarts the inner task if it becomes stale (>30 s without a tick).
+    cancels + restarts the inner task if it becomes stale (>CRYPTO_TASK_STALE_SECS
+    without a tick).
     """
+    global _btc5m_late_last_tick_mono   # needed so we can reset it on restart
     asset = "BTC"
     restart_count = 0
 
@@ -17634,6 +17640,10 @@ async def btc_5m_late_supervised_loop() -> None:
                 asset, restart_count,
             )
             await asyncio.sleep(2.0)
+
+        # Reset last_tick_mono so the 10-s watchdog never fires immediately
+        # after a restart on a stale value from the previous run.
+        _btc5m_late_last_tick_mono = _monotonic()
 
         inner = asyncio.create_task(
             btc_5m_late_loop(),
@@ -17702,6 +17712,10 @@ async def btc_5m_late_supervised_loop() -> None:
 
         if restart_count > 1:
             logging.warning("CRYPTO_ASSET_TASK_RECOVERED asset=BTC")
+            logging.warning(
+                "CRYPTO_TRACKING_RECOVERY_OK asset=BTC slug=%s",
+                _btc5m_late_last_slug or "none",
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -17717,6 +17731,16 @@ async def main():
         "env_COPY_TRADE_ENABLED=%s env_COPY_LIVE_ENABLED=%s",
         COPY_TRADE_ENABLED,
         COPY_LIVE_ENABLED,
+    )
+    # ── Definitive supervisor version marker ─────────────────────────────────
+    # This log appears ONCE at startup.  Search for it in Railway to confirm
+    # the exact committed code is running.  Commit: 18d3d8d → next will differ.
+    logging.warning(
+        "CRYPTO_SUPERVISOR_BOOT version=supervised_loops_v2"
+        " stale_threshold=%.0fs"
+        " settlement=threaded"
+        " btc=supervised eth=supervised sol=supervised xrp=supervised",
+        CRYPTO_TASK_STALE_SECS,
     )
 
     # ── Paper sizing self-test (runs once at startup, no DB access) ───────────
