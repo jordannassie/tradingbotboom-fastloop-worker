@@ -16573,6 +16573,10 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                         "%s_MARKET_EXPIRED old_slug=%s market_end=%s",
                         log_prefix, old_slug, start_ts,
                     )
+                    logging.warning(
+                        "CRYPTO_ROTATION_FORCED asset=%s old=%s new=%s",
+                        asset_label, old_slug, slug,
+                    )
                 state["last_slug"]      = slug
                 state["last_decision"]  = "NONE"
                 state["last_reason"]    = "NEW_MARKET"
@@ -16631,11 +16635,12 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
             trade_size = float(settings.get("trade_size_usd") or default_size)
 
             # ── 5. Health state ───────────────────────────────────────────────
+            # NOTE: per-bot "mode" is no longer used as an entry gate.
+            # Global crypto_execution_mode (PAPER/LIVE) controls routing.
+            # Per-bot settings: is_enabled + trade_size_usd only.
             in_window = (20 < remaining <= 35)
             if not is_enabled:
                 health_state = "STRATEGY_DISABLED"
-            elif mode != "PAPER":
-                health_state = "WRONG_MODE"
             elif ref_price is None:
                 health_state = "PRICE_TO_BEAT_MISSING"
             elif spot_price is None:
@@ -16686,21 +16691,34 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
             if not in_window:
                 continue
 
-            # ── 9. Entry gates ────────────────────────────────────────────────
+            # ── 9. Entry gates (global mode controls execution; is_enabled per-bot) ──
             if not is_enabled:
                 state["last_reason"] = "STRATEGY_DISABLED"
-                continue
-            if mode != "PAPER":
-                state["last_reason"] = "WRONG_MODE"
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=bot_disabled",
+                    bot_id, slug,
+                )
                 continue
             if ref_price is None:
                 state["last_reason"] = "PRICE_TO_BEAT_MISSING"
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=invalid_price source=ref",
+                    bot_id, slug,
+                )
                 continue
             if spot_price is None:
                 state["last_reason"] = "REFERENCE_PRICE_MISSING"
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=invalid_price source=spot",
+                    bot_id, slug,
+                )
                 continue
             if market_data is None:
                 state["last_reason"] = "MARKET_NOT_FOUND"
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=market_not_found",
+                    bot_id, slug,
+                )
                 continue
 
             # ── 10. One-trade-per-market check ────────────────────────────────
@@ -16710,23 +16728,31 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
-                logging.warning("%s_DUP_CHECK_TIMEOUT slug=%s", log_prefix, slug)
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=dup_check_timeout",
+                    bot_id, slug,
+                )
                 continue
             if already_traded:
                 state["last_reason"] = "ALREADY_TRADED_MARKET"
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists",
+                    bot_id, slug,
+                )
                 continue
 
             # ── 10b. Token completeness gate ──────────────────────────────────
             # Do not enter if either token ID is missing — market data is
             # incomplete and LIVE mode would fail; PAPER skips to be consistent.
             if up_token_id is None or down_token_id is None:
+                state["last_reason"] = "TOKEN_IDS_MISSING"
                 logging.warning(
-                    "%s_TOKEN_MISSING slug=%s up=%s down=%s — deferring entry",
-                    log_prefix, slug,
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=token_missing"
+                    " up=%s down=%s",
+                    bot_id, slug,
                     "present" if up_token_id else "missing",
                     "present" if down_token_id else "missing",
                 )
-                state["last_reason"] = "TOKEN_IDS_MISSING"
                 continue
 
             # ── 11. Direction decision ────────────────────────────────────────
@@ -16764,18 +16790,13 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
 
             if decision == "SKIP":
                 logging.warning(
-                    "%s_SKIP slug=%s reason=%s seconds_left=%s",
-                    log_prefix, slug, state["last_reason"], remaining,
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=%s seconds_left=%s",
+                    bot_id, slug, state["last_reason"], remaining,
                 )
                 continue
 
-            # ── 12. Open position (PAPER or LIVE based on global execution mode) ─────
+            # ── 12. Build shared trade instruction then route PAPER or LIVE ──────────
             assert side is not None and entry_price is not None
-            logging.warning(
-                "%s_ENTRY_ATTEMPT slug=%s side=%s entry_price=%.4f size=%s seconds_left=%s",
-                log_prefix, slug, "UP" if side == "yes" else "DOWN",
-                entry_price, trade_size, remaining,
-            )
 
             # Read global execution mode — defaults to PAPER on timeout/error.
             try:
@@ -16789,12 +16810,15 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                     "%s_EXEC_MODE_TIMEOUT — defaulting to %s",
                     log_prefix, _exec_mode,
                 )
+
+            # ONE shared instruction built before PAPER/LIVE split.
+            # PAPER and LIVE receive identical market/side/timing/size/decision.
+            _side_label = "UP" if side == "yes" else "DOWN"
             logging.warning(
-                "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
-                "size=%.4f mode=%s",
-                bot_id, slug,
-                "UP" if side == "yes" else "DOWN",
-                trade_size, _exec_mode,
+                "CRYPTO_TRADE_INSTRUCTION bot_id=%s market=%s side=%s "
+                "size=%.4f mode=%s entry_price=%.4f seconds_left=%s",
+                bot_id, slug, _side_label, trade_size, _exec_mode,
+                entry_price, remaining,
             )
 
             if _exec_mode == "LIVE":
@@ -16833,11 +16857,16 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                     state["last_decision"] = decision
                     state["last_reason"]   = "PAPER_POSITION_OPENED"
                     logging.warning(
+                        "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
+                        "position_id=%s side=%s size=%.4f entry_price=%.4f",
+                        bot_id, slug, row_id or "?",
+                        _side_label, trade_size, entry_price,
+                    )
+                    logging.warning(
                         "%s_ENTRY position_id=%s side=%s size_usd=%s "
                         "entry_price=%.4f seconds_left=%s slug=%s",
                         log_prefix, row_id or "?",
-                        ("UP" if side == "yes" else "DOWN"),
-                        trade_size, entry_price, remaining, slug,
+                        _side_label, trade_size, entry_price, remaining, slug,
                     )
                     # Publish snapshot immediately after opening
                     try:
@@ -17085,6 +17114,10 @@ async def btc_5m_late_loop() -> None:
                         "detected_at=%s",
                         old_slug, start_ts, now_int,
                     )
+                    logging.warning(
+                        "CRYPTO_ROTATION_FORCED asset=BTC old=%s new=%s",
+                        old_slug, slug,
+                    )
                 _btc5m_late_last_slug = slug  # update immediately; rotation confirmed below
 
             # ── 3. Fetch price data + market prices (ALWAYS) ──────────────────
@@ -17184,8 +17217,6 @@ async def btc_5m_late_loop() -> None:
 
             if not is_enabled:
                 health_state = "STRATEGY_DISABLED"
-            elif mode != "PAPER":
-                health_state = "WRONG_MODE"
             elif ref_price is None:
                 health_state = "PRICE_TO_BEAT_MISSING"
             elif btc_price is None:
@@ -17272,15 +17303,9 @@ async def btc_5m_late_loop() -> None:
                     "seconds_left=%s",
                     slug, remaining,
                 )
-                continue
-
-            # ── 11. PAPER-mode gate (LIVE always blocked) ─────────────────────
-            if mode != "PAPER":
-                _btc5m_late_last_reason = "WRONG_MODE"
                 logging.warning(
-                    "BTC5M_SIMPLE_SKIP slug=%s reason=WRONG_MODE "
-                    "mode=%s seconds_left=%s",
-                    slug, mode, remaining,
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=bot_disabled",
+                    BTC5M_LATE_BOT_ID, slug,
                 )
                 continue
 
@@ -17292,6 +17317,10 @@ async def btc_5m_late_loop() -> None:
                     "seconds_left=%s",
                     slug, remaining,
                 )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=invalid_price source=ref",
+                    BTC5M_LATE_BOT_ID, slug,
+                )
                 continue
 
             if btc_price is None:
@@ -17301,6 +17330,10 @@ async def btc_5m_late_loop() -> None:
                     "seconds_left=%s",
                     slug, remaining,
                 )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=invalid_price source=spot",
+                    BTC5M_LATE_BOT_ID, slug,
+                )
                 continue
 
             if market_data is None:
@@ -17309,6 +17342,10 @@ async def btc_5m_late_loop() -> None:
                     "BTC5M_SIMPLE_SKIP slug=%s reason=MARKET_NOT_FOUND "
                     "seconds_left=%s",
                     slug, remaining,
+                )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=market_not_found",
+                    BTC5M_LATE_BOT_ID, slug,
                 )
                 continue
 
@@ -17326,6 +17363,10 @@ async def btc_5m_late_loop() -> None:
                     "seconds_left=%s",
                     slug, remaining,
                 )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=dup_check_timeout",
+                    BTC5M_LATE_BOT_ID, slug,
+                )
                 continue
             if already_traded:
                 _btc5m_late_last_reason = "ALREADY_TRADED_MARKET"
@@ -17333,6 +17374,10 @@ async def btc_5m_late_loop() -> None:
                     "BTC5M_SIMPLE_SKIP slug=%s reason=ALREADY_TRADED_MARKET "
                     "seconds_left=%s",
                     slug, remaining,
+                )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=position_already_exists",
+                    BTC5M_LATE_BOT_ID, slug,
                 )
                 continue
 
@@ -17390,9 +17435,13 @@ async def btc_5m_late_loop() -> None:
                     "BTC5M_SIMPLE_SKIP slug=%s reason=%s seconds_left=%s",
                     slug, _btc5m_late_last_reason, remaining,
                 )
+                logging.warning(
+                    "CRYPTO_ENTRY_SKIP bot_id=%s market=%s reason=%s seconds_left=%s",
+                    BTC5M_LATE_BOT_ID, slug, _btc5m_late_last_reason, remaining,
+                )
                 continue
 
-            # ── 16. Open position (PAPER or LIVE based on global execution mode) ─────
+            # ── 16. Build shared trade instruction then route PAPER or LIVE ──────────
             assert side is not None and entry_price is not None
             logging.warning(
                 "BTC5M_SIZE configured_size_usd=%s final_size_usd=%s "
@@ -17411,12 +17460,15 @@ async def btc_5m_late_loop() -> None:
                 logging.warning(
                     "BTC5M_EXEC_MODE_TIMEOUT — defaulting to %s", _exec_mode
                 )
+
+            # ONE shared instruction built before PAPER/LIVE split.
+            # PAPER and LIVE receive identical market/side/timing/size/decision.
+            _btc_side_label = "UP" if side == "yes" else "DOWN"
             logging.warning(
-                "CRYPTO_EXECUTION_DECISION bot_id=%s market=%s side=%s "
-                "size=%.4f mode=%s",
-                BTC5M_LATE_BOT_ID, slug,
-                "UP" if side == "yes" else "DOWN",
-                trade_size, _exec_mode,
+                "CRYPTO_TRADE_INSTRUCTION bot_id=%s market=%s side=%s "
+                "size=%.4f mode=%s entry_price=%.4f seconds_left=%s",
+                BTC5M_LATE_BOT_ID, slug, _btc_side_label, trade_size, _exec_mode,
+                entry_price, remaining,
             )
 
             if _exec_mode == "LIVE":
@@ -17509,6 +17561,12 @@ async def btc_5m_late_loop() -> None:
                         entry_price,
                         remaining,
                         row_id or "?",
+                    )
+                    logging.warning(
+                        "CRYPTO_PAPER_ENTRY_CREATED bot_id=%s market=%s "
+                        "position_id=%s side=%s size=%.4f entry_price=%.4f",
+                        BTC5M_LATE_BOT_ID, slug, row_id or "?",
+                        _btc_side_label, trade_size, entry_price,
                     )
                     # ── Trade Intent: update with PAPER result ────────────────────
                     asyncio.ensure_future(asyncio.to_thread(
@@ -17734,12 +17792,14 @@ async def main():
     )
     # ── Definitive supervisor version marker ─────────────────────────────────
     # This log appears ONCE at startup.  Search for it in Railway to confirm
-    # the exact committed code is running.  Commit: 18d3d8d → next will differ.
+    # the exact committed code is running.
     logging.warning(
-        "CRYPTO_SUPERVISOR_BOOT version=supervised_loops_v2"
+        "CRYPTO_SUPERVISOR_BOOT version=unified_trade_instruction_v3"
         " stale_threshold=%.0fs"
         " settlement=threaded"
-        " btc=supervised eth=supervised sol=supervised xrp=supervised",
+        " btc=supervised eth=supervised sol=supervised xrp=supervised"
+        " one_toggle=crypto_execution_mode per_bot=is_enabled+trade_size_only"
+        " logs=CRYPTO_ENTRY_SKIP+CRYPTO_TRADE_INSTRUCTION+CRYPTO_PAPER_ENTRY_CREATED",
         CRYPTO_TASK_STALE_SECS,
     )
 
