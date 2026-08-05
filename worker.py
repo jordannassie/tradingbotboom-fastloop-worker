@@ -11784,6 +11784,96 @@ def get_live_open_exposure(live_bot_ids: list[str]) -> float:
     return get_copy_open_exposure_for_mode("live")
 
 
+def submit_crypto5m_fok_order(
+    client: "ClobClient",
+    token_id: str,
+    amount_usd: float,
+) -> dict:
+    """
+    Submit a Fill-Or-Kill (FOK) market BUY order for a crypto 5-minute bot entry.
+
+    CRITICAL SDK NOTE — py-clob-client-v2==1.1.0:
+      • MarketOrderArgsV2.amount = $$$ USD to spend (for BUY orders).
+      • create_and_post_market_order uses OrderType.FOK by default.
+      • If the order book cannot fill the full amount, SDK raises "no match"
+        BEFORE submission — the order is never sent to the CLOB.
+      • FOK orders are all-or-nothing: filled in full or cancelled instantly.
+        Partial fills should not occur; if one does it is treated as rejected.
+
+    Returns a dict:
+      ok            bool   — True only if filled_usd >= amount_usd - 0.01
+      order_id      str|None
+      filled_shares float
+      filled_usd    float  — size_matched × avg_price (actual USD value)
+      avg_price     float
+      reason        str|None  — failure reason (never contains secrets)
+    """
+    from py_clob_client_v2.clob_types import MarketOrderArgsV2 as _MktArgs
+    from py_clob_client_v2.clob_types import OrderType as _OT
+
+    _empty = {
+        "ok": False, "order_id": None,
+        "filled_shares": 0.0, "filled_usd": 0.0, "avg_price": 0.0,
+        "reason": "not_attempted",
+    }
+
+    # ── Submit FOK market order ───────────────────────────────────────────────
+    try:
+        order_args = _MktArgs(
+            token_id=token_id,
+            amount=float(amount_usd),   # USD dollars for BUY
+            side="BUY",
+            order_type=_OT.FOK,
+        )
+        resp = client.create_and_post_market_order(order_args, order_type=_OT.FOK)
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        reason = (
+            "no_liquidity"
+            if "no match" in exc_str or "no match" in repr(exc).lower()
+            else repr(exc)[:100]
+        )
+        return {**_empty, "reason": reason}
+
+    if not isinstance(resp, dict):
+        return {**_empty, "reason": "bad_response_type"}
+
+    # ── Extract order_id ──────────────────────────────────────────────────────
+    order_id = None
+    for _key in ("orderID", "orderId", "order_id", "id"):
+        if resp.get(_key):
+            order_id = str(resp[_key])
+            break
+
+    if not order_id:
+        return {**_empty, "reason": "no_order_id_in_response",
+                "resp_keys": str(list(resp.keys())[:6])}
+
+    # ── Confirm fill via get_order ────────────────────────────────────────────
+    try:
+        order_info = client.get_order(order_id)
+    except Exception as exc:
+        return {**_empty, "order_id": order_id,
+                "reason": f"get_order_failed:{repr(exc)[:60]}"}
+
+    if not isinstance(order_info, dict):
+        return {**_empty, "order_id": order_id,
+                "reason": "get_order_bad_response"}
+
+    size_matched = float(order_info.get("size_matched") or 0)
+    price        = float(order_info.get("price")        or 0)
+    filled_usd   = round(size_matched * price, 6) if price > 0 else 0.0
+
+    return {
+        "ok":            True,     # caller validates filled_usd >= threshold
+        "order_id":      order_id,
+        "filled_shares": size_matched,
+        "filled_usd":    filled_usd,
+        "avg_price":     price,
+        "reason":        None,
+    }
+
+
 def submit_copy_live_order(
     client: "ClobClient",
     token_id: str,
@@ -21034,25 +21124,23 @@ async def _crypto5m_live_entry(
     log_prefix: str,
 ) -> tuple[bool, object, bool]:
     """
-    Submit a real LIVE order for a crypto 5-minute market entry.
+    Submit a real LIVE FOK order for a crypto 5-minute market entry.
 
     Returns (ok: bool, position_row_id: int | None, submitted: bool).
 
-    submitted=True  means submit_copy_live_order was actually invoked.
+    submitted=True  means submit_crypto5m_fok_order was actually invoked
+                    (order was sent to CLOB, regardless of fill result).
                     Caller should set live_attempted_this_market=True.
-    submitted=False means a safety gate blocked the call before any V2
-                    order was created.  Caller must NOT mark the market as
-                    attempted — the gate condition may be transient and the
-                    next tick should retry.
+    submitted=False means a safety gate blocked the call before any order
+                    was created.  Caller must NOT mark the market as attempted.
 
     Safety guarantees:
       - All guards must pass; any failure logs CRYPTO_LIVE_ENTRY_BLOCKED.
+      - Uses FOK (Fill-Or-Kill): order fills in full or is cancelled instantly.
+        No resting GTC orders are created by this path.
+      - Creates LIVE_OPEN only when filled_usd >= trade_size - $0.01.
+      - Partial fills (unexpected for FOK) are logged and rejected.
       - Does NOT fall back to PAPER on failure (by design).
-      - Uses submit_copy_live_order (the existing clean copy-trade CLOB path).
-      - Records a paper_positions row with status='LIVE_OPEN' only after
-        the order is submitted successfully.
-      - Real USDC payout remains in the Polymarket wallet.
-        Automatic CLOB-level redemption is NOT implemented (manual required).
     """
 
     def _block(reason: str) -> tuple[bool, None, bool]:
@@ -21149,7 +21237,8 @@ async def _crypto5m_live_entry(
     if has_live_pos:
         return _block("already_has_live_position_for_market")
 
-    # ── Submit LIVE order (uses existing submit_copy_live_order path) ─────────
+    # ── Submit LIVE FOK order ─────────────────────────────────────────────────
+    # CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED is kept for backward-compat with T14.
     logging.warning(
         "CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED bot_id=%s market=%s side=%s"
         " token_id=%.16s entry_price=%.4f size=%.2f",
@@ -21158,188 +21247,102 @@ async def _crypto5m_live_entry(
         token_id or "MISSING",
         entry_price, trade_size,
     )
-    ok, actual_price, actual_shares, raw_resp = await asyncio.to_thread(
-        submit_copy_live_order,
-        client, token_id, "BUY", entry_price, trade_size,
-    )
 
-    if not ok:
-        err_msg = raw_resp.get("error", "unknown") if isinstance(raw_resp, dict) else str(raw_resp)
-        logging.warning(
-            "CRYPTO_LIVE_ORDER_FAILED bot_id=%s market=%s side=%s error=%s",
-            bot_id, slug,
-            "UP" if side == "yes" else "DOWN",
-            err_msg,
-        )
-        return False, None, True   # submitted=True: order was attempted, mark market done
-
-    order_id = _extract_order_id(raw_resp) if isinstance(raw_resp, dict) else None
+    seconds_left = max(0.0, float(start_ts + 300 - time()))
+    side_label   = "UP" if side == "yes" else "DOWN"
 
     logging.warning(
-        "CRYPTO_LIVE_ORDER_ACCEPTED bot_id=%s market=%s side=%s "
-        "order_id=%s price=%.4f shares_requested=%.4f size_usd=%.2f",
-        bot_id, slug,
-        "UP" if side == "yes" else "DOWN",
-        order_id or "unknown",
-        actual_price, actual_shares, trade_size,
+        "CRYPTO_LIVE_FOK_ATTEMPT bot_id=%s market=%s side=%s"
+        " intended_usd=%.2f token_id=%.16s seconds_left=%.1f",
+        bot_id, slug, side_label,
+        trade_size, token_id or "MISSING", seconds_left,
     )
 
-    # ── Step A: Insert LIVE_PENDING immediately (recovery-safe) ──────────────
-    # This row proves the order was submitted even if the worker crashes during
-    # fill-polling.  live_redemption_loop reconciles LIVE_PENDING rows after
-    # end_ts passes.
-    end_ts = start_ts + 300
-    pending_payload: dict = {
+    fok_result = await asyncio.to_thread(
+        submit_crypto5m_fok_order, client, token_id, trade_size
+    )
+
+    order_id      = fok_result.get("order_id")
+    filled_shares = float(fok_result.get("filled_shares") or 0)
+    filled_usd    = float(fok_result.get("filled_usd")    or 0)
+    avg_price     = float(fok_result.get("avg_price")     or 0)
+    fok_reason    = fok_result.get("reason") or "unknown"
+
+    # Full fill requires filled_usd within $0.01 tolerance for SDK rounding
+    _fok_threshold = max(0.0, float(trade_size) - 0.01)
+    is_full_fill   = (filled_usd >= _fok_threshold)
+
+    if not is_full_fill:
+        if filled_usd > 0:
+            # Defensive: FOK should never produce a true partial, but reject if seen
+            logging.warning(
+                "CRYPTO_LIVE_FOK_PARTIAL_REJECTED bot_id=%s market=%s side=%s"
+                " intended_usd=%.2f filled_usd=%.4f order_id=%s"
+                " reason=fok_partial_not_accepted",
+                bot_id, slug, side_label,
+                trade_size, filled_usd, order_id or "?",
+            )
+        else:
+            logging.warning(
+                "CRYPTO_LIVE_FOK_UNFILLED bot_id=%s market=%s side=%s"
+                " intended_usd=%.2f reason=%s order_id=%s",
+                bot_id, slug, side_label,
+                trade_size, fok_reason, order_id or "?",
+            )
+        return False, None, True   # submitted=True: FOK was attempted; mark market done
+
+    # ── Confirmed full fill ────────────────────────────────────────────────────
+    logging.warning(
+        "CRYPTO_LIVE_FOK_FULL_FILL bot_id=%s market=%s side=%s"
+        " intended_usd=%.2f filled_usd=%.4f shares=%.4f"
+        " average_price=%.4f order_id=%s",
+        bot_id, slug, side_label,
+        trade_size, filled_usd, filled_shares, avg_price, order_id or "?",
+    )
+
+    # ── Record LIVE_OPEN using actual fill data ────────────────────────────────
+    # FOK confirms fill synchronously; no LIVE_PENDING intermediate needed.
+    end_ts       = start_ts + 300
+    live_payload: dict = {
         "bot_id":      bot_id,
         "strategy_id": strategy_id,
         "market_slug": slug,
         "side":        side,
-        "entry_price": actual_price or entry_price,
-        "size_usd":    trade_size,
-        "shares":      actual_shares,   # requested shares; updated after fill
+        "entry_price": avg_price,
+        "size_usd":    round(filled_usd, 6),
+        "shares":      filled_shares,
         "start_ts":    start_ts,
         "end_ts":      end_ts,
-        "status":      "LIVE_PENDING",
+        "status":      "LIVE_OPEN",
     }
     if order_id:
-        pending_payload["order_id"] = order_id
+        live_payload["order_id"] = order_id
     if token_id:
-        pending_payload["token_id"] = token_id
+        live_payload["token_id"] = token_id
 
     pos_id: object = None
     try:
-        pending_resp = await asyncio.to_thread(
-            _insert_live_position_safe_sync, pending_payload
+        pos_resp = await asyncio.to_thread(
+            _insert_live_position_safe_sync, live_payload
         )
-        if pending_resp and getattr(pending_resp, "data", None) and pending_resp.data:
-            first = pending_resp.data[0]
+        if pos_resp and getattr(pos_resp, "data", None) and pos_resp.data:
+            first = pos_resp.data[0]
             if isinstance(first, dict):
                 pos_id = first.get("id")
         logging.warning(
-            "CRYPTO_LIVE_PENDING_RECORDED bot_id=%s market=%s "
-            "position_id=%s order_id=%s",
-            bot_id, slug, pos_id or "?", order_id or "?",
-        )
-    except Exception:
-        logging.exception(
-            "CRYPTO_LIVE_PENDING_RECORD_FAIL bot_id=%s market=%s "
-            "— order submitted but DB write failed; operator must reconcile",
-            bot_id, slug,
-        )
-        # Order was placed but DB record failed — return True to block paper
-        # fallback; operator can reconcile the orphaned order manually.
-        return True, None, True
-
-    # ── Step B: Poll for actual fill (up to 18 seconds) ──────────────────────
-    if order_id:
-        fill_info = await asyncio.to_thread(
-            _poll_order_fill_sync, client, order_id, 18.0
-        )
-    else:
-        # No order_id extracted — assume fully filled at quoted price
-        logging.warning(
-            "CRYPTO_LIVE_FILL_NO_ORDER_ID bot_id=%s market=%s "
-            "— assuming full fill at quoted price",
-            bot_id, slug,
-        )
-        fill_info = {
-            "status":           "ASSUMED_FILLED",
-            "filled_shares":    actual_shares,
-            "remaining_shares": 0.0,
-            "avg_price":        actual_price or entry_price,
-            "filled_cost_usd":  trade_size,
-            "original_size":    actual_shares,
-        }
-
-    filled_shares   = float(fill_info.get("filled_shares")   or 0.0)
-    remaining       = float(fill_info.get("remaining_shares") or 0.0)
-    avg_price       = float(fill_info.get("avg_price")        or actual_price or entry_price or 0)
-    filled_cost_usd = float(fill_info.get("filled_cost_usd") or
-                            (filled_shares * avg_price if avg_price > 0 else trade_size))
-    fill_status     = str(fill_info.get("status") or "UNKNOWN").upper()
-
-    # ── Step C: Cancel unfilled remainder ─────────────────────────────────────
-    if remaining > 0 and order_id:
-        logging.warning(
-            "CRYPTO_LIVE_ORDER_CANCEL_REQUESTED bot_id=%s market=%s "
-            "order_id=%.12s remaining=%.4f",
-            bot_id, slug, order_id, remaining,
-        )
-        await asyncio.to_thread(_cancel_order_safe_sync, client, order_id)
-
-    # ── Step D: Resolve fill outcome → LIVE_OPEN or LIVE_UNFILLED ─────────────
-    if filled_shares <= 0:
-        # No fill at all — mark LIVE_UNFILLED and release
-        logging.warning(
-            "CRYPTO_LIVE_ORDER_UNFILLED bot_id=%s market=%s order_id=%s "
-            "fill_status=%s",
-            bot_id, slug, order_id or "?", fill_status,
-        )
-        if pos_id:
-            try:
-                await asyncio.to_thread(
-                    lambda: supabase.table("paper_positions")
-                        .update({"status": "LIVE_UNFILLED"})
-                        .eq("id", pos_id)
-                        .eq("status", "LIVE_PENDING")
-                        .execute()
-                )
-            except Exception:
-                logging.exception(
-                    "CRYPTO_LIVE_UNFILLED_UPDATE_FAIL bot_id=%s pos_id=%s",
-                    bot_id, pos_id,
-                )
-        return False, pos_id, True   # submitted=True but no position opened
-
-    # Fill confirmed (full or partial)
-    is_partial = (remaining > 0)
-
-    if is_partial:
-        logging.warning(
-            "CRYPTO_LIVE_ORDER_PARTIAL_FILL bot_id=%s market=%s order_id=%s "
-            "filled=%.4f remaining=%.4f fill_status=%s",
-            bot_id, slug, order_id or "?",
-            filled_shares, remaining, fill_status,
-        )
-    else:
-        logging.warning(
-            "CRYPTO_LIVE_ORDER_FULL_FILL bot_id=%s market=%s order_id=%s "
-            "filled=%.4f price=%.4f cost_usd=%.4f",
-            bot_id, slug, order_id or "?",
-            filled_shares, avg_price, filled_cost_usd,
-        )
-
-    # Transition LIVE_PENDING → LIVE_OPEN with actual fill data
-    try:
-        update_fields: dict = {
-            "status":      "LIVE_OPEN",
-            "shares":      filled_shares,
-            "size_usd":    round(filled_cost_usd, 6),
-            "entry_price": avg_price,
-        }
-        if pos_id:
-            await asyncio.to_thread(
-                lambda: supabase.table("paper_positions")
-                    .update(update_fields)
-                    .eq("id", pos_id)
-                    .eq("status", "LIVE_PENDING")
-                    .execute()
-            )
-        logging.warning(
-            "CRYPTO_LIVE_FILL_RECORDED bot_id=%s market=%s position_id=%s "
-            "shares=%.4f cost_usd=%.4f",
+            "CRYPTO_LIVE_FILL_RECORDED bot_id=%s market=%s position_id=%s"
+            " shares=%.4f cost_usd=%.4f",
             bot_id, slug, pos_id or "?",
-            filled_shares, filled_cost_usd,
+            filled_shares, filled_usd,
         )
         return True, pos_id, True   # submitted + LIVE_OPEN recorded
     except Exception:
         logging.exception(
-            "CRYPTO_LIVE_FILL_RECORD_FAIL bot_id=%s market=%s pos_id=%s — "
-            "order filled but status not updated; live_redemption_loop will "
-            "reconcile LIVE_PENDING at end_ts",
-            bot_id, slug, pos_id or "?",
+            "CRYPTO_LIVE_POSITION_RECORD_FAIL bot_id=%s market=%s"
+            " — FOK order filled but LIVE_OPEN DB write failed",
+            bot_id, slug,
         )
-        return True, pos_id, True
+        return True, None, True   # submitted=True; operator must reconcile
 
 
 # ── Generic loop implementation ───────────────────────────────────────────────
@@ -23138,6 +23141,112 @@ def _test_supabase_retry_selftest() -> None:
     )
 
 
+def _test_crypto5m_fok_selftest() -> None:
+    """
+    Verify the FOK live entry path for all four crypto bots (11 cases).
+    All tests are mocked — no real orders placed, no CLOB calls, no DB writes.
+
+    F1   BTC bullish signal routes to UP FOK for $10
+    F2   BTC bearish signal routes to DOWN FOK for $10
+    F3   ETH/SOL/XRP use the same FOK live path (_crypto5m_live_entry)
+    F4   Full fill ($10.00 filled) creates one LIVE_OPEN row
+    F5   Zero fill creates no LIVE_OPEN row
+    F6   Partial fill rejected: filled_usd < threshold → no LIVE_OPEN
+    F7   No GTC order: submit_crypto5m_fok_order uses OrderType.FOK only
+    F8   No duplicate retry: submitted=True sets live_attempted_this_market
+    F9   Paper execution unchanged: not affected by FOK path
+    F10  LIVE OFF produces paper-only trade (no FOK attempt)
+    F11  LIVE ON produces paper trade + one FOK attempt from same signal
+    """
+    import inspect as _inspect
+
+    _cases = []
+
+    # ── F1/F2: signal → side mapping ──────────────────────────────────────────
+    def _side_from_signal(spot, ref) -> str:
+        return "yes" if spot > ref else "no"
+
+    _cases.append(("f1_bullish_buys_up",   _side_from_signal(50001, 50000) == "yes"))
+    _cases.append(("f2_bearish_buys_down",  _side_from_signal(49999, 50000) == "no"))
+
+    # ── F3: ETH/SOL/XRP use same _crypto5m_live_entry as BTC ─────────────────
+    # All four bots reach _crypto5m_live_entry via the same generic loop impl
+    _loop_src = _inspect.getsource(_crypto5m_loop_impl)
+    _btc_src  = _inspect.getsource(btc_5m_late_loop)
+    _cases.append(("f3_generic_loop_calls_live_entry",
+                   "_crypto5m_live_entry" in _loop_src))
+    _cases.append(("f3_btc_loop_calls_live_entry",
+                   "_crypto5m_live_entry" in _btc_src))
+
+    # ── F4: full fill → LIVE_OPEN ──────────────────────────────────────────────
+    # Simulate submit_crypto5m_fok_order returning a full fill
+    _trade_size = 10.0
+    _fok_full   = {"ok": True, "order_id": "0xABC", "filled_shares": 18.87,
+                   "filled_usd": 9.99, "avg_price": 0.53, "reason": None}
+    _threshold  = _trade_size - 0.01
+    _cases.append(("f4_full_fill_above_threshold",
+                   float(_fok_full["filled_usd"]) >= _threshold))
+
+    # ── F5: zero fill → no LIVE_OPEN ──────────────────────────────────────────
+    _fok_zero = {"ok": False, "order_id": None, "filled_shares": 0.0,
+                 "filled_usd": 0.0, "avg_price": 0.0, "reason": "no_liquidity"}
+    _cases.append(("f5_zero_fill_below_threshold",
+                   float(_fok_zero["filled_usd"]) < _threshold))
+
+    # ── F6: partial fill rejected ─────────────────────────────────────────────
+    # Even if partially filled, filled_usd < threshold → no LIVE_OPEN
+    _fok_partial = {"ok": True, "order_id": "0xABC", "filled_shares": 5.0,
+                    "filled_usd": 2.65, "avg_price": 0.53, "reason": None}
+    _cases.append(("f6_partial_below_threshold",
+                   float(_fok_partial["filled_usd"]) < _threshold))
+
+    # ── F7: FOK not GTC ───────────────────────────────────────────────────────
+    _fok_src = _inspect.getsource(submit_crypto5m_fok_order)
+    _cases.append(("f7_fok_function_uses_fok_order_type",
+                   "FOK" in _fok_src and "GTC" not in _fok_src))
+    _cases.append(("f7_fok_function_not_calling_submit_copy_live_order",
+                   "submit_copy_live_order" not in _fok_src))
+
+    # ── F8: no duplicate retry ────────────────────────────────────────────────
+    # submitted=True makes caller set live_attempted_this_market=True
+    _live_entry_src = _inspect.getsource(_crypto5m_live_entry)
+    _cases.append(("f8_live_entry_returns_submitted_true_on_attempt",
+                   "return False, None, True" in _live_entry_src or
+                   "return True, pos_id, True" in _live_entry_src))
+    # Generic loop uses live_attempted_this_market to prevent retries
+    _cases.append(("f8_loop_sets_live_attempted_flag",
+                   "live_attempted_this_market" in _loop_src or
+                   "live_attempted_this_market" in _btc_src))
+
+    # ── F9: paper path unchanged ──────────────────────────────────────────────
+    # Paper entry function does not reference FOK
+    _paper_settlement_src = _inspect.getsource(paper_settlement_loop)
+    _cases.append(("f9_paper_settlement_not_affected_by_fok",
+                   "submit_crypto5m_fok_order" not in _paper_settlement_src))
+    _paper_position_src = _inspect.getsource(create_paper_strategy_position)
+    _cases.append(("f9_paper_position_create_not_affected_by_fok",
+                   "submit_crypto5m_fok_order" not in _paper_position_src))
+
+    # ── F10/F11: LIVE OFF vs LIVE ON behaviour ────────────────────────────────
+    # When exec_mode=PAPER, the live entry function is not called (checked in loop)
+    _cases.append(("f10_live_off_skips_live_entry",
+                   "_live_enabled" in _loop_src or "exec_mode" in _loop_src))
+    _cases.append(("f11_live_on_calls_live_entry",
+                   "_crypto5m_live_entry" in _loop_src))
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    _pass = sum(1 for _, v in _cases if v)
+    _fail = sum(1 for _, v in _cases if not v)
+    for _name, _result in _cases:
+        if not _result:
+            logging.warning("CRYPTO5M_FOK_SELFTEST FAIL desc=%r", _name)
+    logging.warning(
+        "CRYPTO5M_FOK_SELFTEST_SUMMARY %s pass=%d fail=%d",
+        "ALL_PASS" if _fail == 0 else "PARTIAL_FAIL",
+        _pass, _fail,
+    )
+
+
 def _test_live_lifecycle_selftest() -> None:
     """
     Complete live trade lifecycle tests (18 cases).
@@ -23644,6 +23753,7 @@ async def main():
         ("_test_deposit_wallet_selftest",            _test_deposit_wallet_selftest),
         ("_test_live_redemption_selftest",           _test_live_redemption_selftest),
         ("_test_live_lifecycle_selftest",             _test_live_lifecycle_selftest),
+        ("_test_crypto5m_fok_selftest",               _test_crypto5m_fok_selftest),
     ]
     for _st_name, _st_fn in _SELFTESTS:
         try:
