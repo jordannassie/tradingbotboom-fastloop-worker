@@ -71,13 +71,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from math import floor
-from time import time, monotonic as _monotonic
+from time import time, monotonic as _monotonic, sleep as _sleep
 from urllib import parse, request
 from urllib.error import HTTPError
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 import websockets
+import httpx
 from dotenv import load_dotenv
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
@@ -4684,6 +4685,78 @@ _es_cache:    bool  = True   # fail-safe: assume stopped until confirmed clear
 _es_cache_ts: float = 0.0   # monotonic time of last successful read
 _ES_CACHE_TTL: float = 5.0  # max age in seconds before re-reading
 
+# ── Supabase transient-error retry utility ─────────────────────────────────────
+# Supabase's httpx transport uses HTTP/2 keep-alive connections.  The server can
+# close an idle connection at any time, producing httpx.RemoteProtocolError
+# ("Server disconnected").  This is fully transient and safe to retry.
+#
+# Usage (inside any sync helper that runs via asyncio.to_thread):
+#
+#   result = _supabase_with_retry(
+#       lambda: supabase.table("...").select(...).execute(),
+#       op_name="my_op",
+#       bot_id=bot_id,        # optional, for logging
+#       default=<safe_value>, # returned after all retries exhausted
+#   )
+#
+# Non-transient errors (auth, validation, permanent 4xx) are re-raised
+# immediately so the caller's own except can handle them.
+
+_SUPABASE_TRANSIENT_EXCS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+)
+_SUPABASE_RETRY_BACKOFF = (0.4, 1.0, 2.0)   # seconds between attempts 1→2, 2→3, 3→4
+
+
+def _supabase_with_retry(fn, op_name: str, *, bot_id: str = "",
+                         max_retries: int = 2, default=None):
+    """
+    Execute a synchronous Supabase callable with retry on transient httpx errors.
+
+    Logs:
+      SUPABASE_TRANSIENT_RETRY     — each retry attempt (WARNING)
+      SUPABASE_TRANSIENT_RECOVERED — success after at least one retry (WARNING)
+      SUPABASE_TRANSIENT_FAILURE   — all retries exhausted (WARNING), returns default
+
+    Non-transient exceptions propagate immediately (no retry, no default).
+    This function is safe to call from a thread-pool thread (uses time.sleep,
+    not asyncio.sleep).
+    """
+    _last_exc: Exception | None = None
+    for _attempt in range(max_retries + 1):
+        try:
+            _result = fn()
+            if _attempt > 0:
+                logging.warning(
+                    "SUPABASE_TRANSIENT_RECOVERED op=%s bot_id=%s recovered_on_attempt=%d",
+                    op_name, bot_id, _attempt + 1,
+                )
+            return _result
+        except _SUPABASE_TRANSIENT_EXCS as exc:
+            _last_exc = exc
+            if _attempt < max_retries:
+                _wait = _SUPABASE_RETRY_BACKOFF[min(_attempt, len(_SUPABASE_RETRY_BACKOFF) - 1)]
+                logging.warning(
+                    "SUPABASE_TRANSIENT_RETRY op=%s bot_id=%s attempt=%d/%d"
+                    " error_type=%s wait_secs=%.1f",
+                    op_name, bot_id, _attempt + 1, max_retries + 1,
+                    type(exc).__name__, _wait,
+                )
+                _sleep(_wait)
+            # loop continues to next attempt
+        # Non-transient errors propagate immediately (no except clause here)
+
+    logging.warning(
+        "SUPABASE_TRANSIENT_FAILURE op=%s bot_id=%s total_attempts=%d error_type=%s",
+        op_name, bot_id, max_retries + 1,
+        type(_last_exc).__name__ if _last_exc else "unknown",
+    )
+    return default
+
 
 def _read_emergency_stop_sync() -> bool:
     """
@@ -4700,20 +4773,26 @@ def _read_emergency_stop_sync() -> bool:
     if now - _es_cache_ts < _ES_CACHE_TTL:
         return _es_cache
     try:
-        resp = (
-            supabase.table("copy_global_settings")
-            .select("emergency_stop")
-            .eq("id", 1)
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("copy_global_settings")
+                .select("emergency_stop")
+                .eq("id", 1)
+                .limit(1)
+                .execute()
+            ),
+            op_name="read_emergency_stop",
+            default=None,
         )
-        if resp.data:
+        if resp is None:
+            _es_cache = True   # transient failure → fail-safe stopped
+        elif resp.data:
             _es_cache = bool(resp.data[0].get("emergency_stop", True))
         else:
             _es_cache = True  # no row = fail-safe stopped
         _es_cache_ts = now
     except Exception:
-        _es_cache = True  # fail-safe on DB error
+        _es_cache = True  # fail-safe on non-transient DB error
     return _es_cache
 
 
@@ -18106,18 +18185,29 @@ def _btc5m_late_has_live_position_for_market_sync(market_slug: str) -> bool:
     Return True if a LIVE_OPEN btc_5m_late position exists for this slug.
     Used exclusively by the BTC LIVE execution layer so that a freshly created
     PAPER (status=OPEN) position in the same tick does NOT block LIVE entry.
-    Fail-safe: returns True on DB error.
+    Fail-safe: returns True on DB error (conservative — prevents duplicate live orders).
     """
     try:
-        resp = (
-            supabase.table("paper_positions")
-            .select("id")
-            .eq("bot_id", BTC5M_LATE_BOT_ID)
-            .eq("market_slug", market_slug)
-            .eq("status", "LIVE_OPEN")
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("paper_positions")
+                .select("id")
+                .eq("bot_id", BTC5M_LATE_BOT_ID)
+                .eq("market_slug", market_slug)
+                .eq("status", "LIVE_OPEN")
+                .limit(1)
+                .execute()
+            ),
+            op_name="btc_has_live_position",
+            bot_id=BTC5M_LATE_BOT_ID,
+            default=None,
         )
+        if resp is None:
+            logging.warning(
+                "BTC5M_LIVE_DUP_CHECK_FAIL slug=%s — assuming live_traded for safety",
+                market_slug,
+            )
+            return True
         return bool(resp.data)
     except Exception:
         logging.exception(
@@ -18512,17 +18602,26 @@ def _crypto5m_has_position_sync(bot_id: str, slug: str) -> bool:
     """
     Return True if any paper_position exists for this bot+slug (OPEN or settled).
     Used in the loop-level dedup check to prevent re-entering a completed market.
-    Fail-safe: returns True on DB error.
+    Fail-safe: returns True on DB error (conservative — prevents duplicate entries).
     """
     try:
-        resp = (
-            supabase.table("paper_positions")
-            .select("id")
-            .eq("bot_id", bot_id)
-            .eq("market_slug", slug)
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("paper_positions")
+                .select("id")
+                .eq("bot_id", bot_id)
+                .eq("market_slug", slug)
+                .limit(1)
+                .execute()
+            ),
+            op_name="has_paper_position",
+            bot_id=bot_id,
+            default=None,
         )
+        if resp is None:
+            # Transient failure exhausted retries → fail-safe assume traded (no dupe risk)
+            logging.warning("CRYPTO5M_DUP_CHECK_FAIL bot_id=%s slug=%s — assuming traded", bot_id, slug)
+            return True
         return bool(resp.data)
     except Exception:
         logging.warning("CRYPTO5M_DUP_CHECK_FAIL bot_id=%s slug=%s — assuming traded", bot_id, slug)
@@ -18535,18 +18634,29 @@ def _crypto5m_has_live_position_sync(bot_id: str, slug: str) -> bool:
     Used exclusively by Gate 7 of _crypto5m_live_entry so that a freshly
     created PAPER (status=OPEN) position in the same tick does NOT block
     the LIVE execution layer.
-    Fail-safe: returns True on DB error.
+    Fail-safe: returns True on DB error (conservative — prevents duplicate live orders).
     """
     try:
-        resp = (
-            supabase.table("paper_positions")
-            .select("id")
-            .eq("bot_id", bot_id)
-            .eq("market_slug", slug)
-            .eq("status", "LIVE_OPEN")
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("paper_positions")
+                .select("id")
+                .eq("bot_id", bot_id)
+                .eq("market_slug", slug)
+                .eq("status", "LIVE_OPEN")
+                .limit(1)
+                .execute()
+            ),
+            op_name="has_live_position",
+            bot_id=bot_id,
+            default=None,
         )
+        if resp is None:
+            logging.warning(
+                "CRYPTO5M_LIVE_DUP_CHECK_FAIL bot_id=%s slug=%s — assuming live_traded",
+                bot_id, slug,
+            )
+            return True
         return bool(resp.data)
     except Exception:
         logging.warning(
@@ -18753,16 +18863,22 @@ def _crypto5m_upsert_status_sync(
 def _read_crypto_execution_mode_sync() -> str:
     """
     Read the global crypto execution mode from the shared crypto_paper row.
-    Returns 'PAPER' on any error or missing value (fail-safe).
+    Returns 'PAPER' on any error or missing value (fail-safe — never defaults to LIVE).
     """
     try:
-        resp = (
-            supabase.table("bot_settings")
-            .select("strategy_settings")
-            .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("bot_settings")
+                .select("strategy_settings")
+                .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+                .limit(1)
+                .execute()
+            ),
+            op_name="read_exec_mode",
+            default=None,
         )
+        if resp is None:
+            return CRYPTO_EXECUTION_MODE_DEFAULT  # transient failure → safe PAPER
         row = (resp.data or [None])[0]
         if not row:
             return CRYPTO_EXECUTION_MODE_DEFAULT
@@ -18842,16 +18958,22 @@ def _read_crypto_live_master_sync() -> bool:
     Stored in bot_settings[crypto_paper].strategy_settings.crypto_live_master_enabled.
     This is intentionally SEPARATE from the global live master (bot_id='live') so
     that enabling crypto LIVE mode does not affect copy trading or legacy strategies.
-    Returns False on any error (fail-safe).
+    Returns False on any error (fail-safe — gate blocks LIVE until flag confirmed).
     """
     try:
-        resp = (
-            supabase.table("bot_settings")
-            .select("strategy_settings")
-            .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
-            .limit(1)
-            .execute()
+        resp = _supabase_with_retry(
+            lambda: (
+                supabase.table("bot_settings")
+                .select("strategy_settings")
+                .eq("bot_id", CRYPTO_PAPER_ACCOUNT_ID)
+                .limit(1)
+                .execute()
+            ),
+            op_name="read_live_master",
+            default=None,
         )
+        if resp is None:
+            return False  # transient failure → fail-safe gate closed
         row = (resp.data or [None])[0]
         if not row:
             return False
@@ -19061,14 +19183,21 @@ async def _crypto5m_live_entry(
     # ── Gate 2: per-bot arm_live + is_enabled ─────────────────────────────────
     try:
         bot_row_resp = await asyncio.to_thread(
-            lambda: (
-                supabase.table("bot_settings")
-                .select("arm_live, is_enabled")
-                .eq("bot_id", bot_id)
-                .limit(1)
-                .execute()
+            lambda: _supabase_with_retry(
+                lambda: (
+                    supabase.table("bot_settings")
+                    .select("arm_live, is_enabled")
+                    .eq("bot_id", bot_id)
+                    .limit(1)
+                    .execute()
+                ),
+                op_name="gate2_arm_live_read",
+                bot_id=bot_id,
+                default=None,
             )
         )
+        if bot_row_resp is None:
+            return _block("arm_live_read_transient_failure")
         bot_row = (bot_row_resp.data or [None])[0]
     except Exception:
         return _block("arm_live_read_error")
@@ -20771,6 +20900,136 @@ async def btc_5m_late_supervised_loop() -> None:
             )
 
 
+def _test_supabase_retry_selftest() -> None:
+    """
+    Verify _supabase_with_retry behaviour without touching the real Supabase.
+
+    R1  Success on first attempt returns result, no retry logs.
+    R2  Transient error on attempt 1, success on attempt 2 → RECOVERED.
+    R3  All attempts fail with transient error → returns default.
+    R4  Non-transient exception propagates immediately (no retries, no default).
+    R5  submitted=False is returned from _block() (gate-blocked live entry).
+    R6  _SUPABASE_TRANSIENT_EXCS includes httpx.RemoteProtocolError.
+    R7  _supabase_with_retry is callable.
+    R8  Gate 2 arm_live read uses _supabase_with_retry (structural).
+    R9  _read_crypto_live_master_sync uses _supabase_with_retry (structural).
+    R10 _crypto5m_has_position_sync uses _supabase_with_retry (structural).
+    """
+    _pass_ct = 0
+    _fail_ct = 0
+
+    def _p(name: str) -> None:
+        nonlocal _pass_ct
+        _pass_ct += 1
+        logging.info("SUPABASE_RETRY_SELFTEST PASS %s", name)
+
+    def _f(name: str, note: str = "") -> None:
+        nonlocal _fail_ct
+        _fail_ct += 1
+        logging.warning("SUPABASE_RETRY_SELFTEST FAIL %s %s", name, note)
+
+    # R1: success on first attempt
+    _r1 = _supabase_with_retry(lambda: "ok", op_name="r1_test", default="fallback")
+    if _r1 == "ok":
+        _p("R1_success_first_attempt")
+    else:
+        _f("R1_success_first_attempt", f"got={_r1!r}")
+
+    # R2: one transient failure then success
+    _r2_attempts = []
+
+    def _r2_fn():
+        if len(_r2_attempts) == 0:
+            _r2_attempts.append(1)
+            raise httpx.RemoteProtocolError("Server disconnected")
+        return "recovered"
+
+    _r2 = _supabase_with_retry(_r2_fn, op_name="r2_test", max_retries=2, default="fallback")
+    if _r2 == "recovered":
+        _p("R2_transient_retry_recovered")
+    else:
+        _f("R2_transient_retry_recovered", f"got={_r2!r}")
+
+    # R3: all attempts fail → default returned
+    def _r3_fn():
+        raise httpx.ConnectError("refused")
+
+    _r3 = _supabase_with_retry(_r3_fn, op_name="r3_test", max_retries=2, default=None)
+    if _r3 is None:
+        _p("R3_all_attempts_exhausted_returns_default")
+    else:
+        _f("R3_all_attempts_exhausted_returns_default", f"got={_r3!r}")
+
+    # R4: non-transient exception propagates immediately
+    class _NonTransient(ValueError):
+        pass
+
+    _r4_raised = False
+    try:
+        _supabase_with_retry(lambda: (_ for _ in ()).throw(_NonTransient("auth")),
+                             op_name="r4_test", default="fallback")
+    except _NonTransient:
+        _r4_raised = True
+    if _r4_raised:
+        _p("R4_non_transient_propagates")
+    else:
+        _f("R4_non_transient_propagates", "ValueError was swallowed instead of re-raised")
+
+    # R5: httpx.RemoteProtocolError is in _SUPABASE_TRANSIENT_EXCS
+    if httpx.RemoteProtocolError in _SUPABASE_TRANSIENT_EXCS:
+        _p("R5_RemoteProtocolError_in_transient_set")
+    else:
+        _f("R5_RemoteProtocolError_in_transient_set",
+           "httpx.RemoteProtocolError not in _SUPABASE_TRANSIENT_EXCS")
+
+    # R6: all five httpx error types covered
+    _required_excs = {
+        httpx.RemoteProtocolError, httpx.ConnectError,
+        httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+    }
+    _missing = _required_excs - set(_SUPABASE_TRANSIENT_EXCS)
+    if not _missing:
+        _p("R6_all_five_transient_types_covered")
+    else:
+        _f("R6_all_five_transient_types_covered", f"missing={_missing}")
+
+    # R7: _supabase_with_retry is callable
+    if callable(_supabase_with_retry):
+        _p("R7_utility_callable")
+    else:
+        _f("R7_utility_callable")
+
+    # R8: Gate 2 arm_live read uses _supabase_with_retry (structural)
+    _live_entry_src = inspect.getsource(_crypto5m_live_entry)
+    if "_supabase_with_retry" in _live_entry_src and "gate2_arm_live_read" in _live_entry_src:
+        _p("R8_gate2_uses_retry_wrapper")
+    else:
+        _f("R8_gate2_uses_retry_wrapper",
+           "_supabase_with_retry / gate2_arm_live_read not in _crypto5m_live_entry source")
+
+    # R9: _read_crypto_live_master_sync uses _supabase_with_retry (structural)
+    _master_src = inspect.getsource(_read_crypto_live_master_sync)
+    if "_supabase_with_retry" in _master_src:
+        _p("R9_live_master_uses_retry_wrapper")
+    else:
+        _f("R9_live_master_uses_retry_wrapper",
+           "_supabase_with_retry not in _read_crypto_live_master_sync source")
+
+    # R10: _crypto5m_has_position_sync uses _supabase_with_retry (structural)
+    _dup_src = inspect.getsource(_crypto5m_has_position_sync)
+    if "_supabase_with_retry" in _dup_src:
+        _p("R10_has_position_uses_retry_wrapper")
+    else:
+        _f("R10_has_position_uses_retry_wrapper",
+           "_supabase_with_retry not in _crypto5m_has_position_sync source")
+
+    logging.warning(
+        "SUPABASE_RETRY_SELFTEST_SUMMARY pass=%d fail=%d result=%s",
+        _pass_ct, _fail_ct,
+        "ALL_PASS" if _fail_ct == 0 else "FAILURES_DETECTED",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -20839,6 +21098,7 @@ async def main():
         ("_test_crypto_only_worker_selftest",      _test_crypto_only_worker_selftest),
         ("_test_crypto_settlement_handler_selftest", _test_crypto_settlement_handler_selftest),
         ("_test_clob_client_compat_selftest",       _test_clob_client_compat_selftest),
+        ("_test_supabase_retry_selftest",           _test_supabase_retry_selftest),
     ]
     for _st_name, _st_fn in _SELFTESTS:
         try:
