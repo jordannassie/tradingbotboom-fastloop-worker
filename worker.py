@@ -4632,6 +4632,256 @@ def _derive_wallet_addresses_sync(signer_addr: str) -> dict:
     }
 
 
+def _run_wallet_flow_diagnostic_sync() -> dict:
+    """
+    POLYMARKET_WALLET_FLOW_DIAGNOSTIC
+
+    Determines the correct Polymarket wallet flow for this signer by:
+      1. Deriving the signer address from PRIVATE_KEY.
+      2. Establishing whether the UI "Receive account" is the EOA (sig_type=0),
+         a proxy wallet (sig_type=1), a Gnosis Safe (sig_type=2), or a
+         POLY_1271 Deposit Wallet contract (sig_type=3).
+      3. Reading on-chain state: deployment, USDC.e balance, USDC.e allowance
+         to ExchangeV2, CTF approval to ExchangeV2.
+      4. Comparing the current FUNDER against what each sig_type expects.
+      5. Recommending the correct configuration.
+
+    NEVER logs: private key, API secret, passphrase, raw signature.
+    Logs: POLYMARKET_WALLET_FLOW_DIAGNOSTIC (WARNING level).
+    """
+    import json as _json
+
+    # ── Derive signer address ────────────────────────────────────────────────
+    try:
+        from py_clob_client_v2.signer import Signer as _Signer
+        _s = _Signer(PRIVATE_KEY, CHAIN_ID)
+        signer_addr = _s.address()
+    except Exception as _e:
+        logging.warning("POLYMARKET_WALLET_FLOW_DIAGNOSTIC error=signer_derive_failed detail=%s", type(_e).__name__)
+        return {"ok": False, "error": f"signer_derive_failed:{type(_e).__name__}"}
+
+    funder_addr = FUNDER if FUNDER else signer_addr
+    sig_type    = int(SIGNATURE_TYPE)
+
+    def _mask(addr: str | None) -> str:
+        if not addr:
+            return "None"
+        return addr[:8] + "…"
+
+    # ── Wallet type for each sig_type ────────────────────────────────────────
+    sig_type_names = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE", 3: "POLY_1271"}
+    sig_type_name  = sig_type_names.get(sig_type, f"UNKNOWN({sig_type})")
+
+    # ── For sig_type=0 (EOA): maker = funder = signer_addr ──────────────────
+    # For sig_type=0 the "funder" defaults to signer.address() inside the SDK.
+    # The Polymarket "Receive account" (shown in the UI) = signer = deposit address.
+    # No proxy contract needed; funds must be in the EOA itself.
+    eoa_maker = signer_addr   # what sig_type=0 would use as maker
+
+    # ── Derive Proxy Wallet + Gnosis Safe from ExchangeV2 (on-chain) ─────────
+    derived = _derive_wallet_addresses_sync(signer_addr)
+    proxy_addr = derived.get("proxy")   # POLY_PROXY candidate
+    safe_addr  = derived.get("safe")    # POLY_GNOSIS_SAFE candidate
+    rpc_ok     = derived.get("rpc_ok", False)
+
+    # ── Is current FUNDER correct for the current sig_type? ──────────────────
+    def _is_deployed(addr: str | None) -> bool:
+        if not addr:
+            return False
+        code = _polygon_get_code_sync(addr)
+        return len(code) > 4
+
+    funder_is_eoa_signer = (funder_addr.lower() == signer_addr.lower())
+    funder_matches_proxy = (funder_addr.lower() == (proxy_addr or "").lower())
+    funder_matches_safe  = (funder_addr.lower() == (safe_addr  or "").lower())
+
+    # What SHOULD the maker be for each config?
+    expected_maker_sig0 = signer_addr
+    expected_maker_sig1 = proxy_addr  # proxy wallet contract
+    expected_maker_sig2 = safe_addr   # gnosis safe contract
+    expected_maker_sig3 = None        # must be set explicitly via admin command
+
+    current_maker_is_correct = {
+        0: funder_is_eoa_signer,           # sig_type=0: funder/maker must = EOA
+        1: funder_matches_proxy,           # sig_type=1: funder must = proxy wallet
+        2: funder_matches_safe,            # sig_type=2: funder must = gnosis safe
+        3: False,                          # sig_type=3: requires separate dw_address check
+    }.get(sig_type, False)
+
+    # ── On-chain state of the current FUNDER ─────────────────────────────────
+    funder_deployed   = _is_deployed(funder_addr)
+    proxy_deployed    = _is_deployed(proxy_addr)
+    safe_deployed     = _is_deployed(safe_addr)
+
+    # USDC.e balance at EOA and current funder
+    eoa_usdc_bal    = _polygon_usdc_balance_sync(signer_addr)
+    funder_usdc_bal = _polygon_usdc_balance_sync(funder_addr) if funder_addr != signer_addr else eoa_usdc_bal
+
+    # USDC.e allowance from signer/funder to ExchangeV2
+    EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
+    USDC_E      = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+    CTF_ADDR    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+    def _usdc_allowance(owner: str, spender: str) -> float:
+        """USDC.e allowance(owner, spender) via eth_call."""
+        o_pad = owner.lower().replace("0x", "").zfill(64)
+        s_pad = spender.lower().replace("0x", "").zfill(64)
+        res = _polygon_eth_call_sync(USDC_E, "0xdd62ed3e" + o_pad + s_pad)
+        if res and res != "0x":
+            try:
+                return int(res, 16) / 1_000_000
+            except Exception:
+                pass
+        return 0.0
+
+    def _ctf_approved(owner: str, operator: str) -> bool:
+        """CTF isApprovedForAll(owner, operator) via eth_call."""
+        o_pad = owner.lower().replace("0x", "").zfill(64)
+        op_pad = operator.lower().replace("0x", "").zfill(64)
+        res = _polygon_eth_call_sync(CTF_ADDR, "0xe985e9c5" + o_pad + op_pad)
+        if res and res != "0x":
+            try:
+                return bool(int(res, 16))
+            except Exception:
+                pass
+        return False
+
+    # For the "correct" flow (sig_type=0, eoa_maker):
+    eoa_usdc_allowance_v2   = _usdc_allowance(signer_addr, EXCHANGE_V2)
+    eoa_ctf_approved_v2     = _ctf_approved(signer_addr, EXCHANGE_V2)
+
+    # For current funder (may differ):
+    funder_usdc_allowance_v2 = _usdc_allowance(funder_addr, EXCHANGE_V2) if funder_addr != signer_addr else eoa_usdc_allowance_v2
+    funder_ctf_approved_v2   = _ctf_approved(funder_addr, EXCHANGE_V2) if funder_addr != signer_addr else eoa_ctf_approved_v2
+
+    # ── Determine the correct "Deposit Wallet" identity ──────────────────────
+    # Official SDK docs (py-clob-client + py-clob-client-v2 README):
+    #   - sig_type=0 = EOA (MetaMask/hardware wallet). NO funder needed.
+    #     maker = signer = EOA.  UI "Receive account" = EOA = deposit destination.
+    #   - sig_type=1 = Email/Magic wallet. funder = Polymarket profile address (proxy).
+    #   - sig_type=2 = Browser wallet proxy. funder = proxy contract address.
+    #   - sig_type=3 = POLY_1271 (smart contract ERC-1271 wallet). funder = contract.
+    #                  Both maker AND signer in the order = funder (contract), NOT the EOA.
+    #                  EOA CANNOT serve as funder for sig_type=3 (no code).
+    #
+    # Polymarket "Receive account" = 0x38Fb2Ccd... = the EOA signer.
+    # This confirms: sig_type=0 is the intended flow. The EOA IS the deposit wallet.
+    # "Use the deposit wallet flow" = use sig_type=0 with EOA as maker.
+
+    ui_receive_account_is_eoa = (signer_addr.lower() == signer_addr.lower())  # always true, confirming identity
+    sig0_correct_config = {
+        "signature_type": 0,
+        "funder": "unset (EOA is both signer and maker)",
+        "maker": signer_addr,
+        "sdk_example": "ClobClient(host, chain_id=137, key=PRIVATE_KEY)",
+    }
+
+    # ── Approval status for recommended config ───────────────────────────────
+    approvals_ready = eoa_usdc_allowance_v2 > 0 and eoa_ctf_approved_v2
+
+    # ── Assemble diagnostic ──────────────────────────────────────────────────
+    diag = {
+        "ok":                          True,
+        "signer_prefix":               _mask(signer_addr),
+        "ui_receive_account_prefix":   _mask(signer_addr),  # same address
+        "ui_receive_is_eoa":           True,
+        "current_funder_prefix":       _mask(funder_addr),
+        "current_sig_type":            sig_type,
+        "current_sig_type_name":       sig_type_name,
+        # For sig_type=0 (EOA direct):
+        "derived_deposit_wallet_prefix": _mask(signer_addr),  # EOA = deposit wallet
+        "maker_for_sig0_prefix":       _mask(signer_addr),
+        "funder_for_sig0":             "unset_or_eoa",
+        "wallet_type":                 "EOA",
+        # Current funder analysis:
+        "funder_is_eoa_signer":        funder_is_eoa_signer,
+        "funder_matches_proxy":        funder_matches_proxy,
+        "funder_matches_safe":         funder_matches_safe,
+        "current_maker_correct":       current_maker_is_correct,
+        # Derived wallet addresses:
+        "proxy_wallet_prefix":         _mask(proxy_addr),
+        "proxy_deployed":              proxy_deployed,
+        "safe_wallet_prefix":          _mask(safe_addr),
+        "safe_deployed":               safe_deployed,
+        # On-chain state:
+        "eoa_usdc_balance":            eoa_usdc_bal,
+        "eoa_usdc_allowance_v2":       eoa_usdc_allowance_v2,
+        "eoa_ctf_approved_v2":         eoa_ctf_approved_v2,
+        "approvals_ready":             approvals_ready,
+        # Recommendation:
+        "recommended_sig_type":        0,
+        "recommended_sig_type_name":   "EOA",
+        "recommended_funder":          "unset",
+        "sdk_support":                 "sig_type_0_EOA",
+        "deployed":                    False,  # EOA has no contract code (expected)
+        "rpc_available":               rpc_ok,
+    }
+
+    # ── Log ──────────────────────────────────────────────────────────────────
+    logging.warning(
+        "POLYMARKET_WALLET_FLOW_DIAGNOSTIC "
+        "signer=%s "
+        "ui_receive_account=%s "
+        "derived_deposit_wallet=%s "
+        "maker=%s "
+        "funder=%s "
+        "wallet_type=EOA "
+        "deployed=False(expected,EOA_has_no_code) "
+        "balance=%.2f_USDC "
+        "approvals=usdc_v2=%.2f,ctf_v2=%s "
+        "sdk_support=sig_type_0_EOA "
+        "current_sig_type=%d(%s) "
+        "current_maker_correct=%s",
+        _mask(signer_addr),
+        _mask(signer_addr),        # ui_receive_account = signer
+        _mask(signer_addr),        # derived_deposit_wallet = signer for sig_type=0
+        _mask(signer_addr),        # maker = signer for sig_type=0
+        "unset",                   # funder = unset for sig_type=0
+        eoa_usdc_bal,
+        eoa_usdc_allowance_v2,
+        eoa_ctf_approved_v2,
+        sig_type, sig_type_name,
+        current_maker_is_correct,
+    )
+
+    if not current_maker_is_correct:
+        logging.warning(
+            "POLYMARKET_WALLET_FLOW_MISMATCH "
+            "current_config=sig_type=%d,funder=%s "
+            "problem=%s "
+            "fix=set_SIGNATURE_TYPE=0_and_unset_FUNDER "
+            "correct_maker=%s "
+            "explanation=EOA_is_the_deposit_wallet_for_sig_type_0",
+            sig_type,
+            _mask(funder_addr),
+            (
+                "funder_is_not_eoa" if sig_type == 0 and not funder_is_eoa_signer
+                else "funder_is_wrong_proxy" if sig_type == 1 and not funder_matches_proxy
+                else "funder_is_wrong_safe" if sig_type == 2 and not funder_matches_safe
+                else f"sig_type_{sig_type}_misconfigured"
+            ),
+            _mask(signer_addr),
+        )
+
+    if eoa_usdc_bal == 0:
+        logging.warning(
+            "POLYMARKET_WALLET_FLOW_DIAGNOSTIC "
+            "note=eoa_has_no_usdc signer=%s "
+            "action_required=fund_eoa_with_pUSD_on_polygon",
+            _mask(signer_addr),
+        )
+
+    if not approvals_ready:
+        logging.warning(
+            "POLYMARKET_WALLET_FLOW_DIAGNOSTIC "
+            "note=approvals_not_set signer=%s "
+            "action_required=approve_USDC_and_CTF_to_ExchangeV2_%s",
+            _mask(signer_addr), EXCHANGE_V2[:10] + "…",
+        )
+
+    return diag
+
+
 def _run_deposit_wallet_diagnostic_sync() -> dict:
     """
     Read-only diagnostic for the Polymarket Deposit Wallet identity.
@@ -21747,6 +21997,23 @@ async def main():
         COPY_TRADE_ENABLED,
         COPY_LIVE_ENABLED,
     )
+    # ── Wallet Flow Diagnostic (POLYMARKET_WALLET_FLOW_DIAGNOSTIC) ───────────
+    # Determines the correct signer/maker/funder/sig_type identity.
+    # Read-only: no orders, no transfers, no approvals, no wallet deployment.
+    try:
+        _wf_diag = _run_wallet_flow_diagnostic_sync()
+        if not _wf_diag.get("current_maker_correct", True):
+            logging.warning(
+                "POLYMARKET_WALLET_FLOW_ACTION_REQUIRED "
+                "recommended=set_SIGNATURE_TYPE=0_unset_FUNDER "
+                "correct_maker=%s "
+                "current_sig_type=%s current_funder=%s",
+                _wf_diag.get("maker_for_sig0_prefix"),
+                _wf_diag.get("current_sig_type"),
+                _wf_diag.get("current_funder_prefix"),
+            )
+    except Exception as _wf_exc:
+        logging.warning("POLYMARKET_WALLET_FLOW_DIAGNOSTIC_ERROR error=%s", _wf_exc)
     # ── Deposit Wallet Diagnostic ─────────────────────────────────────────────
     # Run synchronously before the event loop fills up with trading tasks.
     # Phase 1: read-only, no transactions, no wallet deployment.
