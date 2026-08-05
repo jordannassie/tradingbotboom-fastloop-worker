@@ -7196,11 +7196,17 @@ def _test_crypto_execution_path_selftest() -> None:
         _f("T13_live_order_failed_log_correct_name",
            "CRYPTO_LIVE_ORDER_FAILED not found in _crypto5m_live_entry")
 
-    # T14: Regression — flag must be set AFTER call, not before.
-    # Simulates: new market, live_attempted=False, LIVE enabled, valid signal
-    # → live submit function called exactly once.
-    def _sim_live_guard(live_attempted: bool, live_enabled: bool) -> dict:
-        """Returns {skipped, call_count, attempted_after}."""
+    # T14: Regression — the live attempt flag must only be set when
+    # submit_copy_live_order was actually invoked (submitted=True).
+    # Gate-blocked calls (submitted=False) must NOT set the flag.
+    def _sim_live_guard(live_attempted: bool, live_enabled: bool,
+                        submitted: bool = True) -> dict:
+        """
+        Simulates the per-tick LIVE guard logic.
+        submitted=True  → entry fn returned submitted=True (order attempted).
+        submitted=False → gate-blocked (transient); flag must NOT be set.
+        Returns {skipped, call_count, attempted_after}.
+        """
         _call_count = 0
         _attempted  = live_attempted
 
@@ -7208,24 +7214,34 @@ def _test_crypto_execution_path_selftest() -> None:
             if _attempted:
                 return {"skipped": True, "call_count": 0, "attempted_after": _attempted}
             else:
-                # Correct: flag is NOT set here (before call)
                 try:
-                    _call_count += 1  # simulates _crypto5m_live_entry call
-                    _live_ok = True   # simulates success
-                    _attempted = True  # set AFTER call returns
+                    _call_count += 1           # simulates _crypto5m_live_entry call
+                    _live_submitted = submitted
+                    if _live_submitted:        # flag only set when submission was attempted
+                        _attempted = True
                 except Exception:
                     pass  # Do NOT set _attempted on exception
         return {"skipped": False, "call_count": _call_count, "attempted_after": _attempted}
 
-    # Case A: new market, first call → must call exactly once
-    _ta = _sim_live_guard(live_attempted=False, live_enabled=True)
+    # Case A: new market, submitted=True → called once AND flag set
+    _ta = _sim_live_guard(live_attempted=False, live_enabled=True, submitted=True)
     if _ta["call_count"] == 1 and not _ta["skipped"] and _ta["attempted_after"]:
         _p("T14_new_market_live_called_once")
     else:
         _f("T14_new_market_live_called_once",
-           f"call_count={_ta['call_count']} skipped={_ta['skipped']}")
+           f"call_count={_ta['call_count']} skipped={_ta['skipped']} "
+           f"attempted_after={_ta['attempted_after']}")
 
-    # Case B: second tick same market (attempted=True) → skipped, no call
+    # Case A2: gate-blocked (submitted=False) → called once but flag NOT set → retry
+    _ta2 = _sim_live_guard(live_attempted=False, live_enabled=True, submitted=False)
+    if _ta2["call_count"] == 1 and not _ta2["skipped"] and not _ta2["attempted_after"]:
+        _p("T14_gate_block_does_not_set_flag")
+    else:
+        _f("T14_gate_block_does_not_set_flag",
+           f"call_count={_ta2['call_count']} skipped={_ta2['skipped']} "
+           f"attempted_after={_ta2['attempted_after']}")
+
+    # Case B: second tick, flag already set → skipped, call_count=0
     _tb = _sim_live_guard(live_attempted=True, live_enabled=True)
     if _tb["call_count"] == 0 and _tb["skipped"]:
         _p("T14_second_tick_skipped")
@@ -7240,19 +7256,39 @@ def _test_crypto_execution_path_selftest() -> None:
     else:
         _f("T14_live_off_no_call", f"call_count={_tc['call_count']}")
 
-    # Structural: flag must appear AFTER the call in generic loop source
-    # (not before it — the early-set bug pattern)
+    # Structural: _live_submitted must appear in generic loop source (3-tuple unpack)
     _src_live_path = _src  # _src = inspect.getsource(_crypto5m_loop_impl) from T12
-    # The pattern "live_attempted_this_market = True" must appear AFTER
-    # "await _crypto5m_live_entry(" in the source, not before.
-    _flag_pos = _src_live_path.find("live_attempted_this_market\" ] = True")
-    _call_pos = _src_live_path.find("await _crypto5m_live_entry(")
-    if _flag_pos > _call_pos > 0:
-        _p("T14_flag_set_after_call_in_source")
+    if "_live_submitted" in _src_live_path:
+        _p("T14_live_submitted_unpacked_in_generic_source")
     else:
-        _f("T14_flag_set_after_call_in_source",
-           f"flag_pos={_flag_pos} call_pos={_call_pos} "
-           "(expected flag_pos > call_pos; early-set bug still present if not)")
+        _f("T14_live_submitted_unpacked_in_generic_source",
+           "_live_submitted not found in _crypto5m_loop_impl source")
+
+    # Structural: 'if _live_submitted:' must appear AFTER 'await _crypto5m_live_entry('
+    _set_marker  = "if _live_submitted:"
+    _call_marker = "await _crypto5m_live_entry("
+    _set_pos2    = _src_live_path.find(_set_marker)
+    _call_pos2   = _src_live_path.find(_call_marker)
+    if _set_pos2 > _call_pos2 > 0:
+        _p("T14_submitted_guard_appears_after_call")
+    else:
+        _f("T14_submitted_guard_appears_after_call",
+           f"set_pos={_set_pos2} call_pos={_call_pos2}")
+
+    # _crypto5m_live_entry must declare 3-tuple return type
+    _live_entry_sig = inspect.getsource(_crypto5m_live_entry)
+    if "tuple[bool, object, bool]" in _live_entry_sig:
+        _p("T14_live_entry_returns_3tuple")
+    else:
+        _f("T14_live_entry_returns_3tuple",
+           "tuple[bool, object, bool] not in _crypto5m_live_entry signature")
+
+    # _block() inside _crypto5m_live_entry must return submitted=False
+    if "return False, None, False" in _live_entry_sig:
+        _p("T14_block_returns_submitted_false")
+    else:
+        _f("T14_block_returns_submitted_false",
+           "return False, None, False not found in _crypto5m_live_entry (_block path)")
 
     # Also check: CRYPTO_LIVE_ATTEMPT_STARTED and CRYPTO_LIVE_SUBMIT_FUNCTION_ENTERED
     if "CRYPTO_LIVE_ATTEMPT_STARTED" in _src:
@@ -18982,11 +19018,18 @@ async def _crypto5m_live_entry(
     start_ts: int,
     token_id: str,      # UP or DOWN token ID for the chosen side
     log_prefix: str,
-) -> tuple[bool, object]:
+) -> tuple[bool, object, bool]:
     """
     Submit a real LIVE order for a crypto 5-minute market entry.
 
-    Returns (ok: bool, position_row_id: int | None).
+    Returns (ok: bool, position_row_id: int | None, submitted: bool).
+
+    submitted=True  means submit_copy_live_order was actually invoked.
+                    Caller should set live_attempted_this_market=True.
+    submitted=False means a safety gate blocked the call before any V2
+                    order was created.  Caller must NOT mark the market as
+                    attempted — the gate condition may be transient and the
+                    next tick should retry.
 
     Safety guarantees:
       - All guards must pass; any failure logs CRYPTO_LIVE_ENTRY_BLOCKED.
@@ -18998,14 +19041,14 @@ async def _crypto5m_live_entry(
         Automatic CLOB-level redemption is NOT implemented (manual required).
     """
 
-    def _block(reason: str) -> tuple[bool, None]:
+    def _block(reason: str) -> tuple[bool, None, bool]:
         logging.warning(
             "CRYPTO_LIVE_ENTRY_BLOCKED bot_id=%s market=%s side=%s reason=%s",
             bot_id, slug,
             "UP" if side == "yes" else "DOWN",
             reason,
         )
-        return False, None
+        return False, None, False   # submitted=False → caller must not mark attempted
 
     # ── Gate 1: Crypto-specific LIVE master ──────────────────────────────────
     # Uses strategy_settings.crypto_live_master_enabled on the crypto_paper row.
@@ -19094,7 +19137,7 @@ async def _crypto5m_live_entry(
             "UP" if side == "yes" else "DOWN",
             err_msg,
         )
-        return False, None
+        return False, None, True   # submitted=True: order was attempted, mark market done
 
     order_id = _extract_order_id(raw_resp) if isinstance(raw_resp, dict) else None
 
@@ -19143,7 +19186,7 @@ async def _crypto5m_live_entry(
             "position_id=%s order_id=%s",
             bot_id, slug, pos_id or "?", order_id or "?",
         )
-        return True, pos_id
+        return True, pos_id, True   # submitted=True: order placed and recorded
     except Exception:
         logging.exception(
             "CRYPTO_LIVE_POSITION_RECORD_FAIL bot_id=%s market=%s", bot_id, slug
@@ -19156,7 +19199,7 @@ async def _crypto5m_live_entry(
             "— LIVE order exists; operator must reconcile manually",
             bot_id, slug, order_id or "?",
         )
-        return True, None
+        return True, None, True   # submitted=True: order placed, DB record failed
 
 
 # ── Generic loop implementation ───────────────────────────────────────────────
@@ -19656,7 +19699,7 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                         )
                         try:
                             _live_tok = (up_token_id if side == "yes" else down_token_id) or ""
-                            _live_ok, _live_row_id = await _crypto5m_live_entry(
+                            _live_ok, _live_row_id, _live_submitted = await _crypto5m_live_entry(
                                 bot_id      = bot_id,
                                 strategy_id = strategy_id,
                                 slug        = slug,
@@ -19667,9 +19710,12 @@ async def _crypto5m_loop_impl(cfg: dict, state: dict) -> None:
                                 token_id    = _live_tok,
                                 log_prefix  = log_prefix,
                             )
-                            # Mark attempted only after function returns
-                            # (success OR known rejection — not on exception)
-                            state["live_attempted_this_market"] = True
+                            # Mark attempted ONLY when submit_copy_live_order was
+                            # actually invoked (submitted=True).  A gate-blocked
+                            # return (submitted=False) means the condition is
+                            # transient — do NOT set the flag so the next tick retries.
+                            if _live_submitted:
+                                state["live_attempted_this_market"] = True
                             if _live_ok:
                                 state["last_reason"] = "LIVE_ORDER_SUBMITTED"
                         except Exception as _live_exc:
@@ -20565,7 +20611,7 @@ async def btc_5m_late_loop() -> None:
                     )
                     try:
                         _live_token_id = (up_token_id if side == "yes" else down_token_id) or ""
-                        _live_ok, _live_row_id = await _crypto5m_live_entry(
+                        _live_ok, _live_row_id, _live_submitted = await _crypto5m_live_entry(
                             bot_id      = BTC5M_LATE_BOT_ID,
                             strategy_id = BTC5M_LATE_STRATEGY_ID,
                             slug        = slug,
@@ -20576,7 +20622,8 @@ async def btc_5m_late_loop() -> None:
                             token_id    = _live_token_id,
                             log_prefix  = "BTC5M",
                         )
-                        _btc5m_late_live_attempted_this_market = True
+                        if _live_submitted:
+                            _btc5m_late_live_attempted_this_market = True
                         if _live_ok:
                             _btc5m_late_last_reason = "LIVE_ORDER_SUBMITTED"
                     except Exception as _live_exc:
