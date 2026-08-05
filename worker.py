@@ -5295,6 +5295,9 @@ def _admin_connect_deposit_wallet_sync(dw_addr: str) -> dict:
         "deployed":     True,
         "note": "poly_deposit_wallet_enabled is still false — set it to true explicitly to activate",
     }
+
+
+def get_trading_client_safe(force_refresh: bool = False) -> "ClobClient | None":
     """
     Return the cached CLOB client, rebuilding with exponential backoff when needed.
 
@@ -5332,8 +5335,44 @@ def _admin_connect_deposit_wallet_sync(dw_addr: str) -> dict:
 
     # ── Build ClobClient ──────────────────────────────────────────────────────
     try:
-        _sig   = int(SIGNATURE_TYPE)
+        _sig    = int(SIGNATURE_TYPE)
         _funder = FUNDER if FUNDER else None
+
+        # ── Startup funder validation ─────────────────────────────────────────
+        # Block attempts to submit live orders through the wrong proxy wallet.
+        # 0x4CB9574E... is a Polymarket proxy for a DIFFERENT signer; any order
+        # built with it as maker will be rejected by the CLOB with
+        # "maker address not allowed".
+        _KNOWN_BAD_FUNDER = "0x4CB9574Ed22d0C28241dF26E71b355669900e0Ec"
+        # Canonical signer-owned Gnosis Safe derived from ExchangeV2.getSafeWalletAddress
+        _SIGNER_OWNED_SAFE = "0x48c04c990182b23fd17c911d18c42605fad3312e"
+
+        if _funder and _funder.lower() == _KNOWN_BAD_FUNDER.lower():
+            _clob_auth_ready = False
+            logging.warning(
+                "POLYMARKET_LIVE_AUTH_NOT_READY reason=wrong_funder_wallet "
+                "funder_prefix=%s is_known_bad=True "
+                "action=update_FUNDER_to_signer_owned_safe_%s",
+                _funder[:8] + "…",
+                _SIGNER_OWNED_SAFE[:8] + "…",
+            )
+            return None
+
+        if _sig == 2 and _funder:
+            # For POLY_GNOSIS_SAFE, verify funder matches signer-owned Safe
+            if _funder.lower() != _SIGNER_OWNED_SAFE.lower():
+                logging.warning(
+                    "POLYMARKET_LIVE_AUTH_WARN reason=sig2_funder_not_signer_safe "
+                    "current_funder=%s expected_safe=%s "
+                    "— orders may be rejected if funder is not this signer's Safe",
+                    _funder[:8] + "…",
+                    _SIGNER_OWNED_SAFE[:8] + "…",
+                )
+            else:
+                logging.warning(
+                    "POLYMARKET_LIVE_FUNDER_VERIFIED funder=%s matches_signer_safe=True sig_type=2",
+                    _funder[:8] + "…",
+                )
         _new_client = ClobClient(
             HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
             signature_type=_sig, funder=_funder,
