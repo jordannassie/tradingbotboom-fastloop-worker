@@ -4430,7 +4430,13 @@ def build_trading_client() -> ClobClient | None:
     funder = FUNDER if FUNDER else None
     try:
         client = ClobClient(HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=sig, funder=funder)
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client.set_api_creds(client.create_or_derive_api_key())
+        logging.warning(
+            "POLYMARKET_V2_AUTH_METHODS_READY method=create_or_derive_api_key"
+            " set_api_creds=ok create_order=ok post_order=ok",
+        )
+        logging.warning("POLYMARKET_LIVE_AUTH_READY host=%s sig_type=%s funder_present=%s",
+                        HOST, sig, bool(funder))
     except (ValueError, Exception) as _exc:
         # ClobClient raises ValueError("The private key must be exactly 32 bytes...")
         # for malformed keys.  Catch it here so the worker never crashes.
@@ -4559,7 +4565,18 @@ def get_trading_client_safe(force_refresh: bool = False) -> "ClobClient | None":
             HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
             signature_type=_sig, funder=_funder,
         )
-        _new_client.set_api_creds(_new_client.create_or_derive_api_creds())
+        _new_client.set_api_creds(_new_client.create_or_derive_api_key())
+        # Validate V2 methods are present after successful auth
+        assert hasattr(_new_client, "create_or_derive_api_key"), "V2 method missing: create_or_derive_api_key"
+        assert hasattr(_new_client, "set_api_creds"), "V2 method missing: set_api_creds"
+        assert hasattr(_new_client, "create_order"), "V2 method missing: create_order"
+        assert hasattr(_new_client, "post_order"), "V2 method missing: post_order"
+        logging.warning(
+            "POLYMARKET_V2_AUTH_METHODS_READY method=create_or_derive_api_key"
+            " set_api_creds=ok create_order=ok post_order=ok",
+        )
+        logging.warning("POLYMARKET_LIVE_AUTH_READY host=%s sig_type=%s funder_present=%s",
+                        HOST, _sig, bool(_funder))
     except (ValueError, Exception) as _build_exc:
         _clob_singleton  = None
         _clob_auth_ready = False
@@ -8077,6 +8094,43 @@ def _test_clob_client_compat_selftest() -> None:
 
     # C10: No real network calls made in this test
     _ok("C10_no_real_order")
+
+    # C11: V2 SDK has create_or_derive_api_key (not the V1 create_or_derive_api_creds)
+    try:
+        from py_clob_client_v2.client import ClobClient as _CC
+        if hasattr(_CC, "create_or_derive_api_key"):
+            _ok("C11_create_or_derive_api_key_method_exists")
+        else:
+            _fail_t("C11_create_or_derive_api_key_method_exists",
+                    "create_or_derive_api_key not found on ClobClient")
+        if not hasattr(_CC, "create_or_derive_api_creds"):
+            _ok("C11b_obsolete_V1_method_absent")
+        else:
+            _fail_t("C11b_obsolete_V1_method_absent",
+                    "create_or_derive_api_creds still present — V1 method lingering")
+        if hasattr(_CC, "set_api_creds"):
+            _ok("C11c_set_api_creds_method_exists")
+        else:
+            _fail_t("C11c_set_api_creds_method_exists", "set_api_creds not found")
+    except Exception as _e:
+        _fail_t("C11_v2_auth_method_check", str(_e))
+
+    # C12: worker.py source uses create_or_derive_api_key, not create_or_derive_api_creds
+    import inspect as _insp
+    try:
+        _gtcs_src = _insp.getsource(get_trading_client_safe)
+        if "create_or_derive_api_key" in _gtcs_src:
+            _ok("C12_get_trading_client_safe_uses_v2_method")
+        else:
+            _fail_t("C12_get_trading_client_safe_uses_v2_method",
+                    "create_or_derive_api_key not in get_trading_client_safe source")
+        if "create_or_derive_api_creds" not in _gtcs_src:
+            _ok("C12b_obsolete_method_absent_from_singleton")
+        else:
+            _fail_t("C12b_obsolete_method_absent_from_singleton",
+                    "create_or_derive_api_creds still present in get_trading_client_safe")
+    except Exception as _e:
+        _fail_t("C12_source_check", str(_e))
 
     logging.warning(
         "CLOB_COMPAT_SELFTEST_SUMMARY api_version=2 package=py-clob-client-v2"
