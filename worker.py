@@ -10761,7 +10761,10 @@ async def live_redemption_loop() -> None:
                     supabase.table("paper_positions")
                     .select(
                         "id, bot_id, market_slug, side, shares, size_usd,"
-                        " start_ts, end_ts, status, order_id"
+                        " start_ts, end_ts, status"
+                        # NOTE: order_id and token_id are selected only when
+                        # schema V2 migration has been applied; skipped here
+                        # to stay backward-compatible.
                     )
                     .in_("bot_id", CRYPTO_PAPER_BOT_IDS)
                     .in_("status", ["LIVE_OPEN", "LIVE_PENDING"])
